@@ -1,0 +1,23 @@
+unlock:
+  name: Unlock door
+  description: Submit a Doorfast unlock command.
+  fields:
+    generation:
+      selector: {number: {min: 0}}
+call_elevator:
+  name: Call elevator
+  description: Request an elevator in the selected direction.
+  fields:
+    direction:
+      required: true
+      default: up
+      selector: {select: {options: [up, down]}}
+hangup:
+  name: Hang up
+  description: Terminate the active Doorfast call.
+  fields:
+    generation:
+      selector: {number: {min: 0}}
+    reason:
+      default: ha
+      selector: {text: {}}

@@ -1,0 +1,10 @@
+DOMAIN = "doorfast"
+MANUFACTURER = "Doorfast"
+SW_VERSION = "0.1.0"
+CONF_SERVER_ADDRESS = "server_address"
+CONF_FILEPATH = "filepath"
+CONF_POLL_INTERVAL = "poll_interval"
+PLATFORMS = ["lock", "button", "sensor", "binary_sensor", "camera"]
+LATEST_EVENT = "latest_event"
+RING_STATUS = "ring_status"
+KEEPALIVE_INTERVAL = 30

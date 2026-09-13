@@ -1,0 +1,10 @@
+{
+  "config": {"step": {"user": {"title": "配置 Doorfast", "data": {"server_address": "Doorfast 网桥地址", "poll_interval": "轮询间隔（秒）"}}}},
+  "entity": {
+    "lock": {"unlock": {"name": "开门"}},
+    "button": {"elevator_up": {"name": "召梯上行"}, "elevator_down": {"name": "召梯下行"}, "hangup": {"name": "挂断通话"}},
+    "sensor": {"latest_event": {"name": "Doorfast 状态"}},
+    "binary_sensor": {"ring_status": {"name": "来电"}},
+    "camera": {"video": {"name": "视频"}}
+  }
+}
