@@ -1,4 +1,0 @@
-0000000000000000000000000000000000000000 c1fb5f8b0ffc1fb821cc7ce2e3464d151b46e671 shen wenjie <970504888@qq.com> 1789341775 +0800	clone: from https://github.com/xswxm/doorlink
-c1fb5f8b0ffc1fb821cc7ce2e3464d151b46e671 c075db0ebf1d772fa208e4b6ed8c50e72174d5a4 shen wenjie <970504888@qq.com> 1789342396 +0800	commit: Create Doorfast Home Assistant integration
-c075db0ebf1d772fa208e4b6ed8c50e72174d5a4 8f7f5f12f6ed61319d3ca1e5736ce1010a553580 shen wenjie <970504888@qq.com> 1789342401 +0800	commit: Remove generated Python cache files
-8f7f5f12f6ed61319d3ca1e5736ce1010a553580 aa1f40a9a8417329b258d014f7dfb78f4123877c shen wenjie <970504888@qq.com> 1789342412 +0800	commit: Add integration validation workflow
