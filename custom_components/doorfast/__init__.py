@@ -24,8 +24,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     entry.async_on_unload(async_track_time_interval(hass, poll, timedelta(seconds=entry.data.get(CONF_POLL_INTERVAL, 5))))
     async def unlock(call): await client.unlock(call.data.get("generation"))
     async def call_elevator(call): await client.call_elevator(call.data.get("direction", "up"))
+    async def answer(call):
+        await client.answer(call.data["generation"], call.data.get("primary_media_port", 0), call.data.get("secondary_media_port", 0), call.data.get("duration_seconds", 0))
     async def hangup(call): await client.hangup(call.data.get("generation"), call.data.get("reason", "ha"))
-    for name, handler in (("unlock", unlock), ("call_elevator", call_elevator), ("hangup", hangup)):
+    for name, handler in (("unlock", unlock), ("call_elevator", call_elevator), ("answer", answer), ("hangup", hangup)):
         if not hass.services.has_service(DOMAIN, name): hass.services.async_register(DOMAIN, name, handler)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS); return True
 

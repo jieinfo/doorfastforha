@@ -12,6 +12,22 @@ call_elevator:
       required: true
       default: up
       selector: {select: {options: [up, down]}}
+answer:
+  name: Answer call
+  description: Accept the active Doorfast call and configure media ports.
+  fields:
+    generation:
+      required: true
+      selector: {number: {min: 0}}
+    primary_media_port:
+      default: 0
+      selector: {number: {min: 0, max: 65535}}
+    secondary_media_port:
+      default: 0
+      selector: {number: {min: 0, max: 65535}}
+    duration_seconds:
+      default: 0
+      selector: {number: {min: 0, max: 3600}}
 hangup:
   name: Hang up
   description: Terminate the active Doorfast call.
