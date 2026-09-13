@@ -6,6 +6,8 @@ from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
+from datetime import timedelta
 from .client import DoorfastClient
 from .const import DOMAIN, PLATFORMS, CONF_SERVER_ADDRESS, CONF_POLL_INTERVAL, LATEST_EVENT, RING_STATUS
 
@@ -19,17 +21,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         except Exception:
             client.online = False
     await poll()
-    entry.async_on_unload(asyncio.create_task(_poll_loop(hass, entry, poll)))
+    entry.async_on_unload(async_track_time_interval(hass, poll, timedelta(seconds=entry.data.get(CONF_POLL_INTERVAL, 5))))
     async def unlock(call): await client.unlock(call.data.get("generation"))
     async def call_elevator(call): await client.call_elevator(call.data.get("direction", "up"))
     async def hangup(call): await client.hangup(call.data.get("generation"), call.data.get("reason", "ha"))
     for name, handler in (("unlock", unlock), ("call_elevator", call_elevator), ("hangup", hangup)):
         if not hass.services.has_service(DOMAIN, name): hass.services.async_register(DOMAIN, name, handler)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS); return True
-
-async def _poll_loop(hass, entry, poll):
-    while True:
-        await asyncio.sleep(entry.data.get(CONF_POLL_INTERVAL, 5)); await poll()
 
 async def async_unload_entry(hass, entry):
     hass.data[DOMAIN].pop(entry.entry_id, None); return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
