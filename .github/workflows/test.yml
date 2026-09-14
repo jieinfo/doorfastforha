@@ -1,7 +1,9 @@
 name: Validate integration
+
 on:
   push:
   pull_request:
+
 jobs:
   python:
     runs-on: ubuntu-latest
@@ -10,7 +12,8 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.x'}
       - run: python -m compileall -q custom_components/doorfast
-      - run: python - <<'PY'
+      - run: |
+          python - <<'PY'
           import json, pathlib
           for p in pathlib.Path('.').rglob('*.json'): json.load(p.open())
-        PY
+          PY
