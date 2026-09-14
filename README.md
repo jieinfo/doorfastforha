@@ -6,6 +6,8 @@ The integration talks to the Doorfast HTTP bridge at `http://<host>/cgi-bin/door
 
 Doorfast status is authoritative for command acceptance, while physical door/elevator confirmation remains a separate status field and is shown as returned by the bridge.
 
+The lock entity sends a momentary unlock command and remains shown as locked because Doorfast does not yet receive a physical door-position signal. Its attributes expose the protocol state, generation, raw reply status and `physical_result_confirmed` value reported by the bridge.
+
 # 安装方式
 
 ## 使用 HACS 安装
