@@ -9,6 +9,8 @@ class DoorfastConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_user(self, user_input=None):
         if user_input is not None:
             address = user_input[CONF_SERVER_ADDRESS].rstrip("/")
+            if address.endswith("/cgi-bin/doorfast") is False:
+                address += "/cgi-bin/doorfast"
             return self.async_create_entry(title=address, data={**user_input, CONF_SERVER_ADDRESS: address})
         return self.async_show_form(step_id="user", data_schema=vol.Schema({
             vol.Required(CONF_SERVER_ADDRESS): cv.url,
