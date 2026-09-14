@@ -10,6 +10,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from datetime import timedelta
 from .client import DoorfastClient
 from .const import DOMAIN, PLATFORMS, CONF_SERVER_ADDRESS, CONF_POLL_INTERVAL, LATEST_EVENT, RING_STATUS
+from .generation import is_ringing
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     client = DoorfastClient(hass, entry.data[CONF_SERVER_ADDRESS]); hass.data.setdefault(DOMAIN, {})[entry.entry_id] = client
@@ -18,6 +19,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         try:
             await client.refresh()
             async_dispatcher_send(hass, f"{DOMAIN}_{entry.entry_id}_STATUS", client.status)
+            async_dispatcher_send(hass, f"{DOMAIN}_{entry.entry_id}_{RING_STATUS}", is_ringing(client.status))
         except Exception:
             client.online = False
     await poll()
@@ -44,4 +46,5 @@ class DoorfastEventView(HomeAssistantView):
         client = self.hass.data[DOMAIN][self.entry_id]; payload["time"] = datetime.now().isoformat()
         client.status.update(payload); async_dispatcher_send(self.hass, f"{DOMAIN}_{self.entry_id}_{LATEST_EVENT}", payload)
         if payload.get("event") in {"ring", "incoming_call", "call"}: async_dispatcher_send(self.hass, f"{DOMAIN}_{self.entry_id}_{RING_STATUS}", True)
+        elif payload.get("event") in {"hangup", "ended", "call_ended"}: async_dispatcher_send(self.hass, f"{DOMAIN}_{self.entry_id}_{RING_STATUS}", False)
         return json_response({"status": "success"})

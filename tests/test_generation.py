@@ -13,6 +13,7 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 resolve_generation = MODULE.resolve_generation
+is_ringing = MODULE.is_ringing
 
 
 class ResolveGenerationTest(unittest.TestCase):
@@ -38,6 +39,22 @@ class ResolveGenerationTest(unittest.TestCase):
             with self.subTest(status=status):
                 with self.assertRaises(ValueError):
                     resolve_generation(status, None)
+
+
+class RingingStatusTest(unittest.TestCase):
+    def test_only_ringing_call_is_active(self):
+        self.assertTrue(is_ringing({"call": {"session": "ringing"}}))
+        for status in (
+            {},
+            {"call": None},
+            {"call": {}},
+            {"call": {"session": "idle"}},
+            {"call": {"session": "preview"}},
+            {"call": {"session": "talking"}},
+            {"call": {"session": "ended"}},
+        ):
+            with self.subTest(status=status):
+                self.assertFalse(is_ringing(status))
 
 
 if __name__ == "__main__":

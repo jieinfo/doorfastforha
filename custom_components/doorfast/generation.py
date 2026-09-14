@@ -16,3 +16,9 @@ def resolve_generation(status: dict[str, Any], generation: int | None) -> int:
     if isinstance(candidate, bool) or not isinstance(candidate, int) or candidate <= 0:
         raise ValueError("Doorfast has no active call generation")
     return candidate
+
+
+def is_ringing(status: dict[str, Any]) -> bool:
+    """Return whether Doorfast reports an incoming call that is still ringing."""
+    call = status.get("call")
+    return isinstance(call, dict) and call.get("session") == "ringing"
