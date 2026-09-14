@@ -8,6 +8,12 @@ Doorfast status is authoritative for command acceptance, while physical door/ele
 
 The lock entity sends a momentary unlock command and remains shown as locked because Doorfast does not yet receive a physical door-position signal. Its attributes expose the protocol state, generation, raw reply status and `physical_result_confirmed` value reported by the bridge.
 
+The camera requests snapshots for the current call generation and reuses a
+cached frame only when the Doorfast bridge returns `304 Not Modified` or a
+short-lived `503 Service Unavailable`. A call-generation change, unavailable
+video status, or `404`/`409` response clears the cached image so a previous
+visitor cannot appear in a later call.
+
 # 安装方式
 
 ## 使用 HACS 安装
