@@ -1,5 +1,9 @@
 {
-  "config": {"step": {"user": {"title": "Configure Doorfast", "data": {"server_address": "Doorfast bridge address", "poll_interval": "Polling interval (seconds)"}}}},
+  "config": {
+    "step": {"user": {"title": "Configure Doorfast", "data": {"server_address": "Doorfast bridge address", "poll_interval": "Polling interval (seconds)"}}},
+    "error": {"cannot_connect": "Could not connect to a running Doorfast bridge."},
+    "abort": {"already_configured": "This Doorfast bridge is already configured."}
+  },
   "entity": {
     "lock": {"unlock": {"name": "Unlock door"}},
     "button": {"elevator_up": {"name": "Call elevator up"}, "elevator_down": {"name": "Call elevator down"}, "hangup": {"name": "Hang up"}},
