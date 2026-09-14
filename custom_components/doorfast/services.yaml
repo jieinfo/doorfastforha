@@ -3,7 +3,8 @@ unlock:
   description: Submit a Doorfast unlock command.
   fields:
     generation:
-      selector: {number: {min: 0}}
+      description: Defaults to the generation of the current call.
+      selector: {number: {min: 1}}
 call_elevator:
   name: Call elevator
   description: Request an elevator in the selected direction.
@@ -18,7 +19,7 @@ answer:
   fields:
     generation:
       required: true
-      selector: {number: {min: 0}}
+      selector: {number: {min: 1}}
     primary_media_port:
       default: 0
       selector: {number: {min: 0, max: 65535}}
@@ -33,7 +34,8 @@ hangup:
   description: Terminate the active Doorfast call.
   fields:
     generation:
-      selector: {number: {min: 0}}
+      description: Defaults to the generation of the current call.
+      selector: {number: {min: 1}}
     reason:
       default: ha
       selector: {text: {}}

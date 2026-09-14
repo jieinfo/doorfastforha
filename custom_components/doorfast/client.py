@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any
 import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from .generation import resolve_generation
 
 class DoorfastClient:
     """Client for the Doorfast JSON bridge mapped to the local ubus API."""
@@ -18,10 +19,14 @@ class DoorfastClient:
             return data
     async def refresh(self):
         self.status = await self._request("GET", "/api/v1/status"); self.online = True; return self.status
-    async def unlock(self, generation=None): return await self._request("POST", "/api/v1/unlock", {} if generation is None else {"generation": generation})
+    async def unlock(self, generation=None):
+        generation = resolve_generation(self.status, generation)
+        return await self._request("POST", "/api/v1/unlock", {"generation": generation})
     async def answer(self, generation, primary_media_port=0, secondary_media_port=0, duration_seconds=0):
         return await self._request("POST", "/api/v1/answer", {"generation": generation, "primary_media_port": primary_media_port, "secondary_media_port": secondary_media_port, "duration_seconds": duration_seconds})
-    async def hangup(self, generation=None, reason="ha"): return await self._request("POST", "/api/v1/hangup", {"generation": generation, "reason": reason})
+    async def hangup(self, generation=None, reason="ha"):
+        generation = resolve_generation(self.status, generation)
+        return await self._request("POST", "/api/v1/hangup", {"generation": generation, "reason": reason})
     async def call_elevator(self, direction="up"):
         if direction not in {"up", "down"}: raise ValueError("direction must be up or down")
         return await self._request("POST", "/api/v1/call_elevator", {"direction": direction})
