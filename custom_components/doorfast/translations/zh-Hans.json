@@ -1,5 +1,9 @@
 {
-  "config": {"step": {"user": {"title": "配置 Doorfast", "data": {"server_address": "Doorfast 网桥地址", "poll_interval": "轮询间隔（秒）"}}}},
+  "config": {
+    "step": {"user": {"title": "配置 Doorfast", "data": {"server_address": "Doorfast 网桥地址", "poll_interval": "轮询间隔（秒）"}}},
+    "error": {"cannot_connect": "无法连接到正在运行的 Doorfast 网桥。"},
+    "abort": {"already_configured": "此 Doorfast 网桥已配置。"}
+  },
   "entity": {
     "lock": {"unlock": {"name": "开门"}},
     "button": {"elevator_up": {"name": "召梯上行"}, "elevator_down": {"name": "召梯下行"}, "hangup": {"name": "挂断通话"}},
