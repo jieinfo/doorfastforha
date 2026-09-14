@@ -25,3 +25,7 @@ class DoorfastClient:
     async def call_elevator(self, direction="up"):
         if direction not in {"up", "down"}: raise ValueError("direction must be up or down")
         return await self._request("POST", "/api/v1/call_elevator", {"direction": direction})
+    async def latest_video_frame(self) -> bytes:
+        async with self.session.get(f"{self.base_url}/api/v1/video/latest.jpg", timeout=aiohttp.ClientTimeout(total=10)) as response:
+            response.raise_for_status()
+            return await response.read()
