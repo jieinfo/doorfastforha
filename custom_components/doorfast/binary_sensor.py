@@ -9,7 +9,7 @@ class IncomingCall(BinarySensorEntity):
  @property
  def unique_id(self): return f"{DOMAIN}_{self.e.entry_id}_{RING_STATUS}"
  @property
- def device_info(self): return {"identifiers": {(DOMAIN,"controller")},"name":"Doorfast Controller","manufacturer":MANUFACTURER,"sw_version":SW_VERSION}
+ def device_info(self): return {"identifiers": {(DOMAIN,self.e.entry_id)},"name":"Doorfast Controller","manufacturer":MANUFACTURER,"sw_version":SW_VERSION}
  @property
  def is_on(self): return self._on
  async def async_added_to_hass(self): self.async_on_remove(async_dispatcher_connect(self.hass,f"{DOMAIN}_{self.e.entry_id}_{RING_STATUS}",self.trigger))

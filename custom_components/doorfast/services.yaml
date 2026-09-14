@@ -2,6 +2,9 @@ unlock:
   name: Unlock door
   description: Submit a Doorfast unlock command.
   fields:
+    config_entry_id:
+      description: Required only when multiple Doorfast entries are loaded.
+      selector: {text: {}}
     generation:
       description: Defaults to the generation of the current call.
       selector: {number: {min: 1}}
@@ -9,6 +12,9 @@ call_elevator:
   name: Call elevator
   description: Request an elevator in the selected direction.
   fields:
+    config_entry_id:
+      description: Required only when multiple Doorfast entries are loaded.
+      selector: {text: {}}
     direction:
       required: true
       default: up
@@ -17,6 +23,9 @@ answer:
   name: Answer call
   description: Accept the active Doorfast call and configure media ports.
   fields:
+    config_entry_id:
+      description: Required only when multiple Doorfast entries are loaded.
+      selector: {text: {}}
     generation:
       required: true
       selector: {number: {min: 1}}
@@ -33,6 +42,9 @@ hangup:
   name: Hang up
   description: Terminate the active Doorfast call.
   fields:
+    config_entry_id:
+      description: Required only when multiple Doorfast entries are loaded.
+      selector: {text: {}}
     generation:
       description: Defaults to the generation of the current call.
       selector: {number: {min: 1}}
