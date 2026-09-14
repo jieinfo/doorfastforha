@@ -1,5 +1,6 @@
 """Tests for command payloads emitted by the Doorfast client."""
 
+import asyncio
 import importlib.util
 from pathlib import Path
 import sys
@@ -44,10 +45,11 @@ DoorfastClient = client_module.DoorfastClient
 
 
 class FakeResponse:
-    def __init__(self, status, body=b"", headers=None):
+    def __init__(self, status, body=b"", headers=None, before_read=None):
         self.status = status
         self.body = body
         self.headers = headers or {}
+        self.before_read = before_read
 
     async def __aenter__(self):
         return self
@@ -60,6 +62,8 @@ class FakeResponse:
             raise RuntimeError(f"HTTP {self.status}")
 
     async def read(self):
+        if self.before_read is not None:
+            await self.before_read()
         return self.body
 
 
@@ -85,6 +89,34 @@ def video_client(*responses):
     client._video_generation = None
     client._video_etag = None
     client._video_frame = None
+    client._audio_generation = None
+    client._audio_revision = None
+    client._audio_etag = None
+    client._refresh_sequence = 0
+    return client
+
+
+def audio_client(*responses):
+    client = DoorfastClient.__new__(DoorfastClient)
+    client.base_url = "http://doorfast/cgi-bin/doorfast"
+    client.session = FakeSession(*responses)
+    client.status = {
+        "call": {"generation": 7},
+        "audio": {
+            "snapshot_ready": True,
+            "generation": 7,
+            "snapshot_packet_count": 40,
+            "snapshot_previous_packet_count": 30,
+        },
+    }
+    client.online = True
+    client._audio_generation = None
+    client._audio_revision = None
+    client._audio_etag = None
+    client._video_generation = None
+    client._video_etag = None
+    client._video_frame = None
+    client._refresh_sequence = 0
     return client
 
 
@@ -169,6 +201,269 @@ class VideoFrameTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await client.latest_video_frame())
         self.assertIsNone(client._video_frame)
 
+
+class AudioChunkTest(unittest.IsolatedAsyncioTestCase):
+    async def test_advances_cursor_without_replaying_unchanged_audio(self):
+        client = audio_client(
+            FakeResponse(
+                200,
+                b"RIFFchunk-40-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "30",
+                    "X-Doorfast-Audio-Revision": "40",
+                    "ETag": '"df-audio-7-40"',
+                },
+            ),
+            FakeResponse(304),
+        )
+
+        self.assertEqual(b"RIFFchunk-40-WAVE", await client.latest_audio_chunk())
+        self.assertIsNone(await client.latest_audio_chunk())
+
+        first = client.session.requests[0][1]
+        second = client.session.requests[1][1]
+        self.assertEqual({"generation": 7}, first["params"])
+        self.assertEqual(
+            {"generation": 7, "after": 40}, second["params"]
+        )
+        self.assertEqual(
+            '"df-audio-7-40"', second["headers"]["If-None-Match"]
+        )
+
+    async def test_accepts_only_the_next_chunk_in_the_revision_chain(self):
+        client = audio_client(
+            FakeResponse(
+                200,
+                b"RIFFchunk-30-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "20",
+                    "X-Doorfast-Audio-Revision": "30",
+                    "ETag": '"df-audio-7-30"',
+                },
+            ),
+            FakeResponse(
+                200,
+                b"RIFFwrong-chain-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "29",
+                    "X-Doorfast-Audio-Revision": "40",
+                },
+            ),
+        )
+        client._audio_generation = 7
+        client._audio_revision = 20
+        client._audio_etag = '"df-audio-7-20"'
+
+        self.assertEqual(b"RIFFchunk-30-WAVE", await client.latest_audio_chunk())
+        self.assertIsNone(await client.latest_audio_chunk())
+        self.assertIsNone(client._audio_revision)
+
+    async def test_rejects_stale_initial_chunk_and_malformed_headers(self):
+        client = audio_client(
+            FakeResponse(
+                200,
+                b"stale",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "20",
+                    "X-Doorfast-Audio-Revision": "30",
+                },
+            ),
+            FakeResponse(
+                200,
+                b"malformed",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": 30,
+                    "X-Doorfast-Audio-Revision": "40",
+                },
+            ),
+        )
+
+        self.assertIsNone(await client.latest_audio_chunk())
+        self.assertIsNone(await client.latest_audio_chunk())
+        self.assertIsNone(client._audio_generation)
+
+    async def test_accepts_initial_chunk_newer_than_polled_status(self):
+        client = audio_client(
+            FakeResponse(
+                200,
+                b"RIFFchunk-50-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "40",
+                    "X-Doorfast-Audio-Revision": "50",
+                    "ETag": '"df-audio-7-50"',
+                },
+            )
+        )
+
+        self.assertEqual(b"RIFFchunk-50-WAVE", await client.latest_audio_chunk())
+        self.assertEqual(50, client._audio_revision)
+
+    async def test_ignores_mismatched_etag_without_skipping_next_chunk(self):
+        client = audio_client(
+            FakeResponse(
+                200,
+                b"RIFFchunk-40-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "30",
+                    "X-Doorfast-Audio-Revision": "40",
+                    "ETag": '"df-audio-7-50"',
+                },
+            ),
+            FakeResponse(
+                200,
+                b"RIFFchunk-50-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "40",
+                    "X-Doorfast-Audio-Revision": "50",
+                    "ETag": '"df-audio-7-50"',
+                },
+            ),
+        )
+
+        self.assertEqual(b"RIFFchunk-40-WAVE", await client.latest_audio_chunk())
+        self.assertEqual(b"RIFFchunk-50-WAVE", await client.latest_audio_chunk())
+        second = client.session.requests[1][1]
+        self.assertEqual({"generation": 7, "after": 40}, second["params"])
+        self.assertEqual({}, second["headers"])
+
+    async def test_drops_old_response_when_generation_changes_during_read(self):
+        read_started = asyncio.Event()
+        release_read = asyncio.Event()
+
+        async def block_read():
+            read_started.set()
+            await release_read.wait()
+
+        client = audio_client(
+            FakeResponse(
+                200,
+                b"RIFFold-call-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "30",
+                    "X-Doorfast-Audio-Revision": "40",
+                    "ETag": '"df-audio-7-40"',
+                },
+                before_read=block_read,
+            )
+        )
+        task = asyncio.create_task(client.latest_audio_chunk())
+        await read_started.wait()
+        client.status = {
+            "call": {"generation": 8},
+            "audio": {
+                "snapshot_ready": True,
+                "generation": 8,
+                "snapshot_packet_count": 2,
+            },
+        }
+        client._clear_audio_cursor()
+        release_read.set()
+
+        self.assertIsNone(await task)
+        self.assertIsNone(client._audio_generation)
+        self.assertIsNone(client._audio_revision)
+
+    async def test_out_of_order_refresh_cannot_restore_old_call_audio(self):
+        audio_started = asyncio.Event()
+        release_audio = asyncio.Event()
+        old_refresh_started = asyncio.Event()
+        release_old_refresh = asyncio.Event()
+
+        async def block_audio():
+            audio_started.set()
+            await release_audio.wait()
+
+        client = audio_client(
+            FakeResponse(
+                200,
+                b"RIFFold-call-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "30",
+                    "X-Doorfast-Audio-Revision": "40",
+                    "ETag": '"df-audio-7-40"',
+                },
+                before_read=block_audio,
+            )
+        )
+        refresh_calls = 0
+
+        async def refresh_response(method, path, payload=None):
+            nonlocal refresh_calls
+            refresh_calls += 1
+            if refresh_calls == 1:
+                old_refresh_started.set()
+                await release_old_refresh.wait()
+                return {
+                    "call": {"generation": 7},
+                    "audio": {
+                        "snapshot_ready": True,
+                        "generation": 7,
+                        "snapshot_packet_count": 40,
+                    },
+                }
+            return {
+                "call": {"generation": 8},
+                "audio": {
+                    "snapshot_ready": True,
+                    "generation": 8,
+                    "snapshot_packet_count": 2,
+                },
+            }
+
+        client._request = refresh_response
+        audio_task = asyncio.create_task(client.latest_audio_chunk())
+        await audio_started.wait()
+        old_refresh = asyncio.create_task(client.refresh())
+        await old_refresh_started.wait()
+        new_refresh = asyncio.create_task(client.refresh())
+        await new_refresh
+        release_old_refresh.set()
+        await old_refresh
+        release_audio.set()
+
+        self.assertEqual(8, client.status["call"]["generation"])
+        self.assertIsNone(await audio_task)
+        self.assertIsNone(client._audio_generation)
+
+    async def test_resynchronizes_expired_cursor_but_retries_transient_failure(self):
+        client = audio_client(FakeResponse(503), FakeResponse(409))
+        client._audio_generation = 7
+        client._audio_revision = 30
+        client._audio_etag = '"df-audio-7-30"'
+
+        self.assertIsNone(await client.latest_audio_chunk())
+        self.assertEqual(30, client._audio_revision)
+        self.assertIsNone(await client.latest_audio_chunk())
+        self.assertIsNone(client._audio_generation)
+        self.assertIsNone(client._audio_revision)
+
+    async def test_refresh_clears_cursor_when_call_generation_changes(self):
+        client = audio_client()
+        client._audio_generation = 7
+        client._audio_revision = 40
+        client._audio_etag = '"df-audio-7-40"'
+        client._request = AsyncMock(
+            return_value={
+                "call": {"generation": 8},
+                "audio": {"snapshot_ready": False, "generation": 0},
+            }
+        )
+
+        await client.refresh()
+
+        self.assertIsNone(client._audio_generation)
+        self.assertIsNone(client._audio_revision)
+        self.assertIsNone(client._audio_etag)
 
 if __name__ == "__main__":
     unittest.main()
