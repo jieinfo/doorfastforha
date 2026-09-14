@@ -12,6 +12,7 @@ from datetime import timedelta
 from .client import DoorfastClient
 from .const import DOMAIN, PLATFORMS, CONF_SERVER_ADDRESS, CONF_POLL_INTERVAL, LATEST_EVENT, RING_STATUS, DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
 from .generation import is_ringing
+from .events import EventGate, process_event
 from .routing import select_client
 
 SERVICE_NAMES = ("unlock", "call_elevator", "answer", "hangup")
@@ -24,12 +25,22 @@ def service_client(hass, call):
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     client = DoorfastClient(hass, entry.data[CONF_SERVER_ADDRESS]); hass.data.setdefault(DOMAIN, {})[entry.entry_id] = client
-    hass.http.register_view(DoorfastEventView(hass, entry.entry_id))
+    event_gate = EventGate()
+    views = hass.data.setdefault(f"{DOMAIN}_event_views", {})
+    view = views.get(entry.entry_id)
+    if view is None:
+        view = DoorfastEventView(hass, entry.entry_id, event_gate)
+        views[entry.entry_id] = view
+        hass.http.register_view(view)
+    else:
+        view.event_gate = event_gate
+    def dispatch_status() -> None:
+        async_dispatcher_send(hass, f"{DOMAIN}_{entry.entry_id}_STATUS", client.status)
+        async_dispatcher_send(hass, f"{DOMAIN}_{entry.entry_id}_{RING_STATUS}", is_ringing(client.status))
     async def poll(_now=None):
         try:
             await client.refresh()
-            async_dispatcher_send(hass, f"{DOMAIN}_{entry.entry_id}_STATUS", client.status)
-            async_dispatcher_send(hass, f"{DOMAIN}_{entry.entry_id}_{RING_STATUS}", is_ringing(client.status))
+            dispatch_status()
         except Exception:
             client.online = False
     await poll()
@@ -54,13 +65,24 @@ async def async_unload_entry(hass, entry):
 
 class DoorfastEventView(HomeAssistantView):
     requires_auth = True
-    def __init__(self, hass, entry_id):
-        self.hass, self.entry_id = hass, entry_id; self.url = f"/api/doorfast/{entry_id}"; self.name = f"api:doorfast:{entry_id}"
+    def __init__(self, hass, entry_id, event_gate: EventGate):
+        self.hass, self.entry_id, self.event_gate = hass, entry_id, event_gate
+        self.url = f"/api/doorfast/{entry_id}"; self.name = f"api:doorfast:{entry_id}"
+
     async def post(self, request: Request) -> Response:
-        try: payload = await request.json()
-        except Exception: return json_response({"error": "invalid JSON"}, status=400)
-        client = self.hass.data[DOMAIN][self.entry_id]; payload["time"] = datetime.now().isoformat()
-        client.status.update(payload); async_dispatcher_send(self.hass, f"{DOMAIN}_{self.entry_id}_{LATEST_EVENT}", payload)
-        if payload.get("event") in {"ring", "incoming_call", "call"}: async_dispatcher_send(self.hass, f"{DOMAIN}_{self.entry_id}_{RING_STATUS}", True)
-        elif payload.get("event") in {"hangup", "ended", "call_ended"}: async_dispatcher_send(self.hass, f"{DOMAIN}_{self.entry_id}_{RING_STATUS}", False)
-        return json_response({"status": "success"})
+        try:
+            payload = await request.json()
+        except Exception:
+            return json_response({"error": "invalid JSON"}, status=400)
+        client = self.hass.data.get(DOMAIN, {}).get(self.entry_id)
+        if client is None:
+            return json_response({"error": "unknown Doorfast entry"}, status=404)
+        def dispatch(kind, data):
+            channels = {
+                "status": f"{DOMAIN}_{self.entry_id}_STATUS",
+                "latest_event": f"{DOMAIN}_{self.entry_id}_{LATEST_EVENT}",
+                "ring_status": f"{DOMAIN}_{self.entry_id}_{RING_STATUS}",
+            }
+            async_dispatcher_send(self.hass, channels[kind], data)
+        status, result = await process_event(payload, client, self.event_gate, dispatch, is_ringing)
+        return json_response(result, status=status)

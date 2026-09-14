@@ -37,3 +37,15 @@ player entity.
 
 [![打开 Home Assistant 并设置新的集成。](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=doorfast)
 ___
+
+## 主动事件推送
+
+集成保留配置中的 5 秒状态轮询作为断线和事件丢失时的兜底，同时提供受 Home Assistant 身份认证保护的 `POST /api/doorfast/<entry_id>` 入口。由于 Home Assistant 通常与 Doorfast 主机分开部署，HA 不能直接读取主机上的 Unix socket；Doorfast 侧需要增加一个事件转发器，向该 URL 发出 HTTPS POST，并携带 Home Assistant 长期访问令牌。
+
+事件 JSON 必须为以下格式：
+
+```json
+{"schema_version":1,"event_id":42,"event":"incoming_call","generation":7,"timestamp_ms":1710000000000}
+```
+
+允许的事件为 `incoming_call`、`call_established`、`hangup`、`timeout` 和 `preempted`。集成会在发布 HA dispatcher 信号前刷新一次 `/api/v1/status`，拒绝格式错误、重复 `(generation,event)` 或旧 generation 事件；重复或旧事件返回 HTTP 202，状态刷新失败返回 HTTP 503，便于转发器稍后重试。
