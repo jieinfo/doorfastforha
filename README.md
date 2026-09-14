@@ -14,6 +14,15 @@ short-lived `503 Service Unavailable`. A call-generation change, unavailable
 video status, or `404`/`409` response clears the cached image so a previous
 visitor cannot appear in a later call.
 
+The client consumes Doorfast audio as generation-bound WAV chunks. It records
+the revision returned by each successful request and asks for the next retained
+chunk with that revision as its cursor. An unchanged response is not replayed,
+temporary failures preserve the cursor for retry, and an expired cursor or call
+generation change resets the sequence before resynchronizing. This client
+boundary prepares continuous playback without allowing audio from an earlier
+call into the current one; the integration does not yet expose a live audio
+player entity.
+
 # 安装方式
 
 ## 使用 HACS 安装
