@@ -14,7 +14,7 @@ class DoorfastStatus(SensorEntity):
     @property
     def unique_id(self): return f"{DOMAIN}_{self.entry.entry_id}_{LATEST_EVENT}"
     @property
-    def device_info(self): return {"identifiers": {(DOMAIN,"controller")},"name":"Doorfast Controller","manufacturer":MANUFACTURER,"sw_version":SW_VERSION}
+    def device_info(self): return {"identifiers": {(DOMAIN,self.entry.entry_id)},"name":"Doorfast Controller","manufacturer":MANUFACTURER,"sw_version":SW_VERSION}
     @property
     def native_value(self): return self._state
     @property
