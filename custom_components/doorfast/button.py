@@ -1,7 +1,7 @@
 from homeassistant.components.button import ButtonEntity
 from .const import DOMAIN, MANUFACTURER, SW_VERSION
 async def async_setup_entry(hass, entry, async_add_entities):
- c=hass.data[DOMAIN][entry.entry_id]; async_add_entities([ElevatorButton(c,entry.entry_id,"up"),ElevatorButton(c,entry.entry_id,"down"),HangupButton(c,entry.entry_id)])
+ c=hass.data[DOMAIN][entry.entry_id]; async_add_entities([ElevatorButton(c,entry.entry_id,"up"),ElevatorButton(c,entry.entry_id,"down"),AnswerButton(c,entry.entry_id),HangupButton(c,entry.entry_id)])
 class Base(ButtonEntity):
  def __init__(self,c,entry_id): self.client=c; self.entry_id=entry_id
  @property
@@ -16,3 +16,8 @@ class HangupButton(Base):
  @property
  def unique_id(self): return f"{DOMAIN}_{self.entry_id}_hangup"
  async def async_press(self): await self.client.hangup()
+class AnswerButton(Base):
+ _attr_translation_key="answer"
+ @property
+ def unique_id(self): return f"{DOMAIN}_{self.entry_id}_answer"
+ async def async_press(self): await self.client.answer()

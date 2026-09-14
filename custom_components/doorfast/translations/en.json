@@ -6,7 +6,7 @@
   },
   "entity": {
     "lock": {"unlock": {"name": "Unlock door"}},
-    "button": {"elevator_up": {"name": "Call elevator up"}, "elevator_down": {"name": "Call elevator down"}, "hangup": {"name": "Hang up"}},
+    "button": {"elevator_up": {"name": "Call elevator up"}, "elevator_down": {"name": "Call elevator down"}, "answer": {"name": "Answer call"}, "hangup": {"name": "Hang up"}},
     "sensor": {"latest_event": {"name": "Doorfast status"}},
     "binary_sensor": {"ring_status": {"name": "Incoming call"}},
     "camera": {"video": {"name": "Video"}}

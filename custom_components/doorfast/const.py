@@ -8,3 +8,6 @@ PLATFORMS = ["lock", "button", "sensor", "binary_sensor", "camera"]
 LATEST_EVENT = "latest_event"
 RING_STATUS = "ring_status"
 KEEPALIVE_INTERVAL = 30
+DEFAULT_VIDEO_PORT = 8303
+DEFAULT_AUDIO_PORT = 8302
+DEFAULT_CALL_DURATION = 120

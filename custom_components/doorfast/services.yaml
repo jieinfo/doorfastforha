@@ -27,17 +27,17 @@ answer:
       description: Required only when multiple Doorfast entries are loaded.
       selector: {text: {}}
     generation:
-      required: true
+      description: Defaults to the generation of the current call.
       selector: {number: {min: 1}}
     primary_media_port:
-      default: 0
-      selector: {number: {min: 0, max: 65535}}
+      default: 8303
+      selector: {number: {min: 1, max: 65535}}
     secondary_media_port:
-      default: 0
-      selector: {number: {min: 0, max: 65535}}
+      default: 8302
+      selector: {number: {min: 1, max: 65535}}
     duration_seconds:
-      default: 0
-      selector: {number: {min: 0, max: 3600}}
+      default: 120
+      selector: {number: {min: 1, max: 255}}
 hangup:
   name: Hang up
   description: Terminate the active Doorfast call.

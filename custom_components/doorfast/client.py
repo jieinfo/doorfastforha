@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import Any
 import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from .const import DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
 from .generation import resolve_generation
 
 class DoorfastClient:
@@ -22,7 +23,8 @@ class DoorfastClient:
     async def unlock(self, generation=None):
         generation = resolve_generation(self.status, generation)
         return await self._request("POST", "/api/v1/unlock", {"generation": generation})
-    async def answer(self, generation, primary_media_port=0, secondary_media_port=0, duration_seconds=0):
+    async def answer(self, generation=None, primary_media_port=DEFAULT_VIDEO_PORT, secondary_media_port=DEFAULT_AUDIO_PORT, duration_seconds=DEFAULT_CALL_DURATION):
+        generation = resolve_generation(self.status, generation)
         return await self._request("POST", "/api/v1/answer", {"generation": generation, "primary_media_port": primary_media_port, "secondary_media_port": secondary_media_port, "duration_seconds": duration_seconds})
     async def hangup(self, generation=None, reason="ha"):
         generation = resolve_generation(self.status, generation)
