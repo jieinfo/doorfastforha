@@ -29,3 +29,6 @@ class DoorfastClient:
         async with self.session.get(f"{self.base_url}/api/v1/video/latest.jpg", timeout=aiohttp.ClientTimeout(total=10)) as response:
             response.raise_for_status()
             return await response.read()
+    @property
+    def latest_audio_url(self) -> str:
+        return f"{self.base_url}/api/v1/audio/latest.wav"
