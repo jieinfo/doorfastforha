@@ -10,7 +10,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 from datetime import timedelta
 from .client import DoorfastClient
-from .const import DOMAIN, PLATFORMS, CONF_SERVER_ADDRESS, CONF_POLL_INTERVAL, LATEST_EVENT, RING_STATUS
+from .const import DOMAIN, PLATFORMS, CONF_SERVER_ADDRESS, CONF_POLL_INTERVAL, LATEST_EVENT, RING_STATUS, DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
 from .generation import is_ringing
 from .routing import select_client
 
@@ -37,7 +37,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     async def unlock(call): await service_client(hass, call).unlock(call.data.get("generation"))
     async def call_elevator(call): await service_client(hass, call).call_elevator(call.data.get("direction", "up"))
     async def answer(call):
-        await service_client(hass, call).answer(call.data["generation"], call.data.get("primary_media_port", 0), call.data.get("secondary_media_port", 0), call.data.get("duration_seconds", 0))
+        await service_client(hass, call).answer(call.data.get("generation"), call.data.get("primary_media_port", DEFAULT_VIDEO_PORT), call.data.get("secondary_media_port", DEFAULT_AUDIO_PORT), call.data.get("duration_seconds", DEFAULT_CALL_DURATION))
     async def hangup(call): await service_client(hass, call).hangup(call.data.get("generation"), call.data.get("reason", "ha"))
     for name, handler in (("unlock", unlock), ("call_elevator", call_elevator), ("answer", answer), ("hangup", hangup)):
         if not hass.services.has_service(DOMAIN, name): hass.services.async_register(DOMAIN, name, handler)
