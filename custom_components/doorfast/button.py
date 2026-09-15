@@ -1,7 +1,7 @@
 from homeassistant.components.button import ButtonEntity
 from .const import DOMAIN, MANUFACTURER, SW_VERSION
 async def async_setup_entry(hass, entry, async_add_entities):
- c=hass.data[DOMAIN][entry.entry_id]; async_add_entities([ElevatorButton(c,entry.entry_id,"up"),ElevatorButton(c,entry.entry_id,"down"),AnswerButton(c,entry.entry_id),HangupButton(c,entry.entry_id)])
+ c=hass.data[DOMAIN][entry.entry_id]; async_add_entities([ElevatorButton(c,entry.entry_id,"up"),ElevatorButton(c,entry.entry_id,"down"),AnswerButton(c,entry.entry_id),HangupButton(hass,c,entry.entry_id)])
 class Base(ButtonEntity):
  def __init__(self,c,entry_id): self.client=c; self.entry_id=entry_id
  @property
@@ -12,10 +12,14 @@ class ElevatorButton(Base):
  def unique_id(self): return f"{DOMAIN}_{self.entry_id}_elevator_{self.direction}"
  async def async_press(self): await self.client.call_elevator(self.direction)
 class HangupButton(Base):
+ def __init__(self,hass,c,entry_id): super().__init__(c,entry_id); self.hass=hass
  _attr_translation_key="hangup"
  @property
  def unique_id(self): return f"{DOMAIN}_{self.entry_id}_hangup"
- async def async_press(self): await self.client.hangup()
+ async def async_press(self):
+  manager=self.hass.data.get(f"{DOMAIN}_pcm_ws")
+  if manager is not None: await manager.release_entry(self.entry_id)
+  await self.client.hangup()
 class AnswerButton(Base):
  _attr_translation_key="answer"
  @property
