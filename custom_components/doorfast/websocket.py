@@ -50,6 +50,7 @@ class PcmWebSocketManager:
         self.producer_factory = producer_factory
         self._captures: dict[str, _Capture] = {}
         self._by_entry: dict[str, _Capture] = {}
+        self._starting: set[str] = set()
         self._registered = False
 
     def register(self) -> None:
@@ -100,20 +101,24 @@ class PcmWebSocketManager:
         try:
             entry_id = msg.get("config_entry_id")
             client = self._client(entry_id)
-            if entry_id in self._by_entry:
+            if entry_id in self._by_entry or entry_id in self._starting:
                 raise PcmProducerError("producer_busy")
+            self._starting.add(entry_id)
             producer = self.producer_factory(client)
-            await producer.start()
-            capture_id = secrets.token_urlsafe(24)
-            capture = _Capture(entry_id, connection, producer, capture_id)
-            self._captures[capture_id] = capture
-            self._by_entry[entry_id] = capture
-            self._attach_cleanup(capture)
-            connection.send_result(msg["id"], {
-                "capture_id": capture_id,
-                "state": producer.state.value,
-                "sequence": producer.sequence,
-            })
+            try:
+                await producer.start()
+                capture_id = secrets.token_urlsafe(24)
+                capture = _Capture(entry_id, connection, producer, capture_id)
+                self._captures[capture_id] = capture
+                self._by_entry[entry_id] = capture
+                self._attach_cleanup(capture)
+                connection.send_result(msg["id"], {
+                    "capture_id": capture_id,
+                    "state": producer.state.value,
+                    "sequence": producer.sequence,
+                })
+            finally:
+                self._starting.discard(entry_id)
         except (ValueError, PcmProducerError) as err:
             self._send_error(connection, msg, getattr(err, "code", "invalid_request"), str(err))
         except Exception:
