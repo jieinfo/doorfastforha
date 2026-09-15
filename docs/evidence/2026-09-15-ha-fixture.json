@@ -1,0 +1,30 @@
+{
+  "schema": 1,
+  "date": "2026-09-15",
+  "source_refs": {
+    "doorfastforha": "0bd2474",
+    "doorfast": "a5fcca3"
+  },
+  "environment": {
+    "home_assistant": "2024.11.0",
+    "runner": "codex/add-ha-e2e-acceptance",
+    "execution_boundary": "runner executed inside the isolated HA container"
+  },
+  "result": {
+    "checks": 42,
+    "passed": true,
+    "scopes": [
+      "REST config-flow entry creation",
+      "four static frontend resources",
+      "authenticated WebSocket audio start, submit, and stop",
+      "disconnect, hangup, and generation cleanup",
+      "multi-entry isolation",
+      "disable and re-enable unload/reload"
+    ]
+  },
+  "limits": [
+    "Doorfast endpoints were synthetic fixtures served by the runner.",
+    "The run proves HA lifecycle and HTTP PCM contract handling, not physical MT8157 audio delivery or intelligibility.",
+    "Tokens, PCM bodies, and opaque capture identifiers are excluded from this record."
+  ]
+}
