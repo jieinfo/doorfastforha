@@ -153,6 +153,15 @@ class PcmProducer:
     def __repr__(self) -> str:
         return f"{type(self).__name__}(state={self.state.value!r})"
 
+    @property
+    def generation(self) -> int | None:
+        return self._generation
+
+    @property
+    def sequence(self) -> int:
+        return self._sequence
+
+
     def _clear(self) -> None:
         self._runtime = None
         self._generation = None
