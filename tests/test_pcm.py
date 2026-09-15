@@ -70,6 +70,10 @@ def error(code, http=409, **changes):
     return PcmHttpReply(http, body)
 
 
+def bare_error(code):
+    return PcmHttpReply(503, {"error": code})
+
+
 class FakeClient:
     def __init__(self, replies, statuses=None, block_submit=None):
         self.status = status()
@@ -233,6 +237,52 @@ class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b"n" * 320, submits[1][5])
         self.assertTrue(next_outcome.complete)
 
+    async def test_identityless_503_keeps_session_and_sequence_without_replay(self):
+        client = FakeClient([
+            success(audio_session=TOKEN, next_sequence=4),
+            bare_error("state_unavailable"),
+            success(accepted_frames=1, next_sequence=5),
+        ])
+        producer = await started(client)
+
+        unavailable = await producer.submit([b"o" * 320])
+        delivered = await producer.submit([b"n" * 320])
+
+        self.assertEqual((0, 4, False, True), (
+            unavailable.accepted_frames, unavailable.next_sequence,
+            unavailable.complete, unavailable.recovered,
+        ))
+        submits = [call for call in client.calls if call[0] == "submit"]
+        self.assertEqual([4, 4], [call[3] for call in submits])
+        self.assertEqual([b"o" * 320, b"n" * 320], [call[5] for call in submits])
+        self.assertTrue(delivered.complete)
+
+    async def test_identityless_503_open_is_reported_without_retry(self):
+        client = FakeClient([bare_error("status_unavailable")])
+        producer = PcmProducer(client)
+
+        with self.assertRaises(PcmProducerError) as caught:
+            await producer.start()
+
+        self.assertEqual("status_unavailable", caught.exception.code)
+        self.assertEqual(PcmProducerState.IDLE, producer.state)
+        self.assertEqual(2, len(client.calls))
+
+    async def test_rejects_partial_identity_fields_on_503(self):
+        client = FakeClient([
+            success(audio_session=TOKEN),
+            PcmHttpReply(503, {
+                "error": "state_unavailable", "runtime_id": RUNTIME,
+            }),
+        ])
+        producer = await started(client)
+
+        with self.assertRaises(PcmProducerError) as caught:
+            await producer.submit([FRAME])
+
+        self.assertEqual("invalid_response", caught.exception.code)
+        self.assertEqual(PcmProducerState.IDLE, producer.state)
+
     async def test_lost_response_never_resends_old_bytes(self):
         client = FakeClient([
             success(audio_session=TOKEN, next_sequence=3),
@@ -354,6 +404,17 @@ class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
         client = FakeClient([
             success(audio_session=TOKEN),
             error("producer_busy", http=503),
+        ])
+        producer = await started(client)
+        with self.assertRaises(PcmProducerError) as caught:
+            await producer.submit([FRAME])
+        self.assertEqual("invalid_response", caught.exception.code)
+        self.assertEqual(PcmProducerState.IDLE, producer.state)
+
+    async def test_rejects_error_code_for_wrong_route(self):
+        client = FakeClient([
+            success(audio_session=TOKEN),
+            error("random_unavailable", http=503),
         ])
         producer = await started(client)
         with self.assertRaises(PcmProducerError) as caught:

@@ -16,23 +16,6 @@ _LEASE_MS = 2000
 _UINT64_MAX = (1 << 64) - 1
 _RUNTIME_RE = re.compile(r"[0-9a-f]{16}\Z")
 _TOKEN_RE = re.compile(r"[0-9a-f]{32}\Z")
-_ERROR_CODES = frozenset({
-    "audio_tx_inactive",
-    "call_not_talking",
-    "clock_unavailable",
-    "generation_mismatch",
-    "pacing_unavailable",
-    "producer_busy",
-    "random_unavailable",
-    "runtime_mismatch",
-    "send_unavailable",
-    "sequence_duplicate",
-    "sequence_gap",
-    "session_expired",
-    "session_mismatch",
-    "state_unavailable",
-    "status_unavailable",
-})
 _CONFLICT_ERRORS = frozenset({
     "audio_tx_inactive",
     "call_not_talking",
@@ -44,7 +27,32 @@ _CONFLICT_ERRORS = frozenset({
     "session_expired",
     "session_mismatch",
 })
-_UNAVAILABLE_ERRORS = _ERROR_CODES - _CONFLICT_ERRORS
+_ROUTE_ERRORS = {
+    "open": {
+        409: frozenset({
+            "audio_tx_inactive", "call_not_talking", "generation_mismatch",
+            "producer_busy", "runtime_mismatch",
+        }),
+        503: frozenset({
+            "clock_unavailable", "random_unavailable", "state_unavailable",
+            "status_unavailable",
+        }),
+    },
+    "submit": {
+        409: _CONFLICT_ERRORS - {"producer_busy"},
+        503: frozenset({
+            "clock_unavailable", "pacing_unavailable", "send_unavailable",
+            "state_unavailable", "status_unavailable",
+        }),
+    },
+    "end": {
+        409: _CONFLICT_ERRORS - {
+            "producer_busy", "sequence_duplicate", "sequence_gap",
+        },
+        503: frozenset({"state_unavailable", "status_unavailable"}),
+    },
+}
+_IDENTITYLESS_ERRORS = frozenset({"state_unavailable", "status_unavailable"})
 
 
 class PcmProducerState(Enum):
@@ -200,22 +208,34 @@ class PcmProducer:
         return payload, accepted, next_sequence
 
     def _validate_error(
-        self, reply: PcmHttpReply
-    ) -> tuple[str, str, int, int, int]:
-        if reply.status not in {409, 503}:
+        self, reply: PcmHttpReply, operation: str
+    ) -> tuple[str, str | None, int | None, int, int | None]:
+        allowed = _ROUTE_ERRORS.get(operation, {}).get(reply.status)
+        if allowed is None or not isinstance(reply.payload, dict):
+            raise PcmProducerError("invalid_response")
+        code = reply.payload.get("error")
+        if code not in allowed or "status" in reply.payload:
+            raise PcmProducerError("invalid_response")
+        identity_fields = {
+            "runtime_id", "generation", "accepted_frames", "next_sequence"
+        }
+        present = identity_fields.intersection(reply.payload)
+        if not present:
+            if reply.status != 503 or code not in _IDENTITYLESS_ERRORS:
+                raise PcmProducerError("invalid_response")
+            return code, None, None, 0, None
+        if present != identity_fields:
             raise PcmProducerError("invalid_response")
         payload, runtime, generation, accepted, next_sequence = _common_payload(reply)
-        code = payload.get("error")
-        expected_codes = _CONFLICT_ERRORS if reply.status == 409 else _UNAVAILABLE_ERRORS
-        if code not in expected_codes or "status" in payload:
-            raise PcmProducerError("invalid_response")
         return code, runtime, generation, accepted, next_sequence
 
     async def _open(self, runtime: str, generation: int) -> None:
         reply = await self._client.pcm_session_open(runtime, generation)
         if reply.status != 200:
-            code, actual_runtime, actual_generation, _accepted, _next = self._validate_error(reply)
-            if actual_runtime != runtime or actual_generation != generation:
+            code, actual_runtime, actual_generation, _accepted, _next = self._validate_error(reply, "open")
+            if actual_runtime is not None and (
+                actual_runtime != runtime or actual_generation != generation
+            ):
                 raise PcmProducerError("identity_changed")
             raise PcmProducerError(code)
         payload, _accepted, next_sequence = self._validate_success(
@@ -295,7 +315,12 @@ class PcmProducer:
                     self._sequence = next_sequence
                     return PcmSubmitOutcome(accepted, next_sequence, True, False)
 
-                code, actual_runtime, actual_generation, accepted, next_sequence = self._validate_error(reply)
+                code, actual_runtime, actual_generation, accepted, next_sequence = self._validate_error(reply, "submit")
+                if actual_runtime is None:
+                    self.state = PcmProducerState.RECOVERING
+                    await self._recover_identity()
+                    self.state = PcmProducerState.ACTIVE
+                    return PcmSubmitOutcome(0, self._sequence, False, True)
                 if actual_runtime != runtime or actual_generation != generation:
                     raise PcmProducerError("identity_changed")
                 if accepted > len(frames):
@@ -344,9 +369,11 @@ class PcmProducer:
                         )
                     else:
                         _code, actual_runtime, actual_generation, _accepted, _next = (
-                            self._validate_error(reply)
+                            self._validate_error(reply, "end")
                         )
-                        if actual_runtime != runtime or actual_generation != generation:
+                        if actual_runtime is not None and (
+                            actual_runtime != runtime or actual_generation != generation
+                        ):
                             raise PcmProducerError("identity_changed")
             except asyncio.CancelledError:
                 raise
