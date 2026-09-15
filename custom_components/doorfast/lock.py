@@ -1,4 +1,5 @@
 from homeassistant.components.lock import LockEntity
+from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .access_status import access_attributes
@@ -14,6 +15,7 @@ class DoorfastLock(LockEntity):
 
     _attr_translation_key = "unlock"
     _attr_assumed_state = True
+    _attr_should_poll = False
 
     def __init__(self, hass, entry):
         self.hass = hass
@@ -49,11 +51,12 @@ class DoorfastLock(LockEntity):
             async_dispatcher_connect(
                 self.hass,
                 f"{DOMAIN}_{self.entry.entry_id}_STATUS",
-                self.update,
+                self._handle_status,
             )
         )
 
-    def update(self, data):
+    @callback
+    def _handle_status(self, data):
         self._attrs = access_attributes(data)
         self.async_write_ha_state()
 

@@ -2,7 +2,11 @@ from __future__ import annotations
 import aiohttp
 import voluptuous as vol
 from homeassistant import config_entries
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.selector import (
+    TextSelector,
+    TextSelectorConfig,
+    TextSelectorType,
+)
 from .client import DoorfastClient
 from .config_helpers import is_doorfast_status, normalize_bridge_url
 from .const import CONF_POLL_INTERVAL, CONF_SERVER_ADDRESS, DOMAIN
@@ -27,6 +31,8 @@ class DoorfastConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     data={**user_input, CONF_SERVER_ADDRESS: address},
                 )
         return self.async_show_form(step_id="user", errors=errors, data_schema=vol.Schema({
-            vol.Required(CONF_SERVER_ADDRESS): cv.url,
+            vol.Required(CONF_SERVER_ADDRESS): TextSelector(
+                TextSelectorConfig(type=TextSelectorType.URL)
+            ),
             vol.Optional(CONF_POLL_INTERVAL, default=5): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
         }))
