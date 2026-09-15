@@ -4,6 +4,7 @@ import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
 from .generation import resolve_generation
+from .client_types import PcmHttpReply
 
 class DoorfastClient:
     """Client for the Doorfast JSON bridge mapped to the local ubus API."""
@@ -25,6 +26,51 @@ class DoorfastClient:
             data = await response.json(content_type=None)
             if not isinstance(data, dict): raise ValueError("Doorfast bridge returned a non-object response")
             return data
+    async def _pcm_request(self, path: str, params: dict[str, str], headers: dict[str, str], body: bytes) -> PcmHttpReply:
+        async with self.session.request(
+            "POST",
+            f"{self.base_url}{path}",
+            params=params,
+            headers=headers,
+            data=body,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as response:
+            payload = await response.json(content_type=None)
+            if not isinstance(payload, dict):
+                raise ValueError("Doorfast PCM bridge returned a non-object response")
+            return PcmHttpReply(response.status, payload)
+
+    async def pcm_session_open(self, runtime_id: str, generation: int) -> PcmHttpReply:
+        return await self._pcm_request(
+            "/api/v1/audio/session",
+            {"runtime": runtime_id, "generation": str(generation)},
+            {},
+            b"",
+        )
+
+    async def pcm_submit(self, runtime_id: str, generation: int, sequence: int, session_token: str, body: bytes) -> PcmHttpReply:
+        return await self._pcm_request(
+            "/api/v1/audio/submit.pcm",
+            {
+                "runtime": runtime_id,
+                "generation": str(generation),
+                "sequence": str(sequence),
+            },
+            {
+                "Content-Type": "application/octet-stream",
+                "X-Doorfast-Audio-Session": session_token,
+            },
+            body,
+        )
+
+    async def pcm_session_end(self, runtime_id: str, generation: int, session_token: str) -> PcmHttpReply:
+        return await self._pcm_request(
+            "/api/v1/audio/session/end",
+            {"runtime": runtime_id, "generation": str(generation)},
+            {"X-Doorfast-Audio-Session": session_token},
+            b"",
+        )
+
     async def refresh(self):
         self._refresh_sequence += 1
         refresh_sequence = self._refresh_sequence
