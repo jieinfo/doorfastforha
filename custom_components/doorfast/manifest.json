@@ -8,6 +8,6 @@
   "iot_class": "local_polling",
   "translation_key": true,
   "requirements": [],
-  "dependencies": [],
+  "dependencies": ["frontend"],
   "codeowners": ["@jieinfo"]
 }

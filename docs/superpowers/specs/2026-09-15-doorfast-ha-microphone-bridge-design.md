@@ -27,6 +27,30 @@ A transport failure or lost response is ambiguous. The failed body is forgotten.
 
 Stop clears local identity and token even when the best-effort end request fails. All public operations are serialized with one `asyncio.Lock`, which ensures no more than one PCM HTTP request is in flight.
 
-## Scope boundary
+## Slice 1 scope boundary
 
 This slice has no HA WebSocket registration, microphone permissions, JavaScript, service, media-player entity, raw PCM public API, or new dependency. It preserves the existing status, control, video, and downlink-audio behavior.
+
+## Browser card contract
+
+The bundled `doorfast-ptt-card` is registered as a versioned Home Assistant extra
+module and served from the collision-resistant `/doorfast_static` path. Home
+Assistant 2024.11 supports the asynchronous static-path API used here. The static
+route remains installed across integration reloads, while an entry refcount adds
+the module for the first loaded entry and removes it after the last unload. A
+dashboard that was already open during first registration needs one page reload.
+
+The worklet uses its actual browser `sampleRate`, averages every input channel,
+applies a 127-tap Blackman-windowed FIR low-pass filter, and performs streaming area resampling.
+It emits only 160-sample, 320-byte little-endian frames. The sender permits one
+WebSocket request in flight plus five queued frames. When that queue fills it
+drops the oldest unsent audio to bound latency; a failed or ambiguous batch is
+discarded and never replayed. A lifecycle epoch prevents a late response from
+resuming transmission after stop.
+
+Capture begins only from pointer or keyboard activation in a secure context. The
+card creates and resumes its AudioContext during that activation. Release,
+pointer cancellation, lost pointer capture, blur, page hiding, HA WebSocket
+disconnect, track end, card removal, configuration change, or processing and
+transport errors stop local media immediately and request best-effort backend
+release using the entry identity stored with that capture.

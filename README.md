@@ -23,6 +23,27 @@ boundary prepares continuous playback without allowing audio from an earlier
 call into the current one; the integration does not yet expose a live audio
 player entity.
 
+## Push to talk card
+
+The integration bundles and automatically registers a `doorfast-ptt-card` dashboard
+card. After installing or upgrading the integration, restart Home Assistant and
+reload an already-open dashboard once. Add a manual card with the configuration:
+
+```yaml
+type: custom:doorfast-ptt-card
+config_entry_id: YOUR_DOORFAST_CONFIG_ENTRY_ID
+name: Doorfast Push to Talk
+```
+
+Press and hold the button (or hold Space/Enter while it is focused) to transmit.
+The browser requires an HTTPS Home Assistant URL or localhost and prompts for
+microphone access on the first press. Releasing the button, losing focus, hiding
+the page, disconnecting the card, ending the microphone track, or losing the HA
+WebSocket stops capture. Audio is downmixed to mono, filtered and resampled to
+8 kHz signed 16-bit little-endian PCM in exact 20 ms frames. The browser sends
+only an opaque capture ID through HA's authenticated WebSocket; Doorfast producer
+credentials stay in the integration backend.
+
 # 安装方式
 
 ## 使用 HACS 安装
