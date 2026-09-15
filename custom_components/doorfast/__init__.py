@@ -13,6 +13,7 @@ from .client import DoorfastClient
 from .const import DOMAIN, PLATFORMS, CONF_SERVER_ADDRESS, CONF_POLL_INTERVAL, LATEST_EVENT, RING_STATUS, DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
 from .generation import is_ringing
 from .events import EventGate, process_event
+from .frontend import async_register_frontend, async_unregister_frontend
 from .routing import select_client
 from .websocket import PcmWebSocketManager
 
@@ -60,7 +61,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await service_client(hass, call).hangup(call.data.get("generation"), call.data.get("reason", "ha"))
     for name, handler in (("unlock", unlock), ("call_elevator", call_elevator), ("answer", answer), ("hangup", hangup)):
         if not hass.services.has_service(DOMAIN, name): hass.services.async_register(DOMAIN, name, handler)
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS); return True
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    await async_register_frontend(hass, entry.entry_id)
+    return True
 
 async def async_unload_entry(hass, entry):
     pcm_ws = hass.data.get(f"{DOMAIN}_pcm_ws")
@@ -68,6 +71,7 @@ async def async_unload_entry(hass, entry):
         await pcm_ws.release_entry(entry.entry_id)
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unloaded:
+        await async_unregister_frontend(hass, entry.entry_id)
         hass.data[DOMAIN].pop(entry.entry_id, None)
         if not hass.data[DOMAIN]:
             for name in SERVICE_NAMES:
