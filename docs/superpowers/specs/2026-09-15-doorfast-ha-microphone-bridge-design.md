@@ -13,7 +13,7 @@ Add push-to-talk microphone audio from an authenticated Home Assistant browser t
 
 ## Backend contract
 
-The producer lifecycle is `IDLE -> OPENING -> ACTIVE -> RECOVERING -> ACTIVE/IDLE` and `ACTIVE/RECOVERING -> STOPPING -> IDLE`. Start always refreshes status and admits only an exact 16-character lowercase hexadecimal runtime, `call.state == talking`, positive integer call generation, `audio_tx.active is true`, and an equal audio transmit generation.
+The producer lifecycle is `IDLE -> OPENING -> ACTIVE -> RECOVERING -> ACTIVE/IDLE` and `ACTIVE/RECOVERING -> STOPPING -> IDLE`. Start always refreshes status and admits only an exact 16-character lowercase hexadecimal runtime, `call.session == talking`, positive integer call generation, `audio_tx.active is true`, and an equal audio transmit generation.
 
 Session open posts an empty body to `/api/v1/audio/session` with `runtime` and `generation` query values. Submit posts one to five consecutive 320-byte frames to `/api/v1/audio/submit.pcm`, additionally sending `sequence`, `Content-Type: application/octet-stream`, and the private token in `X-Doorfast-Audio-Session`. End posts an empty body to `/api/v1/audio/session/end` with the token header. The token remains encapsulated by the producer and is never returned through a public property or log.
 
