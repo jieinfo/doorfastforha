@@ -10,12 +10,23 @@ from typing import Any, Callable
 from .const import DOMAIN
 from .pcm import PcmProducer, PcmProducerError, PcmProducerState
 
+_FRAME_BYTES = 320
+_MAX_FRAMES = 5
+_MAX_PCM_BYTES = _FRAME_BYTES * _MAX_FRAMES
+_MAX_PCM_B64_CHARS = 4 * ((_MAX_PCM_BYTES + 2) // 3)
+
 try:  # Imported only when running inside Home Assistant.
     import voluptuous as vol
-    from homeassistant.components.websocket_api import async_register_command, websocket_command
+    from homeassistant.components.websocket_api import (
+        async_register_command,
+        async_response,
+        websocket_command,
+    )
 except ImportError:  # pragma: no cover - pure unit tests provide these symbols
     vol = None
     async_register_command = None
+    def async_response(func):
+        return func
     def websocket_command(schema):
         def decorate(func):
             func._ws_schema = schema
@@ -65,12 +76,21 @@ class PcmWebSocketManager:
         connection.send_error(msg.get("id"), code, message)
 
     def _attach_cleanup(self, capture: _Capture) -> None:
-        async def callback() -> None:
+        def callback() -> None:
+            task = self.hass.async_create_task(self.release(capture.capture_id))
+            task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+
+        subscriptions = getattr(capture.connection, "subscriptions", None)
+        if isinstance(subscriptions, dict):
+            subscriptions[("doorfast_pcm", capture.capture_id)] = callback
+            return
+
+        async def async_callback() -> None:
             await self.release(capture.capture_id)
         for name in ("async_add_cleanup_callback", "async_on_remove"):
             method = getattr(capture.connection, name, None)
             if method is not None:
-                method(callback)
+                method(async_callback)
                 return
 
     async def start(self, connection: Any, msg: dict[str, Any]) -> None:
@@ -112,16 +132,22 @@ class PcmWebSocketManager:
         if not isinstance(encoded, str):
             self._send_error(connection, msg, "invalid_format", "pcm must be base64 text")
             return
+        if len(encoded) > _MAX_PCM_B64_CHARS:
+            self._send_error(connection, msg, "invalid_format", "pcm exceeds five frames")
+            return
         try:
             body = base64.b64decode(encoded, validate=True)
         except (ValueError, binascii.Error):
             self._send_error(connection, msg, "invalid_format", "pcm is not valid base64")
             return
-        if not body or len(body) % 320 or not 320 <= len(body) <= 1600:
+        if not body or len(body) % _FRAME_BYTES or not _FRAME_BYTES <= len(body) <= _MAX_PCM_BYTES:
             self._send_error(connection, msg, "invalid_format", "pcm must contain one to five 320-byte frames")
             return
         try:
-            outcome = await capture.producer.submit([body[offset:offset + 320] for offset in range(0, len(body), 320)])
+            outcome = await capture.producer.submit([
+                body[offset:offset + _FRAME_BYTES]
+                for offset in range(0, len(body), _FRAME_BYTES)
+            ])
             connection.send_result(msg["id"], {
                 "capture_id": capture.capture_id,
                 "accepted_frames": outcome.accepted_frames,
@@ -130,10 +156,10 @@ class PcmWebSocketManager:
                 "recovered": outcome.recovered,
             })
         except PcmProducerError as err:
-            self.release(capture.capture_id)
+            await self.release(capture.capture_id)
             self._send_error(connection, msg, err.code, err.code)
         except Exception:
-            self.release(capture.capture_id)
+            await self.release(capture.capture_id)
             self._send_error(connection, msg, "unknown_error", "Unable to submit audio")
 
     async def stop(self, connection: Any, msg: dict[str, Any]) -> None:
@@ -174,6 +200,7 @@ class PcmWebSocketManager:
 
 
 @websocket_command(({vol.Required("type"): "doorfast/audio/start", vol.Required("config_entry_id"): str} if vol else {"type": "doorfast/audio/start"}))
+@async_response
 async def _start(hass: Any, connection: Any, msg: dict[str, Any]) -> None:
     manager = hass.data.get(f"{DOMAIN}_pcm_ws")
     if manager is None:
@@ -183,6 +210,7 @@ async def _start(hass: Any, connection: Any, msg: dict[str, Any]) -> None:
 
 
 @websocket_command(({vol.Required("type"): "doorfast/audio/submit", vol.Required("config_entry_id"): str, vol.Required("capture_id"): str, vol.Required("pcm"): str} if vol else {"type": "doorfast/audio/submit"}))
+@async_response
 async def _submit(hass: Any, connection: Any, msg: dict[str, Any]) -> None:
     manager = hass.data.get(f"{DOMAIN}_pcm_ws")
     if manager is None:
@@ -192,6 +220,7 @@ async def _submit(hass: Any, connection: Any, msg: dict[str, Any]) -> None:
 
 
 @websocket_command(({vol.Required("type"): "doorfast/audio/stop", vol.Required("config_entry_id"): str, vol.Required("capture_id"): str} if vol else {"type": "doorfast/audio/stop"}))
+@async_response
 async def _stop(hass: Any, connection: Any, msg: dict[str, Any]) -> None:
     manager = hass.data.get(f"{DOMAIN}_pcm_ws")
     if manager is None:
