@@ -39,7 +39,7 @@ FRAME = bytes(320)
 def status(generation=7, runtime=RUNTIME):
     return {
         "runtime_id": runtime,
-        "call": {"state": "talking", "generation": generation},
+        "call": {"session": "talking", "generation": generation},
         "audio_tx": {"active": True, "generation": generation},
     }
 
@@ -147,10 +147,10 @@ class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
         malformed = [
             {},
             status(runtime="0123456789ABCDEf"),
-            {**status(), "call": {"state": "ringing", "generation": 7}},
+            {**status(), "call": {"session": "ringing", "generation": 7}},
             {**status(), "audio_tx": {"active": False, "generation": 7}},
             {**status(), "audio_tx": {"active": True, "generation": 8}},
-            {**status(), "call": {"state": "talking", "generation": True}},
+            {**status(), "call": {"session": "talking", "generation": True}},
         ]
         for bad in malformed:
             with self.subTest(bad=bad):
@@ -174,6 +174,7 @@ class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
             success(audio_session=TOKEN, generation=8),
             success(audio_session=TOKEN, next_sequence=-1),
             success(audio_session=TOKEN, lease_ms=True),
+            success(audio_session=TOKEN, lease_ms=1999),
             PcmHttpReply(200, []),
         ]
         for reply in replies:
@@ -254,6 +255,35 @@ class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(reconciled.complete)
         self.assertTrue(delivered.complete)
 
+    async def test_transport_failure_does_not_chain_private_token(self):
+        client = FakeClient([
+            success(audio_session=TOKEN),
+            OSError(f"request header leaked {TOKEN}"),
+        ])
+        producer = await started(client)
+
+        with self.assertRaises(PcmProducerError) as caught:
+            await producer.submit([FRAME])
+
+        self.assertEqual("response_lost", caught.exception.code)
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+        self.assertNotIn(TOKEN, repr(caught.exception))
+
+    async def test_validates_the_exact_status_returned_by_refresh(self):
+        client = FakeClient([success(audio_session=TOKEN, generation=8)])
+        client.status = status(generation=7)
+
+        async def fresh_status():
+            client.calls.append(("refresh",))
+            return status(generation=8)
+
+        client.refresh = fresh_status
+        producer = await started(client)
+
+        self.assertEqual(("open", RUNTIME, 8), client.calls[1])
+        self.assertEqual(PcmProducerState.ACTIVE, producer.state)
+
     async def test_state_unavailable_non_durable_cursor_reconciles_gap_without_replay(self):
         client = FakeClient([
             success(audio_session=TOKEN, next_sequence=5),
@@ -320,6 +350,17 @@ class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("invalid_response", caught.exception.code)
         self.assertEqual(PcmProducerState.IDLE, producer.state)
 
+    async def test_rejects_error_code_with_wrong_http_status(self):
+        client = FakeClient([
+            success(audio_session=TOKEN),
+            error("producer_busy", http=503),
+        ])
+        producer = await started(client)
+        with self.assertRaises(PcmProducerError) as caught:
+            await producer.submit([FRAME])
+        self.assertEqual("invalid_response", caught.exception.code)
+        self.assertEqual(PcmProducerState.IDLE, producer.state)
+
     async def test_malformed_error_is_rejected_without_cursor_change(self):
         client = FakeClient([
             success(audio_session=TOKEN, next_sequence=2),
@@ -356,6 +397,26 @@ class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
         await producer.stop()
         self.assertEqual(PcmProducerState.IDLE, producer.state)
         self.assertEqual(1, len([call for call in client.calls if call[0] == "end"]))
+        self.assertNotIn(TOKEN, repr(producer))
+
+    async def test_stop_propagates_cancellation_after_clearing_state(self):
+        entered = asyncio.Event()
+
+        class BlockingEndClient(FakeClient):
+            async def pcm_session_end(self, runtime, generation, token):
+                self.calls.append(("end", runtime, generation, token))
+                entered.set()
+                await asyncio.Event().wait()
+
+        client = BlockingEndClient([success(audio_session=TOKEN)])
+        producer = await started(client)
+        stopping = asyncio.create_task(producer.stop())
+        await entered.wait()
+        stopping.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await stopping
+        self.assertEqual(PcmProducerState.IDLE, producer.state)
         self.assertNotIn(TOKEN, repr(producer))
 
 

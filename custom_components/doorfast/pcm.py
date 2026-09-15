@@ -12,6 +12,7 @@ from .client_types import PcmHttpReply
 
 _FRAME_BYTES = 320
 _MAX_FRAMES = 5
+_LEASE_MS = 2000
 _UINT64_MAX = (1 << 64) - 1
 _RUNTIME_RE = re.compile(r"[0-9a-f]{16}\Z")
 _TOKEN_RE = re.compile(r"[0-9a-f]{32}\Z")
@@ -32,6 +33,18 @@ _ERROR_CODES = frozenset({
     "state_unavailable",
     "status_unavailable",
 })
+_CONFLICT_ERRORS = frozenset({
+    "audio_tx_inactive",
+    "call_not_talking",
+    "generation_mismatch",
+    "producer_busy",
+    "runtime_mismatch",
+    "sequence_duplicate",
+    "sequence_gap",
+    "session_expired",
+    "session_mismatch",
+})
+_UNAVAILABLE_ERRORS = _ERROR_CODES - _CONFLICT_ERRORS
 
 
 class PcmProducerState(Enum):
@@ -87,7 +100,7 @@ def _status_identity(value: object) -> tuple[str, int]:
     generation = call.get("generation")
     audio_generation = audio_tx.get("generation")
     if (
-        call.get("state") != "talking"
+        call.get("session") != "talking"
         or not _u64(generation)
         or generation == 0
         or audio_tx.get("active") is not True
@@ -140,8 +153,8 @@ class PcmProducer:
         self.state = PcmProducerState.IDLE
 
     async def _fresh_identity(self) -> tuple[str, int]:
-        await self._client.refresh()
-        return _status_identity(self._client.status)
+        status = await self._client.refresh()
+        return _status_identity(status)
 
     def _require_identity(self) -> tuple[str, int, str]:
         if self._runtime is None or self._generation is None or self._token is None:
@@ -171,10 +184,10 @@ class PcmProducer:
         ):
             raise PcmProducerError("invalid_response")
         if operation == "open":
-            if lease == 0 or _TOKEN_RE.fullmatch(token) is None or accepted != 0:
+            if lease != _LEASE_MS or _TOKEN_RE.fullmatch(token) is None or accepted != 0:
                 raise PcmProducerError("invalid_response")
         elif operation == "submit":
-            if lease == 0 or token != "":
+            if lease != _LEASE_MS or token != "":
                 raise PcmProducerError("invalid_response")
         elif lease != 0 or token != "":
             raise PcmProducerError("invalid_response")
@@ -193,7 +206,8 @@ class PcmProducer:
             raise PcmProducerError("invalid_response")
         payload, runtime, generation, accepted, next_sequence = _common_payload(reply)
         code = payload.get("error")
-        if code not in _ERROR_CODES or "status" in payload:
+        expected_codes = _CONFLICT_ERRORS if reply.status == 409 else _UNAVAILABLE_ERRORS
+        if code not in expected_codes or "status" in payload:
             raise PcmProducerError("invalid_response")
         return code, runtime, generation, accepted, next_sequence
 
@@ -247,11 +261,20 @@ class PcmProducer:
             sequence = self._sequence
             if sequence > _UINT64_MAX - len(frames):
                 raise PcmProducerError("sequence_overflow")
+            transport_failed = False
             try:
                 reply = await self._client.pcm_submit(
                     runtime, generation, sequence, token, body
                 )
-            except BaseException as error:
+            except asyncio.CancelledError:
+                # The request may already have reached Doorfast. Drop all
+                # private ownership locally and let the bounded lease expire.
+                self._clear()
+                raise
+            except Exception:
+                transport_failed = True
+
+            if transport_failed:
                 self.state = PcmProducerState.RECOVERING
                 try:
                     await self._recover_identity()
@@ -259,9 +282,10 @@ class PcmProducer:
                     self._clear()
                     raise
                 self.state = PcmProducerState.ACTIVE
-                if isinstance(error, asyncio.CancelledError):
-                    raise
-                raise PcmProducerError("response_lost") from error
+                # Raise outside the transport exception handler so request
+                # headers (including the private producer token) are absent
+                # from the public exception context and cause.
+                raise PcmProducerError("response_lost") from None
 
             try:
                 if reply.status == 200:
@@ -324,7 +348,9 @@ class PcmProducer:
                         )
                         if actual_runtime != runtime or actual_generation != generation:
                             raise PcmProducerError("identity_changed")
-            except BaseException:
+            except asyncio.CancelledError:
+                raise
+            except Exception:
                 pass
             finally:
                 self._clear()

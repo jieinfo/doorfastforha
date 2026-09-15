@@ -428,10 +428,11 @@ class AudioChunkTest(unittest.IsolatedAsyncioTestCase):
         new_refresh = asyncio.create_task(client.refresh())
         await new_refresh
         release_old_refresh.set()
-        await old_refresh
+        old_result = await old_refresh
         release_audio.set()
 
         self.assertEqual(8, client.status["call"]["generation"])
+        self.assertEqual(7, old_result["call"]["generation"])
         self.assertIsNone(await audio_task)
         self.assertIsNone(client._audio_generation)
 

@@ -76,7 +76,7 @@ class DoorfastClient:
         refresh_sequence = self._refresh_sequence
         status = await self._request("GET", "/api/v1/status")
         if refresh_sequence != self._refresh_sequence:
-            return self.status
+            return status
         self.status = status
         self.online = True
         if self._current_video_generation() != self._video_generation:
