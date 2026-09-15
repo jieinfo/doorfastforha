@@ -7,7 +7,7 @@ all producer credentials in memory, and writes only redacted JSONL evidence.
 
 The source references under test are recorded in every evidence file:
 
-* `doorfastforha` `819f94b` (HA main after the PTT card PR)
+* `doorfastforha` `0bd2474` (HA main after setup rollback safety)
 * `doorfast` `a5fcca3` (Doorfast main after the HTTP PCM contract PR)
 
 The loopback fixture is the default mode. It starts a private HTTP server on
@@ -27,7 +27,7 @@ The validated local HA setup is:
 * VM test UDP forward `127.0.0.1:18300` to guest port `8300`
 
 The HA container must have the `doorfast` custom component from
-`doorfastforha` `819f94b` installed and be running. A long-lived administrator
+`doorfastforha` `0bd2474` installed and be running. A long-lived administrator
 token can be supplied in a file, or the runner can read the administrator
 refresh token from HA's `.storage/auth` file without printing it.
 

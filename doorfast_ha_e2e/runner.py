@@ -20,7 +20,7 @@ from .fixture import FRAME_BYTES, FixtureHTTPServer
 from .websocket import HACommandError, HAWebSocket, WebSocketError
 
 
-DOORFASTFORHA_REF = "819f94b"
+DOORFASTFORHA_REF = "0bd2474"
 DOORFAST_REF = "a5fcca3"
 FRONTEND_FILES = {
     "doorfast-ptt-card.mjs": "DoorfastPttCard",
