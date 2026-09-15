@@ -70,3 +70,7 @@ ___
 ```
 
 允许的事件为 `incoming_call`、`call_established`、`hangup`、`timeout` 和 `preempted`。集成会在发布 HA dispatcher 信号前刷新一次 `/api/v1/status`，拒绝格式错误、重复 `(generation,event)` 或旧 generation 事件；重复或旧事件返回 HTTP 202，状态刷新失败返回 HTTP 503，便于转发器稍后重试。
+
+## 验收工具
+
+`run_acceptance.py` 和 `doorfast_ha_e2e/` 提供测试专用的 HA/VM 验收 runner，覆盖配置入口、静态资源、音频 WebSocket 生命周期、断线清理、generation 隔离和重载。使用方式与证据边界见 [`docs/ha-e2e-acceptance-runner.md`](docs/ha-e2e-acceptance-runner.md)；该工具不会随集成运行时加载，也不替代 MT8157 实体设备验收。
