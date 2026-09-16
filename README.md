@@ -48,7 +48,15 @@ credentials stay in the integration backend.
 
 ## 使用 HACS 安装
 
-[![打开 Home Assistant 并打开 HACS商店内的存储库。](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=xswxm&repository=[doorfast](https://github.com/xswxm/doorfast)&category=integration)
+[![在 HACS 中打开 Doorfast 仓库。](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=jieinfo&repository=doorfastforha&category=integration)
+
+也可在 HACS 的“集成”页面打开右上角菜单，选择“自定义存储库”，填入：
+
+```text
+https://github.com/jieinfo/doorfastforha
+```
+
+类型选择“Integration”。安装最新 Release 后重启 Home Assistant，再在“设置 → 设备与服务 → 添加集成”中搜索 `Doorfast`。HACS 使用 GitHub Release 的版本标签更新集成；版本说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 手动安装
 
@@ -61,7 +69,7 @@ ___
 
 ## 主动事件推送
 
-集成保留配置中的 5 秒状态轮询作为断线和事件丢失时的兜底，同时提供受 Home Assistant 身份认证保护的 `POST /api/doorfast/<entry_id>` 入口。由于 Home Assistant 通常与 Doorfast 主机分开部署，HA 不能直接读取主机上的 Unix socket；Doorfast 侧需要增加一个事件转发器，向该 URL 发出 HTTPS POST，并携带 Home Assistant 长期访问令牌。
+集成保留配置中的 5 秒状态轮询作为断线和事件丢失时的兜底，同时提供受 Home Assistant 身份认证保护的 `POST /api/doorfast/<entry_id>` 入口。由于 Home Assistant 通常与 Doorfast 主机分开部署，HA 不能直接读取主机上的 Unix socket；Doorfast 侧需要增加一个事件转发器，向该 URL 发出 HTTP 或 HTTPS POST，并携带 Home Assistant 长期访问令牌。HTTP 仅应在可信内网使用。
 
 事件 JSON 必须为以下格式：
 
