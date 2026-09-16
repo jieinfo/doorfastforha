@@ -58,6 +58,8 @@ https://github.com/jieinfo/doorfastforha
 
 类型选择“Integration”。安装最新 Release 后重启 Home Assistant，再在“设置 → 设备与服务 → 添加集成”中搜索 `Doorfast`。HACS 使用 GitHub Release 的版本标签更新集成；版本说明见 [CHANGELOG.md](CHANGELOG.md)。
 
+完成 Doorfast 集成配置后，在“设置 → 系统 → 日志”搜索 `Doorfast configured`。日志会显示可直接填入 Doorfast LuCI 的配置项 ID，以及事件 relay 路径。
+
 ## 手动安装
 
 将 `custom_components/doorfast` 文件夹复制到 Home Assistant 的 `custom_components` 目录，然后重启 Home Assistant。
