@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import logging
 from datetime import datetime
 from aiohttp.web import Request, Response, json_response
 from homeassistant.core import HomeAssistant
@@ -19,6 +20,7 @@ from .setup_lifecycle import rollback_entry_setup
 from .websocket import PcmWebSocketManager
 
 SERVICE_NAMES = ("unlock", "call_elevator", "answer", "hangup")
+_LOGGER = logging.getLogger(__name__)
 
 def service_client(hass, call):
     try:
@@ -76,6 +78,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         for name, handler in (("unlock", unlock), ("call_elevator", call_elevator), ("answer", answer), ("hangup", hangup)):
             if not hass.services.has_service(DOMAIN, name): hass.services.async_register(DOMAIN, name, handler)
         entry.async_on_unload(async_track_time_interval(hass, poll, timedelta(seconds=entry.data.get(CONF_POLL_INTERVAL, 5))))
+        _LOGGER.info(
+            "Doorfast configured: config entry ID=%s; relay endpoint=/api/doorfast/%s",
+            entry.entry_id, entry.entry_id,
+        )
         return True
     except Exception:
         if existing_view is not None:
