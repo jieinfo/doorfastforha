@@ -37,6 +37,7 @@ class MonitorCoordinator:
         self._viewer_count = 0
         self._status_revision = 0
         self._unloaded = False
+        self._ready_event = asyncio.Event()
 
     @property
     def generation(self) -> int | None:
@@ -98,6 +99,10 @@ class MonitorCoordinator:
         self._generation = generation
         self._state = state
         self._ready = response.get("ready") is True or state in _READY_STATES
+        if self._ready:
+            self._ready_event.set()
+        else:
+            self._ready_event.clear()
         self._status_revision = revision
 
     async def _start_locked(self) -> int:
@@ -116,6 +121,20 @@ class MonitorCoordinator:
             if self._generation is not None and self._state not in _IDLE_STATES:
                 return self._generation
             return await self._start_locked()
+
+    async def async_wait_ready(self, generation: int, timeout: float = 10.0) -> None:
+        """Wait until the exact generation is publishing/viewing."""
+        if self._generation == generation and self._ready:
+            return
+        await asyncio.wait_for(self._wait_ready(generation), timeout)
+
+    async def _wait_ready(self, generation: int) -> None:
+        while True:
+            if self._generation != generation or self._state in {"failed", "idle"}:
+                raise RuntimeError("monitor generation is no longer ready")
+            if self._ready:
+                return
+            await self._ready_event.wait()
 
     async def async_acquire_viewer(self) -> int:
         """Register one HA viewer and return the active Doorfast generation."""
@@ -168,6 +187,7 @@ class MonitorCoordinator:
         if self._generation is None:
             self._state = "idle"
             self._ready = False
+            self._ready_event.clear()
             self._viewer_count = 0
             return
         active_generation = self._generation
@@ -182,6 +202,7 @@ class MonitorCoordinator:
             self._generation = None
             self._state = "idle"
             self._ready = False
+            self._ready_event.clear()
             self._viewer_count = 0
 
     async def async_stop(self) -> None:
@@ -225,6 +246,7 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "idle"
                 self._ready = False
+                self._ready_event.clear()
                 self._viewer_count = 0
             return
         if event == "monitor_failed":
@@ -233,6 +255,7 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "failed"
                 self._ready = False
+                self._ready_event.clear()
                 self._viewer_count = 0
             return
         state = merged.get("state")
