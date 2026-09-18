@@ -68,6 +68,20 @@ class PushEventTest(unittest.TestCase):
         self.assertFalse(gate.accept(validate_event(event(generation=7, event_id=2)), current_generation=8))
         self.assertFalse(gate.accept(validate_event(event(generation=9, event_id=3)), current_generation=10))
 
+    def test_call_gate_resets_high_water_for_new_runtime(self):
+        gate = EventGate()
+
+        self.assertTrue(
+            gate.accept(validate_event(event(generation=8)), 8, "0123456789abcdef")
+        )
+        self.assertTrue(
+            gate.accept(
+                validate_event(event(generation=1, event_id=1)),
+                1,
+                "fedcba9876543210",
+            )
+        )
+
     def test_validates_real_monitor_relay_shape(self):
         payload = validate_event(monitor_event())
 

@@ -4,7 +4,7 @@ This integration is a clean Home Assistant adapter for Doorfast host mode. It co
 
 The integration talks to the Doorfast HTTP bridge at `http://<host>/cgi-bin/doorfast`. The bridge maps requests to the local `ubus` object and exposes `GET /api/v1/status`, `POST /api/v1/unlock`, `/api/v1/answer`, `/api/v1/hangup` and `/api/v1/call_elevator`. Enter the host URL in the setup form; the CGI path is added automatically.
 
-Doorfast status is authoritative for command acceptance, while physical door/elevator confirmation remains a separate status field and is shown as returned by the bridge.
+Doorfast status is authoritative for command acceptance, while physical door/elevator confirmation remains a separate status field and is shown as returned by the bridge. The client reads the current 16-character `runtime_id` from status and includes it in answer, hangup, unlock and elevator requests together with the applicable call generation. A daemon restart changes `runtime_id`; cached media state and call-event high-water marks are then discarded so a delayed command or event cannot collide with a reused generation.
 
 The lock entity sends a momentary unlock command and remains shown as locked because Doorfast does not yet receive a physical door-position signal. Its attributes expose the protocol state, generation, raw reply status and `physical_result_confirmed` value reported by the bridge.
 
@@ -96,7 +96,7 @@ ___
 {"schema_version":1,"event_id":42,"event":"incoming_call","generation":7,"timestamp_ms":1710000000000}
 ```
 
-允许的通话事件为 `incoming_call`、`call_established`、`hangup`、`timeout` 和 `preempted`；主动预览事件为 `monitor_requested`、`monitor_confirmed`、`monitor_media_ready`、`monitor_publishing`、`monitor_failed`、`monitor_stopped` 和 `monitor_preempted`。预览事件必须带有 `status_revision` 以及过滤后的 `status` 对象。集成会在发布 HA dispatcher 信号前刷新一次 `/api/v1/status`，拒绝格式错误、重复 `(generation,event)` 或旧 generation/revision 事件；重复或旧事件返回 HTTP 202，状态刷新失败返回 HTTP 503，便于转发器稍后重试。
+允许的通话事件为 `incoming_call`、`call_established`、`hangup`、`timeout` 和 `preempted`；主动预览事件为 `monitor_requested`、`monitor_confirmed`、`monitor_media_ready`、`monitor_publishing`、`monitor_failed`、`monitor_stopped` 和 `monitor_preempted`。预览事件必须带有 `status_revision` 以及过滤后的 `status` 对象。集成会在发布 HA dispatcher 信号前刷新一次 `/api/v1/status`，拒绝格式错误、重复 `(generation,event)` 或旧 generation/revision 事件；Doorfast 的 `runtime_id` 变化时会重置通话和预览事件高水位。重复或旧事件返回 HTTP 202，状态刷新失败返回 HTTP 503，便于转发器稍后重试。
 
 ## 验收工具
 

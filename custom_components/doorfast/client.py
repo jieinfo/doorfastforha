@@ -77,25 +77,51 @@ class DoorfastClient:
         status = await self._request("GET", "/api/v1/status")
         if refresh_sequence != self._refresh_sequence:
             return status
+        previous_runtime_id = self.status.get("runtime_id")
+        runtime_changed = (
+            isinstance(previous_runtime_id, str)
+            and previous_runtime_id
+            and status.get("runtime_id") != previous_runtime_id
+        )
         self.status = status
         self.online = True
-        if self._current_video_generation() != self._video_generation:
+        if runtime_changed or self._current_video_generation() != self._video_generation:
             self._clear_video_cache()
-        if self._current_audio_generation() != self._audio_generation:
+        if runtime_changed or self._current_audio_generation() != self._audio_generation:
             self._clear_audio_cursor()
         return self.status
+
+    def _current_runtime_id(self) -> str | None:
+        runtime_id = self.status.get("runtime_id")
+        if (
+            not isinstance(runtime_id, str)
+            or len(runtime_id) != 16
+            or any(character not in "0123456789abcdef" for character in runtime_id)
+        ):
+            return None
+        return runtime_id
+
+    def _control_runtime_id(self) -> str:
+        runtime_id = self._current_runtime_id()
+        if runtime_id is None:
+            raise ValueError("Doorfast status has no valid runtime_id")
+        return runtime_id
+
     async def unlock(self, generation=None):
         generation = resolve_generation(self.status, generation)
-        return await self._request("POST", "/api/v1/unlock", {"generation": generation})
+        return await self._request("POST", "/api/v1/unlock", {
+            "runtime_id": self._control_runtime_id(),
+            "generation": generation,
+        })
     async def answer(self, generation=None, primary_media_port=DEFAULT_VIDEO_PORT, secondary_media_port=DEFAULT_AUDIO_PORT, duration_seconds=DEFAULT_CALL_DURATION):
         generation = resolve_generation(self.status, generation)
-        return await self._request("POST", "/api/v1/answer", {"generation": generation, "primary_media_port": primary_media_port, "secondary_media_port": secondary_media_port, "duration_seconds": duration_seconds})
+        return await self._request("POST", "/api/v1/answer", {"runtime_id": self._control_runtime_id(), "generation": generation, "primary_media_port": primary_media_port, "secondary_media_port": secondary_media_port, "duration_seconds": duration_seconds})
     async def hangup(self, generation=None, reason="ha"):
         generation = resolve_generation(self.status, generation)
-        return await self._request("POST", "/api/v1/hangup", {"generation": generation, "reason": reason})
+        return await self._request("POST", "/api/v1/hangup", {"runtime_id": self._control_runtime_id(), "generation": generation, "reason": reason})
     async def call_elevator(self, direction="up"):
         if direction not in {"up", "down"}: raise ValueError("direction must be up or down")
-        return await self._request("POST", "/api/v1/call_elevator", {"direction": direction})
+        return await self._request("POST", "/api/v1/call_elevator", {"runtime_id": self._control_runtime_id(), "direction": direction})
 
     @staticmethod
     def _monitor_generation(generation: Any) -> int:
@@ -154,6 +180,18 @@ class DoorfastClient:
         self._video_etag = None
         self._video_frame = None
 
+    def _video_request_is_current(self, runtime_id: str, generation: int) -> bool:
+        return (
+            self._current_runtime_id() == runtime_id
+            and self._current_video_generation() == generation
+        )
+
+    def _clear_video_cache_for_request(
+        self, runtime_id: str, generation: int
+    ) -> None:
+        if self._video_request_is_current(runtime_id, generation):
+            self._clear_video_cache()
+
     def _current_audio_generation(self) -> int | None:
         call = self.status.get("call")
         audio = self.status.get("audio")
@@ -183,9 +221,12 @@ class DoorfastClient:
         self._audio_etag = None
 
     def _audio_request_is_current(
-        self, generation: int, previous_revision: int | None
+        self, runtime_id: str, generation: int, previous_revision: int | None
     ) -> bool:
-        if self._current_audio_generation() != generation:
+        if (
+            self._current_runtime_id() != runtime_id
+            or self._current_audio_generation() != generation
+        ):
             return False
         if previous_revision is None:
             return self._audio_generation is None and self._audio_revision is None
@@ -195,9 +236,11 @@ class DoorfastClient:
         )
 
     def _clear_audio_cursor_for_request(
-        self, generation: int, previous_revision: int | None
+        self, runtime_id: str, generation: int, previous_revision: int | None
     ) -> None:
-        if self._audio_request_is_current(generation, previous_revision):
+        if self._audio_request_is_current(
+            runtime_id, generation, previous_revision
+        ):
             self._clear_audio_cursor()
 
     @staticmethod
@@ -212,8 +255,9 @@ class DoorfastClient:
         return int(raw)
 
     async def latest_video_frame(self) -> bytes | None:
+        runtime_id = self._current_runtime_id()
         generation = self._current_video_generation()
-        if generation is None:
+        if runtime_id is None or generation is None:
             self._clear_video_cache()
             return None
         headers = {}
@@ -226,20 +270,33 @@ class DoorfastClient:
             timeout=aiohttp.ClientTimeout(total=10),
         ) as response:
             if response.status == 304:
-                return self._video_frame if self._video_generation == generation else None
+                return (
+                    self._video_frame
+                    if self._video_request_is_current(runtime_id, generation)
+                    and self._video_generation == generation
+                    else None
+                )
             if response.status in {404, 409}:
-                self._clear_video_cache()
+                self._clear_video_cache_for_request(runtime_id, generation)
                 return None
             if response.status == 503:
-                return self._video_frame if self._video_generation == generation else None
+                return (
+                    self._video_frame
+                    if self._video_request_is_current(runtime_id, generation)
+                    and self._video_generation == generation
+                    else None
+                )
             response.raise_for_status()
             response_generation = response.headers.get("X-Doorfast-Generation")
             if response_generation != str(generation):
-                self._clear_video_cache()
+                self._clear_video_cache_for_request(runtime_id, generation)
                 return None
             frame = await response.read()
-            if not frame:
-                self._clear_video_cache()
+            if (
+                not frame
+                or not self._video_request_is_current(runtime_id, generation)
+            ):
+                self._clear_video_cache_for_request(runtime_id, generation)
                 return None
             self._video_generation = generation
             self._video_etag = response.headers.get("ETag")
@@ -247,8 +304,9 @@ class DoorfastClient:
             return frame
 
     async def latest_audio_chunk(self) -> bytes | None:
+        runtime_id = self._current_runtime_id()
         generation = self._current_audio_generation()
-        if generation is None:
+        if runtime_id is None or generation is None:
             self._clear_audio_cursor()
             return None
         latest_revision = self.status["audio"]["snapshot_packet_count"]
@@ -269,7 +327,9 @@ class DoorfastClient:
             if response.status == 304:
                 return None
             if response.status in {404, 409}:
-                self._clear_audio_cursor_for_request(generation, expected_previous)
+                self._clear_audio_cursor_for_request(
+                    runtime_id, generation, expected_previous
+                )
                 return None
             if response.status == 503:
                 return None
@@ -299,10 +359,12 @@ class DoorfastClient:
                 )
                 or not chunk
                 or not self._audio_request_is_current(
-                    generation, expected_previous
+                    runtime_id, generation, expected_previous
                 )
             ):
-                self._clear_audio_cursor_for_request(generation, expected_previous)
+                self._clear_audio_cursor_for_request(
+                    runtime_id, generation, expected_previous
+                )
                 return None
             self._audio_generation = generation
             self._audio_revision = revision

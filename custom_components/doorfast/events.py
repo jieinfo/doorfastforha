@@ -91,13 +91,25 @@ class EventGate:
         self._capacity = capacity
         self._order: deque[tuple[int, str]] = deque()
         self.highest_generation = 0
+        self.runtime_id: str | None = None
         self._monitor_seen: set[int] = set()
         self._monitor_order: deque[int] = deque()
         self.highest_monitor_generation = 0
         self.highest_monitor_revision = 0
         self.monitor_runtime_id: str | None = None
 
-    def accept(self, payload: dict[str, Any], current_generation: int | None = None) -> bool:
+    def accept(
+        self,
+        payload: dict[str, Any],
+        current_generation: int | None = None,
+        runtime_id: str | None = None,
+    ) -> bool:
+        if isinstance(runtime_id, str) and runtime_id:
+            if self.runtime_id != runtime_id:
+                self._seen.clear()
+                self._order.clear()
+                self.highest_generation = 0
+                self.runtime_id = runtime_id
         generation = payload["generation"]
         event = payload["event"]
         key = (generation, event)
@@ -195,6 +207,7 @@ async def process_event(payload: Any, client: Any, gate: EventGate, dispatch, ri
         accepted = gate.accept(
             event,
             current if isinstance(current, int) and not isinstance(current, bool) else None,
+            client.status.get("runtime_id") if isinstance(client.status.get("runtime_id"), str) else None,
         )
     if not accepted:
         return 202, {"status": "ignored", "reason": "duplicate_or_stale"}
