@@ -16,6 +16,32 @@ def event(generation=7, name="incoming_call", event_id=1):
     return {"schema_version": 1, "event_id": event_id, "event": name, "generation": generation, "timestamp_ms": 1000}
 
 
+def monitor_event(
+    generation=9,
+    name="monitor_publishing",
+    event_id=4,
+    status_revision=7,
+    status=None,
+):
+    if status is None:
+        status = {
+            "state": "publishing",
+            "encoder_running": True,
+            "queue_drops": 0,
+            "relay_failures": 0,
+            "failure": "",
+        }
+    return {
+        "schema_version": 1,
+        "event_id": event_id,
+        "event": name,
+        "generation": generation,
+        "status_revision": status_revision,
+        "timestamp_ms": 1000,
+        "status": status,
+    }
+
+
 class PushEventTest(unittest.TestCase):
     def test_rejects_malformed_event(self):
         for payload in ({}, event(name="unknown"), event(generation=0), {**event(), "schema_version": 2}):
@@ -41,6 +67,83 @@ class PushEventTest(unittest.TestCase):
         self.assertTrue(gate.accept(validate_event(event(generation=8))))
         self.assertFalse(gate.accept(validate_event(event(generation=7, event_id=2)), current_generation=8))
         self.assertFalse(gate.accept(validate_event(event(generation=9, event_id=3)), current_generation=10))
+
+    def test_validates_real_monitor_relay_shape(self):
+        payload = validate_event(monitor_event())
+
+        self.assertEqual("monitor_publishing", payload["event"])
+        self.assertEqual(7, payload["status_revision"])
+        self.assertEqual("publishing", payload["status"]["state"])
+
+    def test_rejects_malformed_or_oversized_monitor_status(self):
+        invalid = (
+            monitor_event(status_revision=0),
+            monitor_event(status_revision=True),
+            {key: value for key, value in monitor_event().items() if key != "status"},
+            monitor_event(status="publishing"),
+            monitor_event(status={"detail": "x" * 17000}),
+        )
+        for payload in invalid:
+            with self.subTest(payload_type=type(payload.get("status"))):
+                with self.assertRaises(ValueError):
+                    validate_event(payload)
+
+    def test_rejects_sensitive_monitor_fields_at_any_depth(self):
+        for field in ("password", "token", "authorization", "sdp", "candidate", "url"):
+            with self.subTest(field=field):
+                payload = monitor_event(
+                    status={"state": "publishing", "nested": [{field: "secret"}]}
+                )
+                with self.assertRaises(ValueError):
+                    validate_event(payload)
+
+    def test_monitor_gate_rejects_duplicate_id_and_stale_revision(self):
+        gate = EventGate()
+        first = validate_event(monitor_event(event_id=4, status_revision=7))
+        duplicate_id = validate_event(
+            monitor_event(
+                name="monitor_stopped", event_id=4, status_revision=8
+            )
+        )
+        stale_revision = validate_event(
+            monitor_event(event_id=5, status_revision=6)
+        )
+        next_generation = validate_event(
+            monitor_event(generation=10, event_id=6, status_revision=1)
+        )
+
+        self.assertTrue(gate.accept_monitor(first, 9, 7))
+        self.assertFalse(gate.accept_monitor(duplicate_id, 9, 8))
+        self.assertFalse(gate.accept_monitor(stale_revision, 9, 7))
+        self.assertTrue(gate.accept_monitor(next_generation, 10, 1))
+
+    def test_monitor_gate_rejects_conflicting_event_at_same_revision(self):
+        gate = EventGate()
+        first = validate_event(monitor_event(event_id=4, status_revision=7))
+        conflict = validate_event(
+            monitor_event(
+                name="monitor_failed", event_id=5, status_revision=7
+            )
+        )
+
+        self.assertTrue(gate.accept_monitor(first, 9, 7, "runtime-a"))
+        self.assertFalse(gate.accept_monitor(conflict, 9, 7, "runtime-a"))
+
+    def test_monitor_gate_resets_high_water_for_new_runtime(self):
+        gate = EventGate()
+        old_runtime = validate_event(
+            monitor_event(generation=9, event_id=4, status_revision=7)
+        )
+        new_runtime = validate_event(
+            monitor_event(generation=1, event_id=1, status_revision=2)
+        )
+
+        self.assertTrue(
+            gate.accept_monitor(old_runtime, 9, 7, "runtime-a")
+        )
+        self.assertTrue(
+            gate.accept_monitor(new_runtime, 1, 2, "runtime-b")
+        )
 
 
 if __name__ == "__main__":
@@ -99,3 +202,59 @@ class ProcessEventTest(unittest.IsolatedAsyncioTestCase):
             online = True
         status, body = await MODULE.process_event({}, Client(), EventGate(), lambda *_: self.fail("must not dispatch"), lambda _: False)
         self.assertEqual(400, status)
+
+    async def test_monitor_event_is_gated_against_media_not_call_generation(self):
+        class Client:
+            status = {}
+            online = True
+
+            async def refresh(self):
+                self.status = {
+                    "runtime_id": "runtime-a",
+                    "call": {"generation": 42, "session": "idle"},
+                    "media": {
+                        "generation": 9,
+                        "status_revision": 7,
+                        "state": "publishing",
+                    },
+                }
+                return self.status
+
+        seen = []
+        status, body = await MODULE.process_event(
+            monitor_event(),
+            Client(),
+            EventGate(),
+            lambda kind, value: seen.append((kind, value)),
+            lambda _: False,
+        )
+
+        self.assertEqual((200, {"status": "success"}), (status, body))
+        self.assertEqual("monitor_publishing", seen[1][1]["event"])
+
+    async def test_monitor_event_older_than_refreshed_media_is_ignored(self):
+        class Client:
+            status = {}
+            online = True
+
+            async def refresh(self):
+                self.status = {
+                    "runtime_id": "runtime-a",
+                    "media": {
+                        "generation": 9,
+                        "status_revision": 8,
+                        "state": "viewing",
+                    }
+                }
+                return self.status
+
+        status, body = await MODULE.process_event(
+            monitor_event(status_revision=7),
+            Client(),
+            EventGate(),
+            lambda *_: self.fail("stale monitor event must not dispatch"),
+            lambda _: False,
+        )
+
+        self.assertEqual(202, status)
+        self.assertEqual("duplicate_or_stale", body["reason"])

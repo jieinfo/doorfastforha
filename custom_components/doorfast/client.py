@@ -96,6 +96,40 @@ class DoorfastClient:
     async def call_elevator(self, direction="up"):
         if direction not in {"up", "down"}: raise ValueError("direction must be up or down")
         return await self._request("POST", "/api/v1/call_elevator", {"direction": direction})
+
+    @staticmethod
+    def _monitor_generation(generation: Any) -> int:
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or generation <= 0
+        ):
+            raise ValueError("monitor generation must be a positive integer")
+        return generation
+
+    async def start_monitor(self) -> dict[str, Any]:
+        return await self._request("POST", "/api/v1/monitor/start", {})
+
+    async def stop_monitor(self, generation: int) -> dict[str, Any]:
+        generation = self._monitor_generation(generation)
+        return await self._request(
+            "POST", "/api/v1/monitor/stop", {"generation": generation}
+        )
+
+    async def set_monitor_viewer(
+        self, generation: int, active: bool
+    ) -> dict[str, Any]:
+        generation = self._monitor_generation(generation)
+        if not isinstance(active, bool):
+            raise ValueError("monitor viewer active must be a boolean")
+        return await self._request(
+            "POST",
+            "/api/v1/monitor/viewer",
+            {"generation": generation, "active": active},
+        )
+
+    async def monitor_status(self) -> dict[str, Any]:
+        return await self._request("GET", "/api/v1/monitor/status")
     def _current_video_generation(self) -> int | None:
         call = self.status.get("call")
         video = self.status.get("video")

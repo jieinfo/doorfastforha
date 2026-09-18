@@ -6,7 +6,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 
 ROOT = Path(__file__).parents[1]
@@ -139,6 +139,66 @@ class AnswerPayloadTest(unittest.IsolatedAsyncioTestCase):
                 "duration_seconds": 120,
             },
         )
+
+
+class MonitorPayloadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_exact_monitor_endpoints_and_payloads(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client._request = AsyncMock(
+            side_effect=[
+                {"state": "queued", "generation": 9},
+                {"state": "publishing", "generation": 9},
+                {"state": "queued", "generation": 9, "active": True},
+                {"state": "stopping", "generation": 9},
+            ]
+        )
+
+        self.assertEqual(
+            {"state": "queued", "generation": 9},
+            await client.start_monitor(),
+        )
+        self.assertEqual(
+            {"state": "publishing", "generation": 9},
+            await client.monitor_status(),
+        )
+        self.assertEqual(
+            {"state": "queued", "generation": 9, "active": True},
+            await client.set_monitor_viewer(9, True),
+        )
+        self.assertEqual(
+            {"state": "stopping", "generation": 9},
+            await client.stop_monitor(9),
+        )
+        self.assertEqual(
+            [
+                call("POST", "/api/v1/monitor/start", {}),
+                call("GET", "/api/v1/monitor/status"),
+                call(
+                    "POST",
+                    "/api/v1/monitor/viewer",
+                    {"generation": 9, "active": True},
+                ),
+                call("POST", "/api/v1/monitor/stop", {"generation": 9}),
+            ],
+            client._request.await_args_list,
+        )
+
+    async def test_rejects_invalid_monitor_generation_and_active_flag(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client._request = AsyncMock()
+
+        for generation in (None, 0, -1, True, "9"):
+            with self.subTest(generation=generation):
+                with self.assertRaises(ValueError):
+                    await client.stop_monitor(generation)
+                with self.assertRaises(ValueError):
+                    await client.set_monitor_viewer(generation, True)
+        for active in (None, 0, 1, "true"):
+            with self.subTest(active=active):
+                with self.assertRaises(ValueError):
+                    await client.set_monitor_viewer(9, active)
+
+        client._request.assert_not_awaited()
 
 
 class VideoFrameTest(unittest.IsolatedAsyncioTestCase):
