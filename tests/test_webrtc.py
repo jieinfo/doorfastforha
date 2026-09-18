@@ -227,6 +227,38 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(1, self.coordinator.released)
 
+    async def test_go2rtc_error_releases_viewer_once(self):
+        task = asyncio.create_task(
+            self.provider.async_handle_async_webrtc_offer(
+                FakeCamera(), "offer", "session-1", lambda _message: None
+            )
+        )
+        await asyncio.sleep(0)
+        await self.ws.incoming.put(
+            {"type": "error", "value": "source unavailable"}
+        )
+        with self.assertRaises(RuntimeError):
+            await asyncio.wait_for(task, 1)
+        self.assertEqual(1, self.coordinator.released)
+
+    async def test_generation_change_closes_stale_session(self):
+        task = asyncio.create_task(
+            self.provider.async_handle_async_webrtc_offer(
+                FakeCamera(), "offer", "session-1", lambda _message: None
+            )
+        )
+        await asyncio.sleep(0)
+        await self.ws.incoming.put(
+            {"type": "webrtc/answer", "value": "answer"}
+        )
+        await asyncio.wait_for(task, 1)
+
+        self.coordinator.generation = 10
+        await self.provider.async_reconcile_monitor()
+
+        self.assertTrue(self.ws.closed)
+        self.assertEqual(1, self.coordinator.released)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,34 @@ class FakePcm:
         self.released.append(entry_id)
 
 
+class FakeMonitor:
+    def __init__(self):
+        self.closed = 0
+
+    async def async_close(self):
+        self.closed += 1
+
+
+class FakeProvider:
+    def __init__(self):
+        self.closed = 0
+        self.reconciled = 0
+
+    async def async_close_entry(self):
+        self.closed += 1
+
+    async def async_reconcile_monitor(self):
+        self.reconciled += 1
+
+
+class FakeStatusMonitor:
+    def __init__(self):
+        self.applied = []
+
+    async def async_apply_status(self, status):
+        self.applied.append(status)
+
+
 def load_module():
     # Import the helper without loading Home Assistant-dependent package code.
     package = types.ModuleType("custom_components.doorfast")
@@ -81,11 +109,54 @@ MODULE = load_module()
 
 
 class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_syncs_polled_media_then_reconciles_provider(self):
+        monitor = FakeStatusMonitor()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(
+            status={"media": {"state": "publishing", "generation": 9}}
+        )
+
+        await MODULE.sync_monitor_state(client, monitor, provider)
+
+        self.assertEqual([client.status["media"]], monitor.applied)
+        self.assertEqual(1, provider.reconciled)
+
+    async def test_syncs_relay_event_after_authoritative_media(self):
+        monitor = FakeStatusMonitor()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(
+            status={
+                "media": {"state": "idle", "generation": 0},
+                "media_event": {
+                    "event": "monitor_preempted",
+                    "generation": 9,
+                },
+            }
+        )
+
+        await MODULE.sync_monitor_state(
+            client, monitor, provider, include_event=True
+        )
+
+        self.assertEqual(
+            [client.status["media"], client.status["media_event"]],
+            monitor.applied,
+        )
+        self.assertEqual(1, provider.reconciled)
+
     async def test_cleans_all_resources_when_first_entry_setup_fails(self):
         hass = FakeHass(("unlock", "call_elevator", "answer", "hangup"))
         hass.data["doorfast"] = {FakeEntry.entry_id: object()}
         hass.data["doorfast_event_views"] = {FakeEntry.entry_id: object()}
+        hass.data["doorfast_monitors"] = {FakeEntry.entry_id: object()}
+        hass.data["doorfast_webrtc_providers"] = {FakeEntry.entry_id: object()}
+        hass.data["doorfast_webrtc_unsubscribers"] = {
+            FakeEntry.entry_id: object()
+        }
         pcm = FakePcm()
+        monitor = FakeMonitor()
+        provider = FakeProvider()
+        provider_unregistered = []
         unregistered = []
 
         async def unregister_frontend(_hass, entry_id):
@@ -100,12 +171,21 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
             frontend_registered=True,
             view_created=True,
             service_names=("unlock", "call_elevator", "answer", "hangup"),
+            monitor=monitor,
+            provider=provider,
+            unregister_webrtc=lambda: provider_unregistered.append(True),
         )
 
         self.assertEqual(pcm.released, [FakeEntry.entry_id])
         self.assertEqual(unregistered, [FakeEntry.entry_id])
         self.assertNotIn("doorfast", hass.data)
         self.assertNotIn("doorfast_event_views", hass.data)
+        self.assertNotIn("doorfast_monitors", hass.data)
+        self.assertNotIn("doorfast_webrtc_providers", hass.data)
+        self.assertNotIn("doorfast_webrtc_unsubscribers", hass.data)
+        self.assertEqual(1, monitor.closed)
+        self.assertEqual(1, provider.closed)
+        self.assertEqual([True], provider_unregistered)
         self.assertEqual(
             hass.services.removed,
             [("doorfast", name) for name in ("unlock", "call_elevator", "answer", "hangup")],

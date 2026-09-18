@@ -8,6 +8,24 @@ from typing import Any
 from .const import DOMAIN, PLATFORMS
 
 
+async def sync_monitor_state(
+    client: Any,
+    monitor: Any,
+    provider: Any,
+    *,
+    include_event: bool = False,
+) -> None:
+    """Apply authoritative media state and optionally its accepted relay event."""
+    media = client.status.get("media")
+    if isinstance(media, dict):
+        await monitor.async_apply_status(media)
+    if include_event:
+        event = client.status.get("media_event")
+        if isinstance(event, dict):
+            await monitor.async_apply_status(event)
+    await provider.async_reconcile_monitor()
+
+
 async def rollback_entry_setup(
     hass: Any,
     entry: Any,
@@ -18,6 +36,9 @@ async def rollback_entry_setup(
     frontend_registered: bool,
     view_created: bool,
     service_names: Iterable[str],
+    monitor: Any | None = None,
+    provider: Any | None = None,
+    unregister_webrtc: Callable[[], None] | None = None,
 ) -> None:
     """Undo resources acquired by a partially initialized config entry.
 
@@ -26,6 +47,35 @@ async def rollback_entry_setup(
     effort and independent so a failed platform unload cannot strand the
     client, PCM capture owner, frontend reference, or service registrations.
     """
+
+    if provider is not None:
+        try:
+            await provider.async_close_entry()
+        except Exception:
+            pass
+
+    if unregister_webrtc is not None:
+        try:
+            unregister_webrtc()
+        except Exception:
+            pass
+
+    if monitor is not None:
+        try:
+            await monitor.async_close()
+        except Exception:
+            pass
+
+    for key in (
+        f"{DOMAIN}_monitors",
+        f"{DOMAIN}_webrtc_providers",
+        f"{DOMAIN}_webrtc_unsubscribers",
+    ):
+        resources = hass.data.get(key)
+        if isinstance(resources, dict):
+            resources.pop(entry.entry_id, None)
+            if not resources:
+                hass.data.pop(key, None)
 
     if platforms_forward_attempted:
         try:

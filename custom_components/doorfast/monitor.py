@@ -7,7 +7,7 @@ from typing import Any
 
 
 _READY_STATES = frozenset(("publishing", "viewing"))
-_IDLE_STATES = frozenset(("idle", "stopped", "failed"))
+_IDLE_STATES = frozenset(("idle", "stopped", "failed", "unavailable"))
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -37,7 +37,7 @@ class MonitorCoordinator:
         self._viewer_count = 0
         self._status_revision = 0
         self._unloaded = False
-        self._ready_event = asyncio.Event()
+        self._status_event = asyncio.Event()
 
     @property
     def generation(self) -> int | None:
@@ -99,11 +99,8 @@ class MonitorCoordinator:
         self._generation = generation
         self._state = state
         self._ready = response.get("ready") is True or state in _READY_STATES
-        if self._ready:
-            self._ready_event.set()
-        else:
-            self._ready_event.clear()
         self._status_revision = revision
+        self._status_event.set()
 
     async def _start_locked(self) -> int:
         if self._unloaded:
@@ -130,11 +127,18 @@ class MonitorCoordinator:
 
     async def _wait_ready(self, generation: int) -> None:
         while True:
-            if self._generation != generation or self._state in {"failed", "idle"}:
-                raise RuntimeError("monitor generation is no longer ready")
-            if self._ready:
-                return
-            await self._ready_event.wait()
+            async with self._lock:
+                if (
+                    self._generation != generation
+                    or self._state
+                    in {"failed", "idle", "stopped", "stopping", "unavailable"}
+                    or self._unloaded
+                ):
+                    raise RuntimeError("monitor generation is no longer ready")
+                if self._ready:
+                    return
+                self._status_event.clear()
+            await self._status_event.wait()
 
     async def async_acquire_viewer(self) -> int:
         """Register one HA viewer and return the active Doorfast generation."""
@@ -147,10 +151,44 @@ class MonitorCoordinator:
             generation = self._generation
             if generation is None:
                 raise RuntimeError("monitor generation was not created")
-            if self._viewer_count == 0:
-                await self._client.set_monitor_viewer(generation, True)
-            self._viewer_count += 1
-            return generation
+        try:
+            # Doorfast accepts the viewer edge only after the monitor reaches
+            # publishing/viewing. Keep this wait outside the state lock so
+            # relay or poll updates can advance the generation.
+            await self.async_wait_ready(generation)
+            async with self._lock:
+                if (
+                    self._generation != generation
+                    or not self._ready
+                    or self._state in _IDLE_STATES
+                ):
+                    raise RuntimeError("monitor generation is no longer ready")
+                if self._viewer_count == 0:
+                    try:
+                        await self._client.set_monitor_viewer(generation, True)
+                    except Exception:
+                        await self._stop_locked(generation)
+                        raise
+                self._viewer_count += 1
+                return generation
+        except asyncio.CancelledError:
+            async with self._lock:
+                if (
+                    self._generation == generation
+                    and self._viewer_count == 0
+                    and self._state not in _IDLE_STATES
+                ):
+                    await self._stop_locked(generation)
+            raise
+        except Exception:
+            async with self._lock:
+                if (
+                    self._generation == generation
+                    and self._viewer_count == 0
+                    and self._state not in _IDLE_STATES
+                ):
+                    await self._stop_locked(generation)
+            raise
 
     async def async_release_viewer(self) -> None:
         """Release one viewer and schedule a delayed stop at the last edge."""
@@ -187,8 +225,8 @@ class MonitorCoordinator:
         if self._generation is None:
             self._state = "idle"
             self._ready = False
-            self._ready_event.clear()
             self._viewer_count = 0
+            self._status_event.set()
             return
         active_generation = self._generation
         if generation is not None and generation != active_generation:
@@ -202,8 +240,8 @@ class MonitorCoordinator:
             self._generation = None
             self._state = "idle"
             self._ready = False
-            self._ready_event.clear()
             self._viewer_count = 0
+            self._status_event.set()
 
     async def async_stop(self) -> None:
         """Stop the current generation immediately and clear local state."""
@@ -246,8 +284,8 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "idle"
                 self._ready = False
-                self._ready_event.clear()
                 self._viewer_count = 0
+                self._status_event.set()
             return
         if event == "monitor_failed":
             async with self._lock:
@@ -255,8 +293,8 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "failed"
                 self._ready = False
-                self._ready_event.clear()
                 self._viewer_count = 0
+                self._status_event.set()
             return
         state = merged.get("state")
         if state in _IDLE_STATES:
@@ -266,12 +304,15 @@ class MonitorCoordinator:
                     _positive_int(generation, "monitor generation")
                 self._cancel_grace_locked()
                 self._generation = None
-                self._state = "idle"
+                self._state = (
+                    state if state in {"failed", "unavailable"} else "idle"
+                )
                 self._ready = False
                 self._viewer_count = 0
                 revision = merged.get("status_revision", self._status_revision)
                 if isinstance(revision, int) and not isinstance(revision, bool):
                     self._status_revision = revision
+                self._status_event.set()
             return
         async with self._lock:
             self._set_response_locked(merged)

@@ -82,6 +82,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
 
         generation = await self._coordinator.async_acquire_viewer()
         viewer_acquired = True
+        state: _Session | None = None
         try:
             await self._coordinator.async_wait_ready(generation, timeout=_OFFER_TIMEOUT)
             websocket = await self._session.ws_connect(GO2RTC_WS_URL)
@@ -101,14 +102,16 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             )
             await asyncio.wait_for(asyncio.shield(state.answer), _OFFER_TIMEOUT)
         except asyncio.CancelledError:
-            if session_id in self._sessions:
-                await self._cleanup_session(session_id)
+            if state is not None:
+                if not state.released:
+                    await self._cleanup_session(session_id, state)
             elif viewer_acquired:
                 await self._coordinator.async_release_viewer()
             raise
         except Exception as error:
-            if session_id in self._sessions:
-                await self._cleanup_session(session_id)
+            if state is not None:
+                if not state.released:
+                    await self._cleanup_session(session_id, state)
             elif viewer_acquired:
                 await self._coordinator.async_release_viewer()
             if isinstance(error, HomeAssistantError):
@@ -193,6 +196,19 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
     async def async_close_entry(self) -> None:
         await asyncio.gather(
             *(self._cleanup_session(session_id) for session_id in list(self._sessions))
+        )
+
+    async def async_reconcile_monitor(self) -> None:
+        """Close sessions that no longer belong to the active generation."""
+        generation = self._coordinator.generation
+        ready = self._coordinator.ready
+        stale = [
+            session_id
+            for session_id, state in self._sessions.items()
+            if state.generation != generation or not ready
+        ]
+        await asyncio.gather(
+            *(self._cleanup_session(session_id) for session_id in stale)
         )
 
     async def async_teardown(self) -> None:
