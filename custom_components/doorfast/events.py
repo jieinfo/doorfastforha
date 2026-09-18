@@ -1,10 +1,51 @@
 """Validation and ordering for Doorfast push events."""
 from __future__ import annotations
 from collections import deque
+import json
 from typing import Any
 
-EVENT_NAMES = frozenset({"incoming_call", "call_established", "hangup", "timeout", "preempted"})
+CALL_EVENT_NAMES = frozenset({"incoming_call", "call_established", "hangup", "timeout", "preempted"})
+MONITOR_EVENT_NAMES = frozenset({
+    "monitor_requested",
+    "monitor_confirmed",
+    "monitor_media_ready",
+    "monitor_publishing",
+    "monitor_failed",
+    "monitor_stopped",
+    "monitor_preempted",
+})
+EVENT_NAMES = CALL_EVENT_NAMES | MONITOR_EVENT_NAMES
 SCHEMA_VERSION = 1
+_SENSITIVE_KEYS = frozenset({
+    "password", "token", "authorization", "sdp", "candidate", "url"
+})
+_MAX_STATUS_BYTES = 16 * 1024
+
+
+def _validate_monitor_status(status: Any) -> dict[str, Any]:
+    if not isinstance(status, dict):
+        raise ValueError("monitor status must be an object")
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if not isinstance(key, str) or key.lower() in _SENSITIVE_KEYS:
+                    raise ValueError("sensitive monitor status field")
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+        elif not isinstance(value, (str, int, float, bool)) and value is not None:
+            raise ValueError("invalid monitor status value")
+
+    visit(status)
+    try:
+        encoded = json.dumps(status, separators=(",", ":"), ensure_ascii=True)
+    except (TypeError, ValueError) as error:
+        raise ValueError("invalid monitor status") from error
+    if len(encoded.encode("utf-8")) > _MAX_STATUS_BYTES:
+        raise ValueError("monitor status is too large")
+    return status
 
 
 def validate_event(payload: Any) -> dict[str, Any]:
@@ -22,13 +63,24 @@ def validate_event(payload: Any) -> dict[str, Any]:
     for name, value in (("event_id", event_id), ("generation", generation), ("timestamp_ms", timestamp_ms)):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"invalid {name}")
-    return {
+    normalized = {
         "schema_version": SCHEMA_VERSION,
         "event_id": event_id,
         "event": event,
         "generation": generation,
         "timestamp_ms": timestamp_ms,
     }
+    if event in MONITOR_EVENT_NAMES:
+        status_revision = payload.get("status_revision")
+        if (
+            isinstance(status_revision, bool)
+            or not isinstance(status_revision, int)
+            or status_revision <= 0
+        ):
+            raise ValueError("invalid status_revision")
+        normalized["status_revision"] = status_revision
+        normalized["status"] = _validate_monitor_status(payload.get("status"))
+    return normalized
 
 
 class EventGate:
@@ -39,6 +91,10 @@ class EventGate:
         self._capacity = capacity
         self._order: deque[tuple[int, str]] = deque()
         self.highest_generation = 0
+        self._monitor_seen: set[int] = set()
+        self._monitor_order: deque[int] = deque()
+        self.highest_monitor_generation = 0
+        self.highest_monitor_revision = 0
 
     def accept(self, payload: dict[str, Any], current_generation: int | None = None) -> bool:
         generation = payload["generation"]
@@ -58,6 +114,50 @@ class EventGate:
         self.highest_generation = max(self.highest_generation, generation)
         return True
 
+    def accept_monitor(
+        self,
+        payload: dict[str, Any],
+        current_generation: int | None = None,
+        current_revision: int | None = None,
+    ) -> bool:
+        event_id = payload["event_id"]
+        generation = payload["generation"]
+        revision = payload["status_revision"]
+        if event_id in self._monitor_seen:
+            return False
+        if (
+            isinstance(current_generation, int)
+            and not isinstance(current_generation, bool)
+            and generation < current_generation
+        ):
+            return False
+        if (
+            isinstance(current_revision, int)
+            and not isinstance(current_revision, bool)
+            and generation == current_generation
+            and revision < current_revision
+        ):
+            return False
+        if generation < self.highest_monitor_generation:
+            return False
+        if (
+            generation == self.highest_monitor_generation
+            and revision < self.highest_monitor_revision
+        ):
+            return False
+        self._monitor_seen.add(event_id)
+        self._monitor_order.append(event_id)
+        while len(self._monitor_order) > self._capacity:
+            self._monitor_seen.discard(self._monitor_order.popleft())
+        if generation > self.highest_monitor_generation:
+            self.highest_monitor_generation = generation
+            self.highest_monitor_revision = revision
+        else:
+            self.highest_monitor_revision = max(
+                self.highest_monitor_revision, revision
+            )
+        return True
+
 
 async def process_event(payload: Any, client: Any, gate: EventGate, dispatch, ring_state) -> tuple[int, dict[str, Any]]:
     """Refresh status, gate an event, and dispatch it in a deterministic order."""
@@ -70,13 +170,30 @@ async def process_event(payload: Any, client: Any, gate: EventGate, dispatch, ri
     except Exception:
         client.online = False
         return 503, {"error": "Doorfast status unavailable"}
-    call = client.status.get("call")
-    current = call.get("generation") if isinstance(call, dict) else None
-    if not gate.accept(event, current if isinstance(current, int) and not isinstance(current, bool) else None):
+    if event["event"] in MONITOR_EVENT_NAMES:
+        media = client.status.get("media")
+        current_generation = media.get("generation") if isinstance(media, dict) else None
+        current_revision = media.get("status_revision") if isinstance(media, dict) else None
+        accepted = gate.accept_monitor(
+            event,
+            current_generation if isinstance(current_generation, int) and not isinstance(current_generation, bool) else None,
+            current_revision if isinstance(current_revision, int) and not isinstance(current_revision, bool) else None,
+        )
+    else:
+        call = client.status.get("call")
+        current = call.get("generation") if isinstance(call, dict) else None
+        accepted = gate.accept(
+            event,
+            current if isinstance(current, int) and not isinstance(current, bool) else None,
+        )
+    if not accepted:
         return 202, {"status": "ignored", "reason": "duplicate_or_stale"}
-    client.status["event"] = event["event"]
-    client.status["event_id"] = event["event_id"]
-    client.status["event_generation"] = event["generation"]
+    if event["event"] in MONITOR_EVENT_NAMES:
+        client.status["media_event"] = event
+    else:
+        client.status["event"] = event["event"]
+        client.status["event_id"] = event["event_id"]
+        client.status["event_generation"] = event["generation"]
     dispatch("status", client.status)
     dispatch("latest_event", event)
     dispatch("ring_status", bool(ring_state(client.status)))
