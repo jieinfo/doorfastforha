@@ -141,10 +141,39 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
 
         await coordinator.async_acquire_viewer()
         await coordinator.async_apply_status(
-            {"event": "monitor_stopped", "generation": 8}
+            {"event": "monitor_stopped", "generation": 7}
         )
         self.assertIsNone(coordinator.generation)
         self.assertEqual(0, coordinator.viewer_count)
+
+    async def test_wait_ready_wakes_for_publish_and_terminal_state(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(client, grace_seconds=10)
+        generation = await coordinator.async_start()
+        ready = asyncio.create_task(
+            coordinator.async_wait_ready(generation, timeout=1)
+        )
+        await asyncio.sleep(0)
+
+        await coordinator.async_apply_status(
+            {"generation": generation, "state": "publishing", "status_revision": 2}
+        )
+        await asyncio.wait_for(ready, 0.1)
+
+        client.start_result = {"state": "queued", "generation": 8}
+        await coordinator.async_apply_status(
+            {"event": "monitor_stopped", "generation": generation}
+        )
+        generation = await coordinator.async_start()
+        failed = asyncio.create_task(
+            coordinator.async_wait_ready(generation, timeout=1)
+        )
+        await asyncio.sleep(0)
+        await coordinator.async_apply_status(
+            {"event": "monitor_failed", "generation": generation}
+        )
+        with self.assertRaises(RuntimeError):
+            await asyncio.wait_for(failed, 0.1)
 
 
 if __name__ == "__main__":

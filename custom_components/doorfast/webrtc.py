@@ -195,5 +195,18 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             *(self._cleanup_session(session_id) for session_id in list(self._sessions))
         )
 
+    async def async_reconcile_monitor(self) -> None:
+        """Close sessions that no longer belong to the active generation."""
+        generation = self._coordinator.generation
+        ready = self._coordinator.ready
+        stale = [
+            session_id
+            for session_id, state in self._sessions.items()
+            if state.generation != generation or not ready
+        ]
+        await asyncio.gather(
+            *(self._cleanup_session(session_id) for session_id in stale)
+        )
+
     async def async_teardown(self) -> None:
         await self.async_close_entry()

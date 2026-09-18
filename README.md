@@ -23,6 +23,23 @@ boundary prepares continuous playback without allowing audio from an earlier
 call into the current one; the integration does not yet expose a live audio
 player entity.
 
+## Active WebRTC preview
+
+When Doorfast reports the media module as installed and available, the camera
+entity exposes an opaque `doorfast://<config_entry_id>/preview` source. HA's
+native `CameraWebRTCProvider` proxies signaling through HA-local go2rtc while
+Doorfast publishes the H.264 preview to the go2rtc RTSP ingress. Use the
+`doorfast.start_monitor` and `doorfast.stop_monitor` services for explicit
+monitor control; camera viewers also acquire and release a generation
+automatically. The provider keeps the JPEG snapshot path as a fallback and
+does not expose RTSP credentials, SDP, ICE candidates, or the Doorfast bridge
+address in entity state.
+
+The go2rtc ingress and field acceptance procedure is documented in
+[`docs/go2rtc-webrtc-acceptance.md`](docs/go2rtc-webrtc-acceptance.md). This
+video path does not imply two-way audio or a confirmed physical door/elevator
+action.
+
 ## Push to talk card
 
 The integration bundles and automatically registers a `doorfast-ptt-card` dashboard
@@ -79,7 +96,7 @@ ___
 {"schema_version":1,"event_id":42,"event":"incoming_call","generation":7,"timestamp_ms":1710000000000}
 ```
 
-允许的事件为 `incoming_call`、`call_established`、`hangup`、`timeout` 和 `preempted`。集成会在发布 HA dispatcher 信号前刷新一次 `/api/v1/status`，拒绝格式错误、重复 `(generation,event)` 或旧 generation 事件；重复或旧事件返回 HTTP 202，状态刷新失败返回 HTTP 503，便于转发器稍后重试。
+允许的通话事件为 `incoming_call`、`call_established`、`hangup`、`timeout` 和 `preempted`；主动预览事件为 `monitor_requested`、`monitor_confirmed`、`monitor_media_ready`、`monitor_publishing`、`monitor_failed`、`monitor_stopped` 和 `monitor_preempted`。预览事件必须带有 `status_revision` 以及过滤后的 `status` 对象。集成会在发布 HA dispatcher 信号前刷新一次 `/api/v1/status`，拒绝格式错误、重复 `(generation,event)` 或旧 generation/revision 事件；重复或旧事件返回 HTTP 202，状态刷新失败返回 HTTP 503，便于转发器稍后重试。
 
 ## 验收工具
 
