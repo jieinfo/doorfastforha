@@ -151,10 +151,44 @@ class MonitorCoordinator:
             generation = self._generation
             if generation is None:
                 raise RuntimeError("monitor generation was not created")
-            if self._viewer_count == 0:
-                await self._client.set_monitor_viewer(generation, True)
-            self._viewer_count += 1
-            return generation
+        try:
+            # Doorfast accepts the viewer edge only after the monitor reaches
+            # publishing/viewing. Keep this wait outside the state lock so
+            # relay or poll updates can advance the generation.
+            await self.async_wait_ready(generation)
+            async with self._lock:
+                if (
+                    self._generation != generation
+                    or not self._ready
+                    or self._state in _IDLE_STATES
+                ):
+                    raise RuntimeError("monitor generation is no longer ready")
+                if self._viewer_count == 0:
+                    try:
+                        await self._client.set_monitor_viewer(generation, True)
+                    except Exception:
+                        await self._stop_locked(generation)
+                        raise
+                self._viewer_count += 1
+                return generation
+        except asyncio.CancelledError:
+            async with self._lock:
+                if (
+                    self._generation == generation
+                    and self._viewer_count == 0
+                    and self._state not in _IDLE_STATES
+                ):
+                    await self._stop_locked(generation)
+            raise
+        except Exception:
+            async with self._lock:
+                if (
+                    self._generation == generation
+                    and self._viewer_count == 0
+                    and self._state not in _IDLE_STATES
+                ):
+                    await self._stop_locked(generation)
+            raise
 
     async def async_release_viewer(self) -> None:
         """Release one viewer and schedule a delayed stop at the last edge."""

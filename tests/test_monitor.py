@@ -27,7 +27,7 @@ MonitorCoordinator = monitor_module.MonitorCoordinator
 class FakeClient:
     def __init__(self):
         self.calls = []
-        self.start_result = {"state": "queued", "generation": 7}
+        self.start_result = {"state": "publishing", "generation": 7}
 
     async def start_monitor(self):
         self.calls.append(("start",))
@@ -82,6 +82,30 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [("start",), ("viewer", 7, True), ("viewer", 7, False),
              ("stop", 7)],
+            client.calls,
+        )
+
+    async def test_acquire_waits_for_publishing_before_enabling_viewer(self):
+        class StrictClient(FakeClient):
+            async def set_monitor_viewer(self, generation, active):
+                if self.start_result["state"] == "queued":
+                    raise RuntimeError("viewer is not allowed before publishing")
+                return await super().set_monitor_viewer(generation, active)
+
+        client = StrictClient()
+        client.start_result = {"state": "queued", "generation": 7}
+        coordinator = MonitorCoordinator(client, grace_seconds=0.01)
+        task = asyncio.create_task(coordinator.async_acquire_viewer())
+        await asyncio.sleep(0)
+        self.assertEqual([("start",)], client.calls)
+
+        client.start_result = {"state": "publishing", "generation": 7}
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 1}
+        )
+        self.assertEqual(7, await asyncio.wait_for(task, 1))
+        self.assertEqual(
+            [("start",), ("viewer", 7, True)],
             client.calls,
         )
 

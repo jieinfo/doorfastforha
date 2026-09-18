@@ -82,6 +82,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
 
         generation = await self._coordinator.async_acquire_viewer()
         viewer_acquired = True
+        state: _Session | None = None
         try:
             await self._coordinator.async_wait_ready(generation, timeout=_OFFER_TIMEOUT)
             websocket = await self._session.ws_connect(GO2RTC_WS_URL)
@@ -101,14 +102,16 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             )
             await asyncio.wait_for(asyncio.shield(state.answer), _OFFER_TIMEOUT)
         except asyncio.CancelledError:
-            if session_id in self._sessions:
-                await self._cleanup_session(session_id)
+            if state is not None:
+                if not state.released:
+                    await self._cleanup_session(session_id, state)
             elif viewer_acquired:
                 await self._coordinator.async_release_viewer()
             raise
         except Exception as error:
-            if session_id in self._sessions:
-                await self._cleanup_session(session_id)
+            if state is not None:
+                if not state.released:
+                    await self._cleanup_session(session_id, state)
             elif viewer_acquired:
                 await self._coordinator.async_release_viewer()
             if isinstance(error, HomeAssistantError):
