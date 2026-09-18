@@ -95,6 +95,7 @@ class EventGate:
         self._monitor_order: deque[int] = deque()
         self.highest_monitor_generation = 0
         self.highest_monitor_revision = 0
+        self.monitor_runtime_id: str | None = None
 
     def accept(self, payload: dict[str, Any], current_generation: int | None = None) -> bool:
         generation = payload["generation"]
@@ -119,7 +120,15 @@ class EventGate:
         payload: dict[str, Any],
         current_generation: int | None = None,
         current_revision: int | None = None,
+        runtime_id: str | None = None,
     ) -> bool:
+        if isinstance(runtime_id, str) and runtime_id:
+            if self.monitor_runtime_id != runtime_id:
+                self._monitor_seen.clear()
+                self._monitor_order.clear()
+                self.highest_monitor_generation = 0
+                self.highest_monitor_revision = 0
+                self.monitor_runtime_id = runtime_id
         event_id = payload["event_id"]
         generation = payload["generation"]
         revision = payload["status_revision"]
@@ -128,7 +137,7 @@ class EventGate:
         if (
             isinstance(current_generation, int)
             and not isinstance(current_generation, bool)
-            and generation < current_generation
+            and generation != current_generation
         ):
             return False
         if (
@@ -142,7 +151,7 @@ class EventGate:
             return False
         if (
             generation == self.highest_monitor_generation
-            and revision < self.highest_monitor_revision
+            and revision <= self.highest_monitor_revision
         ):
             return False
         self._monitor_seen.add(event_id)
@@ -178,6 +187,7 @@ async def process_event(payload: Any, client: Any, gate: EventGate, dispatch, ri
             event,
             current_generation if isinstance(current_generation, int) and not isinstance(current_generation, bool) else None,
             current_revision if isinstance(current_revision, int) and not isinstance(current_revision, bool) else None,
+            client.status.get("runtime_id") if isinstance(client.status.get("runtime_id"), str) else None,
         )
     else:
         call = client.status.get("call")

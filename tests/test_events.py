@@ -117,6 +117,34 @@ class PushEventTest(unittest.TestCase):
         self.assertFalse(gate.accept_monitor(stale_revision, 9, 7))
         self.assertTrue(gate.accept_monitor(next_generation, 10, 1))
 
+    def test_monitor_gate_rejects_conflicting_event_at_same_revision(self):
+        gate = EventGate()
+        first = validate_event(monitor_event(event_id=4, status_revision=7))
+        conflict = validate_event(
+            monitor_event(
+                name="monitor_failed", event_id=5, status_revision=7
+            )
+        )
+
+        self.assertTrue(gate.accept_monitor(first, 9, 7, "runtime-a"))
+        self.assertFalse(gate.accept_monitor(conflict, 9, 7, "runtime-a"))
+
+    def test_monitor_gate_resets_high_water_for_new_runtime(self):
+        gate = EventGate()
+        old_runtime = validate_event(
+            monitor_event(generation=9, event_id=4, status_revision=7)
+        )
+        new_runtime = validate_event(
+            monitor_event(generation=1, event_id=1, status_revision=2)
+        )
+
+        self.assertTrue(
+            gate.accept_monitor(old_runtime, 9, 7, "runtime-a")
+        )
+        self.assertTrue(
+            gate.accept_monitor(new_runtime, 1, 2, "runtime-b")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -182,6 +210,7 @@ class ProcessEventTest(unittest.IsolatedAsyncioTestCase):
 
             async def refresh(self):
                 self.status = {
+                    "runtime_id": "runtime-a",
                     "call": {"generation": 42, "session": "idle"},
                     "media": {
                         "generation": 9,
@@ -210,6 +239,7 @@ class ProcessEventTest(unittest.IsolatedAsyncioTestCase):
 
             async def refresh(self):
                 self.status = {
+                    "runtime_id": "runtime-a",
                     "media": {
                         "generation": 9,
                         "status_revision": 8,
