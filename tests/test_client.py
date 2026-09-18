@@ -82,6 +82,7 @@ def video_client(*responses):
     client.base_url = "http://doorfast/cgi-bin/doorfast"
     client.session = FakeSession(*responses)
     client.status = {
+        "runtime_id": "aaaaaaaaaaaaaaaa",
         "call": {"generation": 7},
         "video": {"ready": True, "generation": 7, "frame_no": 12},
     }
@@ -101,6 +102,7 @@ def audio_client(*responses):
     client.base_url = "http://doorfast/cgi-bin/doorfast"
     client.session = FakeSession(*responses)
     client.status = {
+        "runtime_id": "aaaaaaaaaaaaaaaa",
         "call": {"generation": 7},
         "audio": {
             "snapshot_ready": True,
@@ -120,25 +122,76 @@ def audio_client(*responses):
     return client
 
 
-class AnswerPayloadTest(unittest.IsolatedAsyncioTestCase):
-    async def test_uses_current_generation_and_verified_media_defaults(self):
+class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_binds_all_controls_to_current_runtime(self):
         client = DoorfastClient.__new__(DoorfastClient)
-        client.status = {"call": {"generation": 7}}
+        client.status = {
+            "runtime_id": "0123456789abcdef",
+            "call": {"generation": 7},
+        }
         client._request = AsyncMock(return_value={"queued": True})
 
-        result = await client.answer()
+        self.assertEqual({"queued": True}, await client.answer())
+        self.assertEqual({"queued": True}, await client.hangup(reason=1))
+        self.assertEqual({"queued": True}, await client.unlock())
+        self.assertEqual({"queued": True}, await client.call_elevator("down"))
 
-        self.assertEqual({"queued": True}, result)
-        client._request.assert_awaited_once_with(
-            "POST",
-            "/api/v1/answer",
-            {
-                "generation": 7,
-                "primary_media_port": 8303,
-                "secondary_media_port": 8302,
-                "duration_seconds": 120,
-            },
+        self.assertEqual(
+            [
+                call(
+                    "POST",
+                    "/api/v1/answer",
+                    {
+                        "runtime_id": "0123456789abcdef",
+                        "generation": 7,
+                        "primary_media_port": 8303,
+                        "secondary_media_port": 8302,
+                        "duration_seconds": 120,
+                    },
+                ),
+                call(
+                    "POST",
+                    "/api/v1/hangup",
+                    {
+                        "runtime_id": "0123456789abcdef",
+                        "generation": 7,
+                        "reason": 1,
+                    },
+                ),
+                call(
+                    "POST",
+                    "/api/v1/unlock",
+                    {"runtime_id": "0123456789abcdef", "generation": 7},
+                ),
+                call(
+                    "POST",
+                    "/api/v1/call_elevator",
+                    {"runtime_id": "0123456789abcdef", "direction": "down"},
+                ),
+            ],
+            client._request.await_args_list,
         )
+
+    async def test_rejects_controls_without_valid_runtime(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client._request = AsyncMock()
+
+        for runtime_id in (None, "", "0123456789abcdeF", "short"):
+            with self.subTest(runtime_id=runtime_id):
+                client.status = {
+                    "runtime_id": runtime_id,
+                    "call": {"generation": 7},
+                }
+                with self.assertRaises(ValueError):
+                    await client.answer()
+                with self.assertRaises(ValueError):
+                    await client.hangup()
+                with self.assertRaises(ValueError):
+                    await client.unlock()
+                with self.assertRaises(ValueError):
+                    await client.call_elevator()
+
+        client._request.assert_not_awaited()
 
 
 class MonitorPayloadTest(unittest.IsolatedAsyncioTestCase):
@@ -259,6 +312,37 @@ class VideoFrameTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(b"jpeg-12", await client.latest_video_frame())
         self.assertIsNone(await client.latest_video_frame())
+        self.assertIsNone(client._video_frame)
+
+    async def test_drops_old_response_when_runtime_changes_with_same_generation(self):
+        read_started = asyncio.Event()
+        release_read = asyncio.Event()
+
+        async def block_read():
+            read_started.set()
+            await release_read.wait()
+
+        client = video_client(
+            FakeResponse(
+                200,
+                b"old-runtime-frame",
+                {"X-Doorfast-Generation": "7", "ETag": '"df-7-12"'},
+                before_read=block_read,
+            )
+        )
+        task = asyncio.create_task(client.latest_video_frame())
+        await read_started.wait()
+        client.status = {
+            "runtime_id": "bbbbbbbbbbbbbbbb",
+            "call": {"generation": 7},
+            "video": {"ready": True, "generation": 7, "frame_no": 1},
+        }
+        client._clear_video_cache()
+        release_read.set()
+
+        self.assertIsNone(await task)
+        self.assertIsNone(client._video_generation)
+        self.assertIsNone(client._video_etag)
         self.assertIsNone(client._video_frame)
 
 
@@ -431,6 +515,46 @@ class AudioChunkTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await task)
         self.assertIsNone(client._audio_generation)
         self.assertIsNone(client._audio_revision)
+
+    async def test_drops_old_response_when_runtime_changes_with_same_generation(self):
+        read_started = asyncio.Event()
+        release_read = asyncio.Event()
+
+        async def block_read():
+            read_started.set()
+            await release_read.wait()
+
+        client = audio_client(
+            FakeResponse(
+                200,
+                b"RIFFold-runtime-WAVE",
+                {
+                    "X-Doorfast-Generation": "7",
+                    "X-Doorfast-Audio-Previous-Revision": "30",
+                    "X-Doorfast-Audio-Revision": "40",
+                    "ETag": '"df-audio-7-40"',
+                },
+                before_read=block_read,
+            )
+        )
+        task = asyncio.create_task(client.latest_audio_chunk())
+        await read_started.wait()
+        client.status = {
+            "runtime_id": "bbbbbbbbbbbbbbbb",
+            "call": {"generation": 7},
+            "audio": {
+                "snapshot_ready": True,
+                "generation": 7,
+                "snapshot_packet_count": 2,
+            },
+        }
+        client._clear_audio_cursor()
+        release_read.set()
+
+        self.assertIsNone(await task)
+        self.assertIsNone(client._audio_generation)
+        self.assertIsNone(client._audio_revision)
+        self.assertIsNone(client._audio_etag)
 
     async def test_out_of_order_refresh_cannot_restore_old_call_audio(self):
         audio_started = asyncio.Event()
