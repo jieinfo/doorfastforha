@@ -33,6 +33,11 @@ _NEGOTIATION_ATTEMPTS = 3
 _NEGOTIATION_RETRY_DELAY = 0.5
 
 
+def _consume_answer_exception(future: asyncio.Future[None]) -> None:
+    if not future.cancelled():
+        future.exception()
+
+
 @dataclass
 class _Session:
     websocket: Any
@@ -44,6 +49,7 @@ class _Session:
     reader: asyncio.Task[None] | None = None
     released: bool = False
     negotiating: bool = True
+    notify_error: bool = False
 
 
 class DoorfastWebRTCProvider(CameraWebRTCProvider):
@@ -67,6 +73,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             session = async_get_clientsession(hass)
         self._session = session
         self._sessions: dict[str, _Session] = {}
+        self._negotiations: dict[str, asyncio.Task[None]] = {}
 
     @property
     def domain(self) -> str:
@@ -112,6 +119,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             raise HomeAssistantError("Doorfast camera source is not supported")
         if session_id in self._sessions:
             await self._cleanup_session(session_id)
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._negotiations[session_id] = current_task
 
         station = self._registry.station(station_id)
         coordinator = self._registry.monitor(station_id)
@@ -121,6 +131,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             await coordinator.async_wait_ready(generation, timeout=_OFFER_TIMEOUT)
             for attempt in range(_NEGOTIATION_ATTEMPTS):
                 state: _Session | None = None
+                final_attempt = attempt == _NEGOTIATION_ATTEMPTS - 1
                 try:
                     websocket = await self._session.ws_connect(
                         self.websocket_url(station.stream_name)
@@ -133,7 +144,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         generation=generation,
                         send_message=send_message,
                         answer=loop.create_future(),
+                        notify_error=final_attempt,
                     )
+                    state.answer.add_done_callback(_consume_answer_exception)
                     self._sessions[session_id] = state
                     state.reader = asyncio.create_task(self._read_loop(session_id, state))
                     await websocket.send_json(
@@ -175,6 +188,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 # Covers failures before a WebSocket session is created.
                 await coordinator.async_release_viewer()
             raise
+        finally:
+            if self._negotiations.get(session_id) is current_task:
+                self._negotiations.pop(session_id, None)
 
     async def _read_loop(self, session_id: str, state: _Session) -> None:
         try:
@@ -199,7 +215,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     state.send_message(WebRTCCandidate(RTCIceCandidateInit(value)))
                 elif message_type == "error":
                     error = HomeAssistantError("go2rtc WebRTC signaling failed")
-                    if not state.negotiating:
+                    if not state.negotiating or state.notify_error:
                         state.send_message(
                             WebRTCError("doorfast_webrtc_failed", str(value))
                         )
@@ -231,6 +247,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         )
 
     def async_close_session(self, session_id: str) -> None:
+        negotiation = self._negotiations.get(session_id)
+        if negotiation is not None:
+            negotiation.cancel()
         if session_id in self._sessions:
             self._hass.async_create_task(self._cleanup_session(session_id))
 
@@ -252,13 +271,18 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             await state.websocket.close()
         finally:
             if not state.answer.done():
-                state.answer.set_exception(
-                    HomeAssistantError("go2rtc WebRTC session closed")
-                )
+                if state.negotiating:
+                    state.answer.cancel()
+                else:
+                    state.answer.set_exception(
+                        HomeAssistantError("go2rtc WebRTC session closed")
+                    )
             if release_viewer:
                 await state.coordinator.async_release_viewer()
 
     async def async_close_entry(self) -> None:
+        for negotiation in list(self._negotiations.values()):
+            negotiation.cancel()
         await asyncio.gather(
             *(self._cleanup_session(session_id) for session_id in list(self._sessions))
         )

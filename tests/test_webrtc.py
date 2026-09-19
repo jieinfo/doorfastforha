@@ -284,6 +284,45 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         await provider.async_close_entry()
         self.assertEqual(1, registry.monitors["gate_main"].released)
 
+    async def test_final_negotiation_failure_notifies_home_assistant(self):
+        websockets = [FakeWebSocket() for _ in range(3)]
+        provider, registry = self.make_provider(FakeSession(*websockets))
+        messages = []
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "failed", messages.append
+            )
+        )
+
+        for websocket in websockets:
+            await asyncio.sleep(0)
+            await websocket.incoming.put({"type": "error", "value": "not ready"})
+
+        with self.assertRaises(Exception):
+            await asyncio.wait_for(task, 3)
+        self.assertEqual(1, len(messages))
+        self.assertIsInstance(messages[-1], WebRTCError)
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+
+    async def test_close_session_cancels_retrying_offer(self):
+        first_ws = FakeWebSocket()
+        second_ws = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(first_ws, second_ws))
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "closing", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        await first_ws.incoming.put({"type": "error", "value": "not ready"})
+        await asyncio.sleep(0)
+        provider.async_close_session("closing")
+
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        self.assertEqual(1, len(provider._session.urls))
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+
     async def test_reconcile_closes_only_stale_station_generation(self):
         main_ws = FakeWebSocket()
         side_ws = FakeWebSocket()
