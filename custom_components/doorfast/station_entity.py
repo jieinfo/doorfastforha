@@ -18,9 +18,10 @@ class DoorfastStationEntity(Entity):
     @property
     def device_info(self) -> dict:
         return {
-            "identifiers": {(DOMAIN, self.entry_id, self.station.station_id)},
+            "identifiers": {
+                (DOMAIN, f"{self.entry_id}_station_{self.station.station_id}")
+            },
             "name": self.station.name,
             "manufacturer": MANUFACTURER,
             "via_device": (DOMAIN, self.entry_id),
         }
-

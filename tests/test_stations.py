@@ -285,7 +285,7 @@ class StationRegistryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             {
-                "identifiers": {("doorfast", "entry-1", "gate_main")},
+                "identifiers": {("doorfast", "entry-1_station_gate_main")},
                 "name": "Gate Main",
                 "manufacturer": "Doorfast",
                 "via_device": ("doorfast", "entry-1"),
