@@ -4,7 +4,12 @@ import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
 from .generation import resolve_generation
-from .client_types import PcmHttpReply
+from .client_types import (
+    DoorfastStation,
+    DoorfastStationSnapshot,
+    PcmHttpReply,
+    require_station_id,
+)
 
 class DoorfastClient:
     """Client for the Doorfast JSON bridge mapped to the local ubus API."""
@@ -124,6 +129,34 @@ class DoorfastClient:
         return await self._request("POST", "/api/v1/call_elevator", {"runtime_id": self._control_runtime_id(), "direction": direction})
 
     @staticmethod
+    def _snapshot_runtime_id(value: Any) -> str:
+        if (
+            not isinstance(value, str)
+            or len(value) != 16
+            or any(character not in "0123456789abcdef" for character in value)
+        ):
+            raise ValueError("station snapshot has no valid runtime_id")
+        return value
+
+    @staticmethod
+    def _snapshot_revision(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("station snapshot revision must be non-negative")
+        return value
+
+    async def stations(self) -> DoorfastStationSnapshot:
+        payload = await self._request("GET", "/api/v1/stations")
+        runtime_id = self._snapshot_runtime_id(payload.get("runtime_id"))
+        revision = self._snapshot_revision(payload.get("revision"))
+        raw_stations = payload.get("stations")
+        if not isinstance(raw_stations, list):
+            raise ValueError("station snapshot stations must be an array")
+        stations = tuple(DoorfastStation.from_payload(raw) for raw in raw_stations)
+        if len({station.station_id for station in stations}) != len(stations):
+            raise ValueError("station snapshot contains duplicate station ids")
+        return DoorfastStationSnapshot(runtime_id, revision, stations)
+
+    @staticmethod
     def _monitor_generation(generation: Any) -> int:
         if (
             isinstance(generation, bool)
@@ -133,17 +166,31 @@ class DoorfastClient:
             raise ValueError("monitor generation must be a positive integer")
         return generation
 
-    async def start_monitor(self) -> dict[str, Any]:
-        return await self._request("POST", "/api/v1/monitor/start", {})
+    async def start_monitor(
+        self, runtime_id: str, station_id: str
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            "/api/v1/monitor/start",
+            {"runtime_id": runtime_id, "station_id": require_station_id(station_id)},
+        )
 
-    async def stop_monitor(self, generation: int) -> dict[str, Any]:
+    async def stop_monitor(
+        self, runtime_id: str, station_id: str, generation: int
+    ) -> dict[str, Any]:
         generation = self._monitor_generation(generation)
         return await self._request(
-            "POST", "/api/v1/monitor/stop", {"generation": generation}
+            "POST",
+            "/api/v1/monitor/stop",
+            {
+                "runtime_id": runtime_id,
+                "station_id": require_station_id(station_id),
+                "generation": generation,
+            },
         )
 
     async def set_monitor_viewer(
-        self, generation: int, active: bool
+        self, runtime_id: str, station_id: str, generation: int, active: bool
     ) -> dict[str, Any]:
         generation = self._monitor_generation(generation)
         if not isinstance(active, bool):
@@ -151,7 +198,12 @@ class DoorfastClient:
         return await self._request(
             "POST",
             "/api/v1/monitor/viewer",
-            {"generation": generation, "active": active},
+            {
+                "runtime_id": runtime_id,
+                "station_id": require_station_id(station_id),
+                "generation": generation,
+                "active": active,
+            },
         )
 
     async def monitor_status(self) -> dict[str, Any]:
