@@ -11,8 +11,9 @@ import unittest
 
 
 class WebRTCMessage:
-    def __init__(self, value=None, **kwargs):
+    def __init__(self, value=None, *args, **kwargs):
         self.value = value
+        self.args = args
         self.__dict__.update(kwargs)
 
 
@@ -246,6 +247,42 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, registry.monitors["gate_main"].released)
         self.assertEqual(0, registry.monitors["gate_side"].released)
         await provider.async_close_entry()
+
+    async def test_retries_when_go2rtc_producer_is_not_ready(self):
+        first_ws = FakeWebSocket()
+        second_ws = FakeWebSocket()
+        session = FakeSession(first_ws, second_ws)
+        provider, registry = self.make_provider(session)
+        messages = []
+
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "retry", messages.append
+            )
+        )
+        await asyncio.sleep(0)
+        await first_ws.incoming.put(
+            {"type": "error", "value": "streams: unknown error"}
+        )
+        await asyncio.sleep(0)
+        await second_ws.incoming.put({"type": "webrtc/answer", "value": "answer"})
+        await asyncio.wait_for(task, 1)
+
+        self.assertEqual(
+            [
+                "ws://127.0.0.1:1984/api/ws?src=doorfast_gate_main",
+                "ws://127.0.0.1:1984/api/ws?src=doorfast_gate_main",
+            ],
+            session.urls,
+        )
+        self.assertTrue(first_ws.closed)
+        self.assertEqual(1, len(messages))
+        self.assertIsInstance(messages[-1], WebRTCAnswer)
+        self.assertEqual(1, registry.monitors["gate_main"].acquired)
+        self.assertEqual(0, registry.monitors["gate_main"].released)
+
+        await provider.async_close_entry()
+        self.assertEqual(1, registry.monitors["gate_main"].released)
 
     async def test_reconcile_closes_only_stale_station_generation(self):
         main_ws = FakeWebSocket()
