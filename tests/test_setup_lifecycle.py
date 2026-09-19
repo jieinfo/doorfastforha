@@ -207,6 +207,45 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("idle", registry.monitors["gate_main"].applied[-1]["state"])
         self.assertEqual("viewing", registry.monitors["gate_side"].applied[-1]["state"])
 
+    async def test_relay_sync_updates_only_the_matching_station(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+
+        async def monitor_status():
+            return {
+                "runtime_id": "runtime-a",
+                "sessions": [
+                    {"station_id": "gate_main", "generation": 7,
+                     "state": "publishing", "status_revision": 4},
+                    {"station_id": "gate_side", "generation": 7,
+                     "state": "viewing", "status_revision": 5},
+                ],
+            }
+
+        client.monitor_status = monitor_status
+        relay_event = {
+            "runtime_id": "runtime-a",
+            "station_id": "gate_main",
+            "event": "monitor_preempted",
+            "generation": 7,
+            "status_revision": 5,
+        }
+        await MODULE.sync_monitor_state(
+            client,
+            registry,
+            provider,
+            station_id="gate_main",
+            relay_event=relay_event,
+        )
+
+        self.assertEqual(
+            ["publishing", "monitor_preempted"],
+            [item.get("state", item.get("event"))
+             for item in registry.monitors["gate_main"].applied],
+        )
+        self.assertEqual([], registry.monitors["gate_side"].applied)
+
     async def test_syncs_polled_media_then_reconciles_provider(self):
         monitor = FakeStatusMonitor()
         provider = FakeProvider()

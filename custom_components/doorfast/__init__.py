@@ -314,9 +314,15 @@ class DoorfastEventView(HomeAssistantView):
             }
             async_dispatcher_send(self.hass, channels[kind], data)
 
-        async def sync_station_monitor(_station_id, _relay_event):
+        async def sync_station_monitor(station_id, relay_event):
             await self.monitor.async_refresh()
-            await sync_monitor_state(client, self.monitor, self.provider)
+            await sync_monitor_state(
+                client,
+                self.monitor,
+                self.provider,
+                station_id=station_id,
+                relay_event=relay_event,
+            )
 
         status, result = await process_event(
             payload,

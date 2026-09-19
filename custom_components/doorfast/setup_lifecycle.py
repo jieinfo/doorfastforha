@@ -14,6 +14,8 @@ async def sync_monitor_state(
     provider: Any,
     *,
     include_event: bool = False,
+    station_id: str | None = None,
+    relay_event: dict[str, Any] | None = None,
 ) -> None:
     """Apply authoritative monitor state before reconciling WebRTC sessions."""
     station_ids = getattr(monitor, "station_ids", None)
@@ -36,20 +38,26 @@ async def sync_monitor_state(
         for session in sessions:
             if not isinstance(session, dict):
                 continue
-            station_id = session.get("station_id")
-            if not isinstance(station_id, str) or station_id not in station_ids:
+            session_station_id = session.get("station_id")
+            if (
+                not isinstance(session_station_id, str)
+                or session_station_id not in station_ids
+            ):
                 continue
             item = dict(session)
             item["runtime_id"] = expected_runtime
-            item["station_id"] = station_id
-            by_station[station_id] = item
-        for station_id in station_ids:
-            item = by_station.get(station_id)
+            item["station_id"] = session_station_id
+            by_station[session_station_id] = item
+        target_station_ids = (
+            (station_id,) if station_id in station_ids else station_ids
+        )
+        for current_station_id in target_station_ids:
+            item = by_station.get(current_station_id)
             if item is None:
                 revision = status.get("status_revision", 0)
                 item = {
                     "runtime_id": expected_runtime,
-                    "station_id": station_id,
+                    "station_id": current_station_id,
                     "generation": 0,
                     "state": "idle",
                     "status_revision": (
@@ -58,7 +66,14 @@ async def sync_monitor_state(
                         else 0
                     ),
                 }
-            await monitor_for_station(station_id).async_apply_status(item)
+            await monitor_for_station(current_station_id).async_apply_status(item)
+        if (
+            station_id is not None
+            and isinstance(relay_event, dict)
+            and relay_event.get("station_id") == station_id
+            and station_id in station_ids
+        ):
+            await monitor_for_station(station_id).async_apply_status(relay_event)
         await provider.async_reconcile_monitor()
         return
 

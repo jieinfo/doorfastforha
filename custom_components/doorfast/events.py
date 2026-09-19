@@ -273,6 +273,13 @@ async def process_event(
             if coordinator is not None
             else client.status.get("runtime_id")
         )
+        client_runtime = client.status.get("runtime_id")
+        if (
+            coordinator is not None
+            and isinstance(client_runtime, str)
+            and client_runtime != current_runtime
+        ):
+            return 202, {"status": "ignored", "reason": "duplicate_or_stale"}
         accepted = gate.accept_monitor(
             event,
             current_generation if isinstance(current_generation, int) and not isinstance(current_generation, bool) else None,
@@ -296,7 +303,10 @@ async def process_event(
             except Exception:
                 client.online = False
                 return 503, {"error": "Doorfast status unavailable"}
-        client.status["media_event"] = event
+        elif coordinator is not None:
+            await coordinator.async_apply_status(event)
+        else:
+            client.status["media_event"] = event
     else:
         client.status["event"] = event["event"]
         client.status["event_id"] = event["event_id"]

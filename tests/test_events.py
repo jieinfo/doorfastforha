@@ -346,6 +346,38 @@ class ProcessEventTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(503, status)
         self.assertEqual("Doorfast status unavailable", body["error"])
 
+    async def test_monitor_relay_rejects_runtime_changed_after_refresh(self):
+        class Monitor:
+            runtime_id = "runtime-a"
+            generation = 7
+            status_revision = 4
+
+        class Registry:
+            def monitor(self, station_id):
+                if station_id != "gate_main":
+                    raise KeyError(station_id)
+                return Monitor()
+
+        class Client:
+            status = {"runtime_id": "runtime-b"}
+            online = True
+
+            async def refresh(self):
+                return self.status
+
+        status, body = await MODULE.process_event(
+            monitor_event(event_id=16, generation=7, status_revision=5),
+            Client(),
+            EventGate(),
+            lambda *_: self.fail("old runtime must not dispatch"),
+            lambda _: False,
+            monitor=Registry(),
+            sync_monitor=lambda *_: self.fail("old runtime must not synchronize"),
+        )
+
+        self.assertEqual(202, status)
+        self.assertEqual("duplicate_or_stale", body["reason"])
+
     async def test_refreshes_before_dispatch_and_derives_ring_from_status(self):
         class Client:
             status = {"call": {"generation": 7, "session": "ringing"}}
