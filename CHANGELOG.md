@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Retry Home Assistant WebRTC negotiation while the go2rtc producer is starting.
+- Cancel in-flight retries cleanly when a viewer disconnects.
+- Avoid transient signaling errors and unretrieved Future exceptions during startup.
+
 ## 0.2.0
 
 - Add active Doorfast monitor lifecycle controls and Home Assistant native WebRTC signaling through local go2rtc.
