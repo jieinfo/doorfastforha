@@ -74,6 +74,14 @@ class FakeProvider:
         self.reconciled += 1
 
 
+class FakeRegistry:
+    def __init__(self):
+        self.closed = 0
+
+    async def async_close(self):
+        self.closed += 1
+
+
 class FakeStatusMonitor:
     def __init__(self):
         self.applied = []
@@ -153,9 +161,11 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
         hass.data["doorfast_webrtc_unsubscribers"] = {
             FakeEntry.entry_id: object()
         }
+        hass.data["doorfast_stations"] = {FakeEntry.entry_id: object()}
         pcm = FakePcm()
         monitor = FakeMonitor()
         provider = FakeProvider()
+        registry = FakeRegistry()
         provider_unregistered = []
         unregistered = []
 
@@ -173,6 +183,7 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
             service_names=("unlock", "call_elevator", "answer", "hangup"),
             monitor=monitor,
             provider=provider,
+            station_registry=registry,
             unregister_webrtc=lambda: provider_unregistered.append(True),
         )
 
@@ -183,8 +194,10 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("doorfast_monitors", hass.data)
         self.assertNotIn("doorfast_webrtc_providers", hass.data)
         self.assertNotIn("doorfast_webrtc_unsubscribers", hass.data)
+        self.assertNotIn("doorfast_stations", hass.data)
         self.assertEqual(1, monitor.closed)
         self.assertEqual(1, provider.closed)
+        self.assertEqual(1, registry.closed)
         self.assertEqual([True], provider_unregistered)
         self.assertEqual(
             hass.services.removed,
@@ -195,7 +208,9 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
         hass = FakeHass(("unlock", "call_elevator", "answer", "hangup"))
         hass.data["doorfast"] = {FakeEntry.entry_id: object(), "entry-2": object()}
         hass.data["doorfast_event_views"] = {FakeEntry.entry_id: object(), "entry-2": object()}
+        hass.data["doorfast_stations"] = {FakeEntry.entry_id: object(), "entry-2": object()}
         pcm = FakePcm()
+        registry = FakeRegistry()
 
         async def unregister_frontend(_hass, _entry_id):
             raise AssertionError("frontend was not registered for this failed entry")
@@ -210,11 +225,14 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
             frontend_registered=False,
             view_created=True,
             service_names=("unlock", "call_elevator", "answer", "hangup"),
+            station_registry=registry,
         )
 
         self.assertEqual(pcm.released, [FakeEntry.entry_id])
         self.assertEqual(set(hass.data["doorfast"]), {"entry-2"})
         self.assertEqual(set(hass.data["doorfast_event_views"]), {"entry-2"})
+        self.assertEqual(set(hass.data["doorfast_stations"]), {"entry-2"})
+        self.assertEqual(1, registry.closed)
         self.assertEqual(hass.services.removed, [])
 
 

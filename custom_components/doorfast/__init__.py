@@ -25,6 +25,7 @@ from .const import (
     MONITOR_STATUS,
     PLATFORMS,
     RING_STATUS,
+    STATIONS_KEY,
     WEBRTC_PROVIDERS_KEY,
     WEBRTC_UNSUBS_KEY,
 )
@@ -34,6 +35,7 @@ from .generation import is_ringing
 from .monitor import DoorfastMonitorCoordinator
 from .routing import select_client
 from .setup_lifecycle import rollback_entry_setup, sync_monitor_state
+from .stations import StationRegistryCoordinator
 from .webrtc import DoorfastWebRTCProvider
 from .websocket import PcmWebSocketManager
 
@@ -69,6 +71,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     clients = hass.data.setdefault(DOMAIN, {})
     client = DoorfastClient(hass, entry.data[CONF_SERVER_ADDRESS])
     clients[entry.entry_id] = client
+
+    station_registries = hass.data.setdefault(STATIONS_KEY, {})
+    station_registry = StationRegistryCoordinator(client, entry_id=entry.entry_id)
+    station_registries[entry.entry_id] = station_registry
 
     monitors = hass.data.setdefault(MONITORS_KEY, {})
     monitor = DoorfastMonitorCoordinator(client)
@@ -113,6 +119,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     async def poll(_now=None):
         try:
             await client.refresh()
+            await station_registry.async_refresh()
             await sync_current_monitor()
             await dispatch_status()
         except Exception:
@@ -214,6 +221,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             view_created=view_created,
             service_names=SERVICE_NAMES,
             monitor=monitor,
+            station_registry=station_registry,
             provider=provider,
             unregister_webrtc=unregister_webrtc,
         )
@@ -244,6 +252,13 @@ async def async_unload_entry(hass, entry):
         unregister_webrtc()
     if not unregisters:
         hass.data.pop(WEBRTC_UNSUBS_KEY, None)
+
+    station_registries = hass.data.get(STATIONS_KEY, {})
+    station_registry = station_registries.pop(entry.entry_id, None)
+    if station_registry is not None:
+        await station_registry.async_close()
+    if not station_registries:
+        hass.data.pop(STATIONS_KEY, None)
 
     monitors = hass.data.get(MONITORS_KEY, {})
     monitor = monitors.pop(entry.entry_id, None)

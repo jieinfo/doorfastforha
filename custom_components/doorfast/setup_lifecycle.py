@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
-from .const import DOMAIN, PLATFORMS
+from .const import DOMAIN, PLATFORMS, STATIONS_KEY
 
 
 async def sync_monitor_state(
@@ -37,6 +37,7 @@ async def rollback_entry_setup(
     view_created: bool,
     service_names: Iterable[str],
     monitor: Any | None = None,
+    station_registry: Any | None = None,
     provider: Any | None = None,
     unregister_webrtc: Callable[[], None] | None = None,
 ) -> None:
@@ -66,8 +67,15 @@ async def rollback_entry_setup(
         except Exception:
             pass
 
+    if station_registry is not None:
+        try:
+            await station_registry.async_close()
+        except Exception:
+            pass
+
     for key in (
         f"{DOMAIN}_monitors",
+        STATIONS_KEY,
         f"{DOMAIN}_webrtc_providers",
         f"{DOMAIN}_webrtc_unsubscribers",
     ):

@@ -9,6 +9,7 @@ LATEST_EVENT = "latest_event"
 RING_STATUS = "ring_status"
 MONITOR_STATUS = "monitor_status"
 MONITORS_KEY = f"{DOMAIN}_monitors"
+STATIONS_KEY = f"{DOMAIN}_stations"
 WEBRTC_PROVIDERS_KEY = f"{DOMAIN}_webrtc_providers"
 WEBRTC_UNSUBS_KEY = f"{DOMAIN}_webrtc_unsubscribers"
 KEEPALIVE_INTERVAL = 30
