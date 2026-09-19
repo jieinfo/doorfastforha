@@ -49,8 +49,8 @@ class FixtureState:
             "runtime_id": self.runtime_id,
             "revision": self.stations_revision,
             "stations": [
-                {"station_id": "gate_main", "logical_address": "320000000001", "stream_name": "doorfast_one_main", "enabled": True},
-                {"station_id": "gate_side", "logical_address": "320000000002", "stream_name": "doorfast_one_side", "enabled": True},
+                {"id": "gate_main", "name": "Main gate", "logical_address": "32:00:00:00:00:01", "stream_name": "doorfast_one_main", "enabled": True, "route_source": "discovered", "route_fresh": True, "monitorable": True, "last_seen_ms": 1},
+                {"id": "gate_side", "name": "Side gate", "logical_address": "32:00:00:00:00:02", "stream_name": "doorfast_one_side", "enabled": True, "route_source": "discovered", "route_fresh": True, "monitorable": True, "last_seen_ms": 1},
             ],
         }
 

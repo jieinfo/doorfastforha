@@ -8,7 +8,7 @@
     "lock": {"unlock": {"name": "Unlock door"}},
     "button": {"elevator_up": {"name": "Call elevator up"}, "elevator_down": {"name": "Call elevator down"}, "answer": {"name": "Answer call"}, "hangup": {"name": "Hang up"}},
     "sensor": {"latest_event": {"name": "Doorfast status"}},
-    "binary_sensor": {"ring_status": {"name": "Incoming call"}, "station_reachability": {"name": "Station reachable"}},
+    "binary_sensor": {"ring_status": {"name": "Incoming call"}, "station_reachable": {"name": "Station reachable"}},
     "camera": {"video": {"name": "Video"}, "station_monitor": {"name": "Station monitor"}}
   }
 }
