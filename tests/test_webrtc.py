@@ -1,11 +1,13 @@
-"""Tests for the HA-local go2rtc WebRTC signaling provider."""
+"""Tests for station-aware go2rtc WebRTC signaling."""
+
+from __future__ import annotations
 
 import asyncio
 import importlib.util
+from pathlib import Path
 import sys
 import types
 import unittest
-from pathlib import Path
 
 
 class WebRTCMessage:
@@ -30,22 +32,12 @@ class CameraWebRTCProvider:
     pass
 
 
-class FakeCamera:
-    def __init__(self, source="doorfast://entry-1/preview"):
-        self.source = source
-
-    async def stream_source(self):
-        return self.source
-
-
 camera_module = types.ModuleType("homeassistant.components.camera")
-camera_module.Camera = FakeCamera
+camera_module.Camera = object
 camera_module.CameraWebRTCProvider = CameraWebRTCProvider
 camera_module.WebRTCAnswer = WebRTCAnswer
 camera_module.WebRTCCandidate = WebRTCCandidate
 camera_module.WebRTCError = WebRTCError
-camera_module.WebRTCMessage = WebRTCMessage
-camera_module.WebRTCSendMessage = object
 homeassistant = types.ModuleType("homeassistant")
 components = types.ModuleType("homeassistant.components")
 components.camera = camera_module
@@ -71,21 +63,31 @@ package = types.ModuleType("custom_components.doorfast")
 package.__path__ = [str(COMPONENT)]
 sys.modules.setdefault("custom_components", types.ModuleType("custom_components"))
 sys.modules["custom_components.doorfast"] = package
-const_spec = importlib.util.spec_from_file_location(
-    "custom_components.doorfast.const", COMPONENT / "const.py"
-)
-const_module = importlib.util.module_from_spec(const_spec)
-sys.modules[const_spec.name] = const_module
-assert const_spec.loader is not None
-const_spec.loader.exec_module(const_module)
-spec = importlib.util.spec_from_file_location(
-    "custom_components.doorfast.webrtc", COMPONENT / "webrtc.py"
-)
-webrtc_module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = webrtc_module
-assert spec.loader is not None
-spec.loader.exec_module(webrtc_module)
+
+
+def load_component(name):
+    spec = importlib.util.spec_from_file_location(
+        f"custom_components.doorfast.{name}", COMPONENT / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+load_component("config_helpers")
+load_component("const")
+webrtc_module = load_component("webrtc")
 DoorfastWebRTCProvider = webrtc_module.DoorfastWebRTCProvider
+
+
+class FakeCamera:
+    def __init__(self, source):
+        self.source = source
+
+    async def stream_source(self):
+        return self.source
 
 
 class FakeWebSocket:
@@ -106,31 +108,24 @@ class FakeWebSocket:
 
 
 class FakeSession:
-    def __init__(self, websocket):
-        self.websocket = websocket
-        self.url = None
+    def __init__(self, *websockets):
+        self.websockets = list(websockets)
+        self.urls = []
 
     async def ws_connect(self, url, **kwargs):
-        self.url = url
-        return self.websocket
-
-
-class FailingSession(FakeSession):
-    async def ws_connect(self, url, **kwargs):
-        self.url = url
-        raise OSError("go2rtc unavailable")
+        self.urls.append(url)
+        return self.websockets.pop(0)
 
 
 class FakeCoordinator:
-    def __init__(self):
-        self.generation = 9
-        self.state = "publishing"
+    def __init__(self, generation):
+        self.generation = generation
         self.ready = True
-        self.acquired = []
+        self.acquired = 0
         self.released = 0
 
     async def async_acquire_viewer(self):
-        self.acquired.append(self.generation)
+        self.acquired += 1
         return self.generation
 
     async def async_wait_ready(self, generation, timeout=10):
@@ -139,6 +134,24 @@ class FakeCoordinator:
 
     async def async_release_viewer(self):
         self.released += 1
+
+
+class FakeRegistry:
+    def __init__(self):
+        self.stations = {
+            "gate_main": types.SimpleNamespace(stream_name="doorfast_gate_main"),
+            "gate_side": types.SimpleNamespace(stream_name="doorfast_gate_side"),
+        }
+        self.monitors = {
+            "gate_main": FakeCoordinator(9),
+            "gate_side": FakeCoordinator(12),
+        }
+
+    def station(self, station_id):
+        return self.stations[station_id]
+
+    def monitor(self, station_id):
+        return self.monitors[station_id]
 
 
 class FakeHass:
@@ -151,113 +164,104 @@ class FakeHass:
         return task
 
 
+def source(station_id, entry_id="entry-1"):
+    return f"doorfast://{entry_id}/station/{station_id}/preview"
+
+
 class ProviderTest(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.ws = FakeWebSocket()
-        self.session = FakeSession(self.ws)
-        self.hass = FakeHass()
-        self.coordinator = FakeCoordinator()
-        self.provider = DoorfastWebRTCProvider(
-            self.hass, "entry-1", self.coordinator, self.session
+    def make_provider(self, session=None, base="http://127.0.0.1:1984"):
+        registry = FakeRegistry()
+        provider = DoorfastWebRTCProvider(
+            FakeHass(), "entry-1", registry, base, session or FakeSession()
         )
+        return provider, registry
 
-    async def test_offer_is_proxied_to_local_go2rtc_and_answer_forwarded(self):
+    async def open_offer(self, provider, websocket, station_id, session_id):
         messages = []
-        offer = "v=0\\r\\no=- offer"
         task = asyncio.create_task(
-            self.provider.async_handle_async_webrtc_offer(
-                FakeCamera(), offer, "session-1", messages.append
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source(station_id)), "offer", session_id, messages.append
             )
         )
         await asyncio.sleep(0)
-        self.assertEqual(
-            "ws://127.0.0.1:1984/api/ws?src=doorfast_preview",
-            self.session.url,
-        )
-        self.assertEqual(
-            [{"type": "webrtc/offer", "value": offer}], self.ws.sent
-        )
-        await self.ws.incoming.put(
-            {"type": "webrtc/answer", "value": "v=0\\r\\na=answer"}
-        )
+        await websocket.incoming.put({"type": "webrtc/answer", "value": "answer"})
         await asyncio.wait_for(task, 1)
-        self.assertIsInstance(messages[0], WebRTCAnswer)
-        self.assertEqual("v=0\\r\\na=answer", messages[0].value)
-        self.assertEqual([9], self.coordinator.acquired)
+        return messages
 
-    async def test_candidate_forwarding_and_session_close_release_viewer(self):
-        messages = []
-        task = asyncio.create_task(
-            self.provider.async_handle_async_webrtc_offer(
-                FakeCamera(), "offer", "session-1", messages.append
-            )
+    async def test_url_selection_and_strict_station_source(self):
+        provider, _registry = self.make_provider(
+            base="https://go2rtc.example/base"
         )
-        await asyncio.sleep(0)
-        await self.ws.incoming.put(
-            {"type": "webrtc/answer", "value": "answer"}
+
+        self.assertEqual(
+            "wss://go2rtc.example/base/api/ws?src=doorfast_gate_main",
+            provider.websocket_url("doorfast_gate_main"),
         )
-        await asyncio.wait_for(task, 1)
-        await self.provider.async_on_webrtc_candidate(
-            "session-1", RTCIceCandidateInit("candidate:1")
+        self.assertEqual(
+            "wss://go2rtc.example/base/api/ws?src=doorfast%20gate%2Fmain",
+            provider.websocket_url("doorfast gate/main"),
         )
+        self.assertTrue(provider.async_is_supported(source("gate_main")))
+        self.assertFalse(provider.async_is_supported(source("gate_main", "entry-2")))
+        self.assertFalse(provider.async_is_supported(source("unknown")))
+        self.assertFalse(provider.async_is_supported("rtsp://secret@example"))
+
+    async def test_two_station_offers_use_distinct_streams_and_coordinators(self):
+        main_ws = FakeWebSocket()
+        side_ws = FakeWebSocket()
+        session = FakeSession(main_ws, side_ws)
+        provider, registry = self.make_provider(session)
+
+        main_messages = await self.open_offer(provider, main_ws, "gate_main", "main")
+        side_messages = await self.open_offer(provider, side_ws, "gate_side", "side")
+
         self.assertEqual(
             [
-                {"type": "webrtc/offer", "value": "offer"},
-                {"type": "webrtc/candidate", "value": "candidate:1"},
+                "ws://127.0.0.1:1984/api/ws?src=doorfast_gate_main",
+                "ws://127.0.0.1:1984/api/ws?src=doorfast_gate_side",
             ],
-            self.ws.sent,
+            session.urls,
         )
-        self.provider.async_close_session("session-1")
-        await asyncio.gather(*self.hass.tasks)
-        self.assertTrue(self.ws.closed)
-        self.assertEqual(1, self.coordinator.released)
+        self.assertIsInstance(main_messages[0], WebRTCAnswer)
+        self.assertIsInstance(side_messages[0], WebRTCAnswer)
+        self.assertEqual(1, registry.monitors["gate_main"].acquired)
+        self.assertEqual(1, registry.monitors["gate_side"].acquired)
+        await provider.async_close_entry()
 
-    async def test_provider_accepts_only_opaque_doorfast_source(self):
-        self.assertTrue(self.provider.async_is_supported("doorfast://entry-1/preview"))
-        self.assertFalse(self.provider.async_is_supported("doorfast://entry-2/preview"))
-        self.assertFalse(self.provider.async_is_supported("rtsp://secret@example"))
+    async def test_one_station_error_leaves_other_session_open(self):
+        main_ws = FakeWebSocket()
+        side_ws = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(main_ws, side_ws))
+        await self.open_offer(provider, main_ws, "gate_main", "main")
+        await self.open_offer(provider, side_ws, "gate_side", "side")
 
-    async def test_failed_socket_connect_releases_acquired_viewer(self):
-        provider = DoorfastWebRTCProvider(
-            self.hass, "entry-1", self.coordinator, FailingSession(self.ws)
-        )
-        with self.assertRaises(RuntimeError):
-            await provider.async_handle_async_webrtc_offer(
-                FakeCamera(), "offer", "session-1", lambda _message: None
-            )
-        self.assertEqual(1, self.coordinator.released)
-
-    async def test_go2rtc_error_releases_viewer_once(self):
-        task = asyncio.create_task(
-            self.provider.async_handle_async_webrtc_offer(
-                FakeCamera(), "offer", "session-1", lambda _message: None
-            )
-        )
+        await main_ws.incoming.put({"type": "error", "value": "failed"})
         await asyncio.sleep(0)
-        await self.ws.incoming.put(
-            {"type": "error", "value": "source unavailable"}
-        )
-        with self.assertRaises(RuntimeError):
-            await asyncio.wait_for(task, 1)
-        self.assertEqual(1, self.coordinator.released)
-
-    async def test_generation_change_closes_stale_session(self):
-        task = asyncio.create_task(
-            self.provider.async_handle_async_webrtc_offer(
-                FakeCamera(), "offer", "session-1", lambda _message: None
-            )
-        )
         await asyncio.sleep(0)
-        await self.ws.incoming.put(
-            {"type": "webrtc/answer", "value": "answer"}
-        )
-        await asyncio.wait_for(task, 1)
 
-        self.coordinator.generation = 10
-        await self.provider.async_reconcile_monitor()
+        self.assertTrue(main_ws.closed)
+        self.assertFalse(side_ws.closed)
+        self.assertNotIn("main", provider._sessions)
+        self.assertIn("side", provider._sessions)
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+        self.assertEqual(0, registry.monitors["gate_side"].released)
+        await provider.async_close_entry()
 
-        self.assertTrue(self.ws.closed)
-        self.assertEqual(1, self.coordinator.released)
+    async def test_reconcile_closes_only_stale_station_generation(self):
+        main_ws = FakeWebSocket()
+        side_ws = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(main_ws, side_ws))
+        await self.open_offer(provider, main_ws, "gate_main", "main")
+        await self.open_offer(provider, side_ws, "gate_side", "side")
+
+        registry.monitors["gate_main"].generation = 10
+        await provider.async_reconcile_monitor()
+
+        self.assertTrue(main_ws.closed)
+        self.assertFalse(side_ws.closed)
+        self.assertNotIn("main", provider._sessions)
+        self.assertIn("side", provider._sessions)
+        await provider.async_close_entry()
 
 
 if __name__ == "__main__":

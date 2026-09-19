@@ -8,8 +8,18 @@ from homeassistant.helpers.selector import (
     TextSelectorType,
 )
 from .client import DoorfastClient
-from .config_helpers import is_doorfast_status, normalize_bridge_url
-from .const import CONF_POLL_INTERVAL, CONF_SERVER_ADDRESS, DOMAIN
+from .config_helpers import (
+    is_doorfast_status,
+    normalize_bridge_url,
+    normalize_go2rtc_api_url,
+)
+from .const import (
+    CONF_GO2RTC_API_URL,
+    CONF_POLL_INTERVAL,
+    CONF_SERVER_ADDRESS,
+    DEFAULT_GO2RTC_API_URL,
+    DOMAIN,
+)
 
 class DoorfastConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     VERSION = 1
@@ -36,3 +46,43 @@ class DoorfastConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ),
             vol.Optional(CONF_POLL_INTERVAL, default=5): vol.All(vol.Coerce(int), vol.Range(min=1, max=300)),
         }))
+
+    @staticmethod
+    def async_get_options_flow(config_entry):
+        return DoorfastOptionsFlow(config_entry)
+
+
+class DoorfastOptionsFlow(config_entries.OptionsFlow):
+    def __init__(self, config_entry):
+        self.config_entry = config_entry
+
+    async def async_step_init(self, user_input=None):
+        errors = {}
+        if user_input is not None:
+            try:
+                address = normalize_go2rtc_api_url(
+                    user_input[CONF_GO2RTC_API_URL]
+                )
+            except ValueError:
+                errors[CONF_GO2RTC_API_URL] = "invalid_url"
+            else:
+                return self.async_create_entry(
+                    title="", data={CONF_GO2RTC_API_URL: address}
+                )
+        current = self.config_entry.options.get(
+            CONF_GO2RTC_API_URL,
+            self.config_entry.data.get(
+                CONF_GO2RTC_API_URL, DEFAULT_GO2RTC_API_URL
+            ),
+        )
+        return self.async_show_form(
+            step_id="init",
+            errors=errors,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(
+                        CONF_GO2RTC_API_URL, default=current
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL))
+                }
+            ),
+        )

@@ -1,10 +1,11 @@
-"""Native Home Assistant WebRTC provider backed by HA-local go2rtc."""
+"""Station-aware Home Assistant WebRTC provider backed by go2rtc."""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Callable
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from homeassistant.components.camera import (
     Camera,
@@ -15,16 +16,16 @@ from homeassistant.components.camera import (
 )
 from webrtc_models import RTCIceCandidateInit
 
+from .config_helpers import normalize_go2rtc_api_url
 from .const import DOMAIN
 
 try:
     from homeassistant.exceptions import HomeAssistantError
-except ImportError:  # pragma: no cover - only used by dependency-free tests
+except ImportError:  # pragma: no cover - dependency-free tests
     class HomeAssistantError(RuntimeError):
         """Fallback used when Home Assistant is not installed."""
 
 
-GO2RTC_WS_URL = "ws://127.0.0.1:1984/api/ws?src=doorfast_preview"
 _SOURCE_PREFIX = "doorfast://"
 _SOURCE_SUFFIX = "/preview"
 _OFFER_TIMEOUT = 10.0
@@ -33,6 +34,8 @@ _OFFER_TIMEOUT = 10.0
 @dataclass
 class _Session:
     websocket: Any
+    station_id: str
+    coordinator: Any
     generation: int
     send_message: Callable[[Any], None]
     answer: asyncio.Future[None]
@@ -41,18 +44,20 @@ class _Session:
 
 
 class DoorfastWebRTCProvider(CameraWebRTCProvider):
-    """Proxy HA camera signaling to the local go2rtc WebSocket API."""
+    """Proxy station camera signaling to a configured go2rtc API."""
 
     def __init__(
         self,
         hass: Any,
         entry_id: str,
-        coordinator: Any,
+        registry: Any,
+        go2rtc_api_url: str,
         session: Any | None = None,
     ) -> None:
         self._hass = hass
         self._entry_id = entry_id
-        self._coordinator = coordinator
+        self._registry = registry
+        self._go2rtc_api_url = normalize_go2rtc_api_url(go2rtc_api_url)
         if session is None:
             from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -64,8 +69,32 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
     def domain(self) -> str:
         return DOMAIN
 
+    def _station_id(self, stream_source: str) -> str | None:
+        prefix = f"{_SOURCE_PREFIX}{self._entry_id}/station/"
+        if not stream_source.startswith(prefix) or not stream_source.endswith(
+            _SOURCE_SUFFIX
+        ):
+            return None
+        station_id = stream_source[len(prefix) : -len(_SOURCE_SUFFIX)]
+        if not station_id or "/" in station_id:
+            return None
+        try:
+            self._registry.station(station_id)
+            self._registry.monitor(station_id)
+        except KeyError:
+            return None
+        return station_id
+
     def async_is_supported(self, stream_source: str) -> bool:
-        return stream_source == f"{_SOURCE_PREFIX}{self._entry_id}{_SOURCE_SUFFIX}"
+        return isinstance(stream_source, str) and self._station_id(stream_source) is not None
+
+    def websocket_url(self, stream_name: str) -> str:
+        parsed = urlsplit(self._go2rtc_api_url)
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        path = f"{parsed.path.rstrip('/')}/api/ws"
+        return urlunsplit(
+            (scheme, parsed.netloc, path, f"src={quote(stream_name, safe='')}", "")
+        )
 
     async def async_handle_async_webrtc_offer(
         self,
@@ -75,45 +104,45 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         send_message: Callable[[Any], None],
     ) -> None:
         source = await camera.stream_source()
-        if not isinstance(source, str) or not self.async_is_supported(source):
+        station_id = self._station_id(source) if isinstance(source, str) else None
+        if station_id is None:
             raise HomeAssistantError("Doorfast camera source is not supported")
         if session_id in self._sessions:
             await self._cleanup_session(session_id)
 
-        generation = await self._coordinator.async_acquire_viewer()
-        viewer_acquired = True
+        station = self._registry.station(station_id)
+        coordinator = self._registry.monitor(station_id)
+        generation = await coordinator.async_acquire_viewer()
         state: _Session | None = None
         try:
-            await self._coordinator.async_wait_ready(generation, timeout=_OFFER_TIMEOUT)
-            websocket = await self._session.ws_connect(GO2RTC_WS_URL)
+            await coordinator.async_wait_ready(generation, timeout=_OFFER_TIMEOUT)
+            websocket = await self._session.ws_connect(
+                self.websocket_url(station.stream_name)
+            )
             loop = asyncio.get_running_loop()
             state = _Session(
                 websocket=websocket,
+                station_id=station_id,
+                coordinator=coordinator,
                 generation=generation,
                 send_message=send_message,
                 answer=loop.create_future(),
             )
             self._sessions[session_id] = state
-            state.reader = asyncio.create_task(
-                self._read_loop(session_id, state)
-            )
-            await websocket.send_json(
-                {"type": "webrtc/offer", "value": offer_sdp}
-            )
+            state.reader = asyncio.create_task(self._read_loop(session_id, state))
+            await websocket.send_json({"type": "webrtc/offer", "value": offer_sdp})
             await asyncio.wait_for(asyncio.shield(state.answer), _OFFER_TIMEOUT)
         except asyncio.CancelledError:
-            if state is not None:
-                if not state.released:
-                    await self._cleanup_session(session_id, state)
-            elif viewer_acquired:
-                await self._coordinator.async_release_viewer()
+            if state is not None and not state.released:
+                await self._cleanup_session(session_id, state)
+            elif state is None:
+                await coordinator.async_release_viewer()
             raise
         except Exception as error:
-            if state is not None:
-                if not state.released:
-                    await self._cleanup_session(session_id, state)
-            elif viewer_acquired:
-                await self._coordinator.async_release_viewer()
+            if state is not None and not state.released:
+                await self._cleanup_session(session_id, state)
+            elif state is None:
+                await coordinator.async_release_viewer()
             if isinstance(error, HomeAssistantError):
                 raise
             raise HomeAssistantError("Doorfast go2rtc negotiation failed") from error
@@ -137,9 +166,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 elif message_type == "webrtc/candidate":
                     if not isinstance(value, str):
                         raise HomeAssistantError("invalid go2rtc ICE candidate")
-                    state.send_message(
-                        WebRTCCandidate(RTCIceCandidateInit(value))
-                    )
+                    state.send_message(WebRTCCandidate(RTCIceCandidateInit(value)))
                 elif message_type == "error":
                     error = HomeAssistantError("go2rtc WebRTC signaling failed")
                     state.send_message(WebRTCError("doorfast_webrtc_failed", str(value)))
@@ -191,7 +218,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 state.answer.set_exception(
                     HomeAssistantError("go2rtc WebRTC session closed")
                 )
-            await self._coordinator.async_release_viewer()
+            await state.coordinator.async_release_viewer()
 
     async def async_close_entry(self) -> None:
         await asyncio.gather(
@@ -199,17 +226,20 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         )
 
     async def async_reconcile_monitor(self) -> None:
-        """Close sessions that no longer belong to the active generation."""
-        generation = self._coordinator.generation
-        ready = self._coordinator.ready
-        stale = [
-            session_id
-            for session_id, state in self._sessions.items()
-            if state.generation != generation or not ready
-        ]
-        await asyncio.gather(
-            *(self._cleanup_session(session_id) for session_id in stale)
-        )
+        stale = []
+        for session_id, state in self._sessions.items():
+            try:
+                coordinator = self._registry.monitor(state.station_id)
+            except KeyError:
+                stale.append(session_id)
+                continue
+            if (
+                coordinator is not state.coordinator
+                or coordinator.generation != state.generation
+                or not coordinator.ready
+            ):
+                stale.append(session_id)
+        await asyncio.gather(*(self._cleanup_session(item) for item in stale))
 
     async def async_teardown(self) -> None:
         await self.async_close_entry()

@@ -14,15 +14,15 @@ from homeassistant.helpers.event import async_track_time_interval
 
 from .client import DoorfastClient
 from .const import (
+    CONF_GO2RTC_API_URL,
     CONF_POLL_INTERVAL,
     CONF_SERVER_ADDRESS,
     DEFAULT_AUDIO_PORT,
     DEFAULT_CALL_DURATION,
+    DEFAULT_GO2RTC_API_URL,
     DEFAULT_VIDEO_PORT,
     DOMAIN,
     LATEST_EVENT,
-    MONITORS_KEY,
-    MONITOR_STATUS,
     PLATFORMS,
     RING_STATUS,
     STATIONS_KEY,
@@ -32,9 +32,8 @@ from .const import (
 from .events import EventGate, process_event
 from .frontend import async_register_frontend, async_unregister_frontend
 from .generation import is_ringing
-from .monitor import DoorfastMonitorCoordinator
 from .routing import select_client
-from .setup_lifecycle import rollback_entry_setup, sync_monitor_state
+from .setup_lifecycle import rollback_entry_setup
 from .stations import StationRegistryCoordinator
 from .webrtc import DoorfastWebRTCProvider
 from .websocket import PcmWebSocketManager
@@ -76,12 +75,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     station_registry = StationRegistryCoordinator(client, entry_id=entry.entry_id)
     station_registries[entry.entry_id] = station_registry
 
-    monitors = hass.data.setdefault(MONITORS_KEY, {})
-    monitor = DoorfastMonitorCoordinator(client, "legacy", "legacy")
-    monitors[entry.entry_id] = monitor
-
     providers = hass.data.setdefault(WEBRTC_PROVIDERS_KEY, {})
-    provider = DoorfastWebRTCProvider(hass, entry.entry_id, monitor)
+    options = getattr(entry, "options", {})
+    go2rtc_api_url = options.get(
+        CONF_GO2RTC_API_URL,
+        entry.data.get(CONF_GO2RTC_API_URL, DEFAULT_GO2RTC_API_URL),
+    )
+    provider = DoorfastWebRTCProvider(
+        hass, entry.entry_id, station_registry, go2rtc_api_url
+    )
     providers[entry.entry_id] = provider
     unregister_webrtc = None
 
@@ -96,14 +98,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     frontend_registration_attempted = False
 
     async def sync_current_monitor(*, include_event: bool = False) -> None:
-        await sync_monitor_state(
-            client, monitor, provider, include_event=include_event
-        )
-        async_dispatcher_send(
-            hass,
-            f"{DOMAIN}_{entry.entry_id}_{MONITOR_STATUS}",
-            monitor.snapshot,
-        )
+        del include_event
+        await provider.async_reconcile_monitor()
 
     async def dispatch_status() -> None:
         async_dispatcher_send(
@@ -184,14 +180,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         view = existing_view
         if view is None:
             view = DoorfastEventView(
-                hass, entry.entry_id, event_gate, monitor, provider
+                hass, entry.entry_id, event_gate, station_registry, provider
             )
             views[entry.entry_id] = view
             view_created = True
             hass.http.register_view(view)
         else:
             view.event_gate = event_gate
-            view.monitor = monitor
+            view.monitor = station_registry
             view.provider = provider
 
         handlers = (
@@ -232,7 +228,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             frontend_registered=frontend_registration_attempted,
             view_created=view_created,
             service_names=SERVICE_NAMES,
-            monitor=monitor,
             station_registry=station_registry,
             provider=provider,
             unregister_webrtc=unregister_webrtc,
@@ -271,13 +266,6 @@ async def async_unload_entry(hass, entry):
         await station_registry.async_close()
     if not station_registries:
         hass.data.pop(STATIONS_KEY, None)
-
-    monitors = hass.data.get(MONITORS_KEY, {})
-    monitor = monitors.pop(entry.entry_id, None)
-    if monitor is not None:
-        await monitor.async_close()
-    if not monitors:
-        hass.data.pop(MONITORS_KEY, None)
 
     clients = hass.data.get(DOMAIN, {})
     clients.pop(entry.entry_id, None)
@@ -326,17 +314,7 @@ class DoorfastEventView(HomeAssistantView):
             payload, client, self.event_gate, dispatch, is_ringing
         )
         if status in {200, 202}:
-            await sync_monitor_state(
-                client,
-                self.monitor,
-                self.provider,
-                include_event=status == 200,
-            )
-            async_dispatcher_send(
-                self.hass,
-                f"{DOMAIN}_{self.entry_id}_{MONITOR_STATUS}",
-                self.monitor.snapshot,
-            )
+            await self.provider.async_reconcile_monitor()
         if payload.get("event") in {"hangup", "call_ended"}:
             manager = self.hass.data.get(f"{DOMAIN}_pcm_ws")
             if manager is not None:
