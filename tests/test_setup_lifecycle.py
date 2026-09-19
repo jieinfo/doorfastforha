@@ -90,6 +90,21 @@ class FakeStatusMonitor:
         self.applied.append(status)
 
 
+class FakeStationRegistry:
+    def __init__(self):
+        self.monitors = {
+            "gate_main": FakeStatusMonitor(),
+            "gate_side": FakeStatusMonitor(),
+        }
+
+    @property
+    def station_ids(self):
+        return tuple(self.monitors)
+
+    def monitor(self, station_id):
+        return self.monitors[station_id]
+
+
 def load_module():
     # Import the helper without loading Home Assistant-dependent package code.
     package = types.ModuleType("custom_components.doorfast")
@@ -117,6 +132,81 @@ MODULE = load_module()
 
 
 class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_polls_authoritative_sessions_by_station_only(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(
+            status={"runtime_id": "runtime-a"},
+            monitor_status=lambda: None,
+        )
+
+        async def monitor_status():
+            return {
+                "runtime_id": "runtime-a",
+                "sessions": [
+                    {"station_id": "gate_main", "generation": 7,
+                     "state": "publishing", "status_revision": 4},
+                    {"station_id": "gate_side", "generation": 7,
+                     "state": "viewing", "status_revision": 5},
+                    {"station_id": "unknown", "generation": 9,
+                     "state": "publishing", "status_revision": 6},
+                ],
+            }
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(client, registry, provider)
+
+        self.assertEqual(
+            [
+                {"runtime_id": "runtime-a", "station_id": "gate_main",
+                 "generation": 7, "state": "publishing", "status_revision": 4}
+            ],
+            registry.monitors["gate_main"].applied,
+        )
+        self.assertEqual(
+            [
+                {"runtime_id": "runtime-a", "station_id": "gate_side",
+                 "generation": 7, "state": "viewing", "status_revision": 5}
+            ],
+            registry.monitors["gate_side"].applied,
+        )
+        self.assertEqual(1, provider.reconciled)
+
+    async def test_later_poll_replaces_a_relay_accelerated_station_state(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+        replies = iter((
+            {
+                "runtime_id": "runtime-a",
+                "sessions": [
+                    {"station_id": "gate_main", "generation": 7,
+                     "state": "publishing", "status_revision": 4},
+                    {"station_id": "gate_side", "generation": 7,
+                     "state": "viewing", "status_revision": 5},
+                ],
+            },
+            {
+                "runtime_id": "runtime-a",
+                "sessions": [
+                    {"station_id": "gate_main", "generation": 7,
+                     "state": "idle", "status_revision": 5},
+                    {"station_id": "gate_side", "generation": 7,
+                     "state": "viewing", "status_revision": 5},
+                ],
+            },
+        ))
+
+        async def monitor_status():
+            return next(replies)
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(client, registry, provider)
+        await MODULE.sync_monitor_state(client, registry, provider)
+
+        self.assertEqual("idle", registry.monitors["gate_main"].applied[-1]["state"])
+        self.assertEqual("viewing", registry.monitors["gate_side"].applied[-1]["state"])
+
     async def test_syncs_polled_media_then_reconciles_provider(self):
         monitor = FakeStatusMonitor()
         provider = FakeProvider()

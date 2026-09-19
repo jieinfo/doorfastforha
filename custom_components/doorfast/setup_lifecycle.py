@@ -15,7 +15,54 @@ async def sync_monitor_state(
     *,
     include_event: bool = False,
 ) -> None:
-    """Apply authoritative media state and optionally its accepted relay event."""
+    """Apply authoritative monitor state before reconciling WebRTC sessions."""
+    station_ids = getattr(monitor, "station_ids", None)
+    monitor_for_station = getattr(monitor, "monitor", None)
+    if station_ids is not None and callable(monitor_for_station):
+        expected_runtime = client.status.get("runtime_id")
+        status = await client.monitor_status()
+        if not isinstance(status, dict):
+            raise ValueError("monitor status must be an object")
+        reported_runtime = status.get("runtime_id", expected_runtime)
+        sessions = status.get("sessions")
+        if (
+            not isinstance(expected_runtime, str)
+            or reported_runtime != expected_runtime
+            or not isinstance(sessions, list)
+        ):
+            await provider.async_reconcile_monitor()
+            return
+        by_station: dict[str, dict[str, Any]] = {}
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            station_id = session.get("station_id")
+            if not isinstance(station_id, str) or station_id not in station_ids:
+                continue
+            item = dict(session)
+            item["runtime_id"] = expected_runtime
+            item["station_id"] = station_id
+            by_station[station_id] = item
+        for station_id in station_ids:
+            item = by_station.get(station_id)
+            if item is None:
+                revision = status.get("status_revision", 0)
+                item = {
+                    "runtime_id": expected_runtime,
+                    "station_id": station_id,
+                    "generation": 0,
+                    "state": "idle",
+                    "status_revision": (
+                        revision
+                        if isinstance(revision, int) and not isinstance(revision, bool)
+                        else 0
+                    ),
+                }
+            await monitor_for_station(station_id).async_apply_status(item)
+        await provider.async_reconcile_monitor()
+        return
+
+    """Compatibility path for direct monitor coordinator callers."""
     media = client.status.get("media")
     if isinstance(media, dict):
         await monitor.async_apply_status(media)

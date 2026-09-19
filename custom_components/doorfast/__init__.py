@@ -33,7 +33,7 @@ from .events import EventGate, process_event
 from .frontend import async_register_frontend, async_unregister_frontend
 from .generation import is_ringing
 from .routing import select_client
-from .setup_lifecycle import rollback_entry_setup
+from .setup_lifecycle import rollback_entry_setup, sync_monitor_state
 from .stations import StationRegistryCoordinator
 from .webrtc import DoorfastWebRTCProvider
 from .websocket import PcmWebSocketManager
@@ -98,8 +98,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     frontend_registration_attempted = False
 
     async def sync_current_monitor(*, include_event: bool = False) -> None:
-        del include_event
-        await provider.async_reconcile_monitor()
+        await sync_monitor_state(
+            client,
+            station_registry,
+            provider,
+            include_event=include_event,
+        )
 
     async def dispatch_status() -> None:
         async_dispatcher_send(
@@ -310,11 +314,20 @@ class DoorfastEventView(HomeAssistantView):
             }
             async_dispatcher_send(self.hass, channels[kind], data)
 
+        async def sync_station_monitor(_station_id, _relay_event):
+            await self.monitor.async_refresh()
+            await sync_monitor_state(client, self.monitor, self.provider)
+
         status, result = await process_event(
-            payload, client, self.event_gate, dispatch, is_ringing
+            payload,
+            client,
+            self.event_gate,
+            dispatch,
+            is_ringing,
+            self.monitor.station_ids,
+            monitor=self.monitor,
+            sync_monitor=sync_station_monitor,
         )
-        if status in {200, 202}:
-            await self.provider.async_reconcile_monitor()
         if payload.get("event") in {"hangup", "call_ended"}:
             manager = self.hass.data.get(f"{DOMAIN}_pcm_ws")
             if manager is not None:
