@@ -2,6 +2,11 @@
 
 This integration is a clean Home Assistant adapter for Doorfast host mode. It covers door unlock, elevator up/down calls, incoming-call notifications, hangup and optional video.
 
+Release 0.3.0 adds dynamic multi-station discovery, station reachability, and
+per-station monitor cameras. Configure one go2rtc stream for each station;
+repository fixture acceptance is simulated and does not prove physical-device
+concurrency.
+
 The integration talks to the Doorfast HTTP bridge at `http://<host>/cgi-bin/doorfast`. The bridge maps requests to the local `ubus` object and exposes `GET /api/v1/status`, `POST /api/v1/unlock`, `/api/v1/answer`, `/api/v1/hangup` and `/api/v1/call_elevator`. Enter the host URL in the setup form; the CGI path is added automatically.
 
 Doorfast status is authoritative for command acceptance, while physical door/elevator confirmation remains a separate status field and is shown as returned by the bridge. The client reads the current 16-character `runtime_id` from status and includes it in answer, hangup, unlock and elevator requests together with the applicable call generation. A daemon restart changes `runtime_id`; cached media state and call-event high-water marks are then discarded so a delayed command or event cannot collide with a reused generation.

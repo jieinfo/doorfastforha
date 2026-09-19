@@ -66,6 +66,14 @@ class E2ERunnerUnitTest(unittest.TestCase):
             state.hangup()
             self.assertFalse(state.status()["audio_tx"]["active"])
 
+    def test_fixture_exposes_two_independent_station_states(self):
+        with FixtureHTTPServer() as server:
+            self.assertEqual({"one", "two"}, set(server.states))
+            self.assertNotEqual(server.states["one"].runtime_id, server.states["two"].runtime_id)
+            server.states["one"].set_generation(8)
+            self.assertEqual(8, server.states["one"].generation)
+            self.assertEqual(7, server.states["two"].generation)
+
     def test_json_request_posts_bearer_and_json_payload(self):
         observed = {}
 

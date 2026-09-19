@@ -4,6 +4,11 @@ This guide validates the video path after Doorfast host mode and the HA
 integration are installed. It describes the ingress contract only; it does
 not replace an on-site MT8157 call or a packet capture.
 
+For multi-station deployments, configure one `streams` entry per station
+stream name. `max_encoders` limits station source sessions, not browser
+viewers sharing a source. The repository fixture exercises these contracts
+synthetically and is not evidence of concurrent physical door stations.
+
 ## Boundary and configuration
 
 Doorfast publishes the encoded preview to the HA host's go2rtc RTSP ingress.

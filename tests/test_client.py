@@ -42,6 +42,8 @@ load_module("custom_components.doorfast.const", COMPONENT / "const.py")
 load_module("custom_components.doorfast.generation", COMPONENT / "generation.py")
 client_module = load_module("custom_components.doorfast.client", COMPONENT / "client.py")
 DoorfastClient = client_module.DoorfastClient
+client_types_module = sys.modules["custom_components.doorfast.client_types"]
+DoorfastStation = client_types_module.DoorfastStation
 
 
 class FakeResponse:
@@ -208,7 +210,7 @@ class MonitorPayloadTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             {"state": "queued", "generation": 9},
-            await client.start_monitor(),
+            await client.start_monitor("runtime-a", "gate_main"),
         )
         self.assertEqual(
             {"state": "publishing", "generation": 9},
@@ -216,22 +218,39 @@ class MonitorPayloadTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             {"state": "queued", "generation": 9, "active": True},
-            await client.set_monitor_viewer(9, True),
+            await client.set_monitor_viewer("runtime-a", "gate_main", 9, True),
         )
         self.assertEqual(
             {"state": "stopping", "generation": 9},
-            await client.stop_monitor(9),
+            await client.stop_monitor("runtime-a", "gate_main", 9),
         )
         self.assertEqual(
             [
-                call("POST", "/api/v1/monitor/start", {}),
+                call(
+                    "POST",
+                    "/api/v1/monitor/start",
+                    {"runtime_id": "runtime-a", "station_id": "gate_main"},
+                ),
                 call("GET", "/api/v1/monitor/status"),
                 call(
                     "POST",
                     "/api/v1/monitor/viewer",
-                    {"generation": 9, "active": True},
+                    {
+                        "runtime_id": "runtime-a",
+                        "station_id": "gate_main",
+                        "generation": 9,
+                        "active": True,
+                    },
                 ),
-                call("POST", "/api/v1/monitor/stop", {"generation": 9}),
+                call(
+                    "POST",
+                    "/api/v1/monitor/stop",
+                    {
+                        "runtime_id": "runtime-a",
+                        "station_id": "gate_main",
+                        "generation": 9,
+                    },
+                ),
             ],
             client._request.await_args_list,
         )
@@ -243,15 +262,138 @@ class MonitorPayloadTest(unittest.IsolatedAsyncioTestCase):
         for generation in (None, 0, -1, True, "9"):
             with self.subTest(generation=generation):
                 with self.assertRaises(ValueError):
-                    await client.stop_monitor(generation)
+                    await client.stop_monitor("runtime-a", "gate_main", generation)
                 with self.assertRaises(ValueError):
-                    await client.set_monitor_viewer(generation, True)
+                    await client.set_monitor_viewer(
+                        "runtime-a", "gate_main", generation, True
+                    )
         for active in (None, 0, 1, "true"):
             with self.subTest(active=active):
                 with self.assertRaises(ValueError):
-                    await client.set_monitor_viewer(9, active)
+                    await client.set_monitor_viewer(
+                        "runtime-a", "gate_main", 9, active
+                    )
 
         client._request.assert_not_awaited()
+
+
+def station_payload(**overrides):
+    payload = {
+        "id": "gate_main",
+        "name": "Main Gate",
+        "logical_address": "32:02:01:00:02:00",
+        "enabled": True,
+        "stream_name": "doorfast_gate_main",
+        "route_source": "discovered",
+        "route_fresh": True,
+        "monitorable": True,
+        "last_seen_ms": 123456,
+    }
+    payload.update(overrides)
+    return payload
+
+
+class StationContractTest(unittest.IsolatedAsyncioTestCase):
+    def test_parses_a_reachable_station(self):
+        station = DoorfastStation.from_payload(station_payload())
+
+        self.assertEqual("gate_main", station.station_id)
+        self.assertEqual("Main Gate", station.name)
+        self.assertTrue(station.reachable)
+
+    def test_disabled_station_is_not_reachable(self):
+        station = DoorfastStation.from_payload(station_payload(enabled=False))
+
+        self.assertFalse(station.reachable)
+
+    def test_rejects_malformed_station_fields(self):
+        malformed_fields = (
+            {"id": "Gate-main"},
+            {"name": ""},
+            {"name": "Main G\u00e1te"},
+            {"logical_address": "31:02:01:00:02:00"},
+            {"enabled": 1},
+            {"stream_name": "doorfast gate"},
+            {"route_source": "cached"},
+            {"route_fresh": "true"},
+            {"monitorable": 1},
+            {"last_seen_ms": True},
+            {"last_seen_ms": -1},
+        )
+
+        for overrides in malformed_fields:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ValueError):
+                    DoorfastStation.from_payload(station_payload(**overrides))
+
+    async def test_returns_validated_station_snapshot(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client._request = AsyncMock(
+            return_value={
+                "runtime_id": "0123456789abcdef",
+                "revision": 3,
+                "stations": [station_payload()],
+            }
+        )
+
+        snapshot = await client.stations()
+
+        self.assertEqual("0123456789abcdef", snapshot.runtime_id)
+        self.assertEqual(3, snapshot.revision)
+        self.assertEqual((DoorfastStation.from_payload(station_payload()),), snapshot.stations)
+        client._request.assert_awaited_once_with("GET", "/api/v1/stations")
+
+    async def test_rejects_duplicate_station_ids_and_wrong_runtime_ids(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        invalid_snapshots = (
+            {
+                "runtime_id": "not-a-runtime-id",
+                "revision": 3,
+                "stations": [station_payload()],
+            },
+            {
+                "runtime_id": "0123456789abcdef",
+                "revision": 3,
+                "stations": [station_payload(), station_payload()],
+            },
+        )
+
+        for payload in invalid_snapshots:
+            with self.subTest(payload=payload):
+                client._request = AsyncMock(return_value=payload)
+                with self.assertRaises(ValueError):
+                    await client.stations()
+
+    async def test_rejects_duplicate_station_stream_names(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client._request = AsyncMock(
+            return_value={
+                "runtime_id": "0123456789abcdef",
+                "revision": 3,
+                "stations": [
+                    station_payload(),
+                    station_payload(
+                        id="gate_side",
+                        name="Side Gate",
+                        logical_address="32:02:01:00:02:01",
+                    ),
+                ],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate station stream names"):
+            await client.stations()
+
+    async def test_rejects_non_object_station_snapshots(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+
+        for payload in (None, [], 3, "station snapshot"):
+            with self.subTest(payload=payload):
+                client._request = AsyncMock(return_value=payload)
+                with self.assertRaisesRegex(
+                    ValueError, "station snapshot must be an object"
+                ):
+                    await client.stations()
 
 
 class VideoFrameTest(unittest.IsolatedAsyncioTestCase):

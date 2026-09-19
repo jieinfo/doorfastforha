@@ -52,16 +52,24 @@ hangup:
       default: ha
       selector: {text: {}}
 start_monitor:
-  name: Start monitor
-  description: Start the configured Doorfast active preview.
+  name: Start station monitor
+  description: Start the selected Doorfast station preview.
   fields:
     config_entry_id:
       description: Required only when multiple Doorfast entries are loaded.
       selector: {text: {}}
+    station_id:
+      required: true
+      description: Immutable configured Doorfast station ID.
+      selector: {text: {}}
 stop_monitor:
-  name: Stop monitor
-  description: Stop the current Doorfast active preview generation.
+  name: Stop station monitor
+  description: Stop the selected Doorfast station preview generation.
   fields:
     config_entry_id:
       description: Required only when multiple Doorfast entries are loaded.
+      selector: {text: {}}
+    station_id:
+      required: true
+      description: Immutable configured Doorfast station ID.
       selector: {text: {}}
