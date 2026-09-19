@@ -146,6 +146,8 @@ class DoorfastClient:
 
     async def stations(self) -> DoorfastStationSnapshot:
         payload = await self._request("GET", "/api/v1/stations")
+        if not isinstance(payload, dict):
+            raise ValueError("station snapshot must be an object")
         runtime_id = self._snapshot_runtime_id(payload.get("runtime_id"))
         revision = self._snapshot_revision(payload.get("revision"))
         raw_stations = payload.get("stations")
@@ -154,6 +156,8 @@ class DoorfastClient:
         stations = tuple(DoorfastStation.from_payload(raw) for raw in raw_stations)
         if len({station.station_id for station in stations}) != len(stations):
             raise ValueError("station snapshot contains duplicate station ids")
+        if len({station.stream_name for station in stations}) != len(stations):
+            raise ValueError("station snapshot contains duplicate station stream names")
         return DoorfastStationSnapshot(runtime_id, revision, stations)
 
     @staticmethod

@@ -364,6 +364,37 @@ class StationContractTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await client.stations()
 
+    async def test_rejects_duplicate_station_stream_names(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client._request = AsyncMock(
+            return_value={
+                "runtime_id": "0123456789abcdef",
+                "revision": 3,
+                "stations": [
+                    station_payload(),
+                    station_payload(
+                        id="gate_side",
+                        name="Side Gate",
+                        logical_address="32:02:01:00:02:01",
+                    ),
+                ],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate station stream names"):
+            await client.stations()
+
+    async def test_rejects_non_object_station_snapshots(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+
+        for payload in (None, [], 3, "station snapshot"):
+            with self.subTest(payload=payload):
+                client._request = AsyncMock(return_value=payload)
+                with self.assertRaisesRegex(
+                    ValueError, "station snapshot must be an object"
+                ):
+                    await client.stations()
+
 
 class VideoFrameTest(unittest.IsolatedAsyncioTestCase):
     async def test_binds_request_to_generation_and_reuses_unchanged_frame(self):
