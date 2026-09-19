@@ -126,6 +126,18 @@ class StationRegistryTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual([], closed)
 
+    async def test_default_monitor_is_bound_to_snapshot_runtime_and_station(self):
+        client = FakeClient(
+            snapshot("0123456789abcdef", 1, station("gate_main"))
+        )
+        registry = StationRegistryCoordinator(client, entry_id="entry-1")
+
+        await registry.async_refresh()
+
+        monitor = registry.monitor("gate_main")
+        self.assertEqual("0123456789abcdef", monitor.runtime_id)
+        self.assertEqual("gate_main", monitor.station_id)
+
     async def test_updates_identity_in_place_and_ignores_unchanged_revision(self):
         closed = []
         client = FakeClient(

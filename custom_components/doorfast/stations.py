@@ -14,9 +14,9 @@ MonitorFactory = Callable[[Any, str, DoorfastStation], MonitorCoordinator]
 
 
 def _default_monitor_factory(
-    client: Any, _runtime_id: str, _station: DoorfastStation
+    client: Any, runtime_id: str, station: DoorfastStation
 ) -> MonitorCoordinator:
-    return MonitorCoordinator(client)
+    return MonitorCoordinator(client, runtime_id, station.station_id)
 
 
 class StationRegistryCoordinator:

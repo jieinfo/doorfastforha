@@ -24,10 +24,18 @@ class MonitorCoordinator:
     one start/stop lifecycle and delays the final stop to absorb reconnects.
     """
 
-    def __init__(self, client: Any, grace_seconds: float = 15.0) -> None:
+    def __init__(
+        self,
+        client: Any,
+        runtime_id: str,
+        station_id: str,
+        grace_seconds: float = 15.0,
+    ) -> None:
         if grace_seconds < 0:
             raise ValueError("grace_seconds must not be negative")
         self._client = client
+        self.runtime_id = runtime_id
+        self.station_id = station_id
         self._grace_seconds = grace_seconds
         self._lock = asyncio.Lock()
         self._stop_task: asyncio.Task[None] | None = None
@@ -62,6 +70,8 @@ class MonitorCoordinator:
     @property
     def snapshot(self) -> dict[str, Any]:
         return {
+            "runtime_id": self.runtime_id,
+            "station_id": self.station_id,
             "generation": self._generation,
             "state": self._state,
             "ready": self._ready,
@@ -88,25 +98,40 @@ class MonitorCoordinator:
             self._stop_task = None
 
     def _set_response_locked(self, response: dict[str, Any]) -> None:
+        self._validate_identity(response)
         generation = self._response_generation(response)
         state = self._response_state(response)
         revision = response.get("status_revision", self._status_revision)
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise ValueError("monitor status revision must be a non-negative integer")
-        if self._generation is not None and generation != self._generation:
-            self._viewer_count = 0
-            self._cancel_grace_locked()
         self._generation = generation
         self._state = state
         self._ready = response.get("ready") is True or state in _READY_STATES
         self._status_revision = revision
         self._status_event.set()
 
+    def _validate_identity(self, payload: dict[str, Any]) -> None:
+        runtime_id = payload.get("runtime_id")
+        if runtime_id is not None and runtime_id != self.runtime_id:
+            raise ValueError("monitor status runtime does not match coordinator")
+        station_id = payload.get("station_id")
+        if station_id is not None and station_id != self.station_id:
+            raise ValueError("monitor status station does not match coordinator")
+        generation = payload.get("generation")
+        if (
+            self._generation is not None
+            and generation not in (None, 0, self._generation)
+        ):
+            _positive_int(generation, "monitor generation")
+            raise ValueError("monitor status generation does not match coordinator")
+
     async def _start_locked(self) -> int:
         if self._unloaded:
             raise RuntimeError("monitor coordinator is unloaded")
         self._cancel_grace_locked()
-        response = await self._client.start_monitor()
+        response = await self._client.start_monitor(
+            self.runtime_id, self.station_id
+        )
         if not isinstance(response, dict):
             raise ValueError("Doorfast monitor start returned a non-object")
         self._set_response_locked(response)
@@ -165,7 +190,9 @@ class MonitorCoordinator:
                     raise RuntimeError("monitor generation is no longer ready")
                 if self._viewer_count == 0:
                     try:
-                        await self._client.set_monitor_viewer(generation, True)
+                        await self._client.set_monitor_viewer(
+                            self.runtime_id, self.station_id, generation, True
+                        )
                     except Exception:
                         await self._stop_locked(generation)
                         raise
@@ -200,7 +227,9 @@ class MonitorCoordinator:
             if self._viewer_count != 0 or generation is None:
                 return
             try:
-                await self._client.set_monitor_viewer(generation, False)
+                await self._client.set_monitor_viewer(
+                    self.runtime_id, self.station_id, generation, False
+                )
             except Exception:
                 self._viewer_count = 1
                 raise
@@ -233,7 +262,9 @@ class MonitorCoordinator:
             return
         self._cancel_grace_locked()
         try:
-            response = await self._client.stop_monitor(active_generation)
+            response = await self._client.stop_monitor(
+                self.runtime_id, self.station_id, active_generation
+            )
             if isinstance(response, dict):
                 self._set_response_locked(response)
         finally:
@@ -277,6 +308,10 @@ class MonitorCoordinator:
                 merged["status_revision"] = payload["status_revision"]
         else:
             merged = dict(payload)
+        for field in ("runtime_id", "station_id"):
+            if field in payload:
+                merged[field] = payload[field]
+        self._validate_identity(merged)
         event = payload.get("event")
         if event in {"monitor_preempted", "monitor_stopped"}:
             async with self._lock:

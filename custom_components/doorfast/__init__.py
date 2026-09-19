@@ -77,7 +77,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     station_registries[entry.entry_id] = station_registry
 
     monitors = hass.data.setdefault(MONITORS_KEY, {})
-    monitor = DoorfastMonitorCoordinator(client)
+    monitor = DoorfastMonitorCoordinator(client, "legacy", "legacy")
     monitors[entry.entry_id] = monitor
 
     providers = hass.data.setdefault(WEBRTC_PROVIDERS_KEY, {})
@@ -150,12 +150,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         )
 
     async def start_monitor(call):
-        selected = _service_resource(hass, MONITORS_KEY, call)
-        await selected.async_start()
+        registry = _service_resource(hass, STATIONS_KEY, call)
+        station_id = call.data.get("station_id")
+        if not isinstance(station_id, str):
+            raise HomeAssistantError("station_id is required")
+        try:
+            await registry.monitor(station_id).async_start()
+        except KeyError as error:
+            raise HomeAssistantError("unknown Doorfast station") from error
 
     async def stop_monitor(call):
-        selected = _service_resource(hass, MONITORS_KEY, call)
-        await selected.async_stop()
+        registry = _service_resource(hass, STATIONS_KEY, call)
+        station_id = call.data.get("station_id")
+        if not isinstance(station_id, str):
+            raise HomeAssistantError("station_id is required")
+        try:
+            await registry.monitor(station_id).async_stop()
+        except KeyError as error:
+            raise HomeAssistantError("unknown Doorfast station") from error
 
     try:
         await poll()
