@@ -86,6 +86,12 @@ class FakeMonitor:
         self.closed.append(self.station_id)
 
 
+class FailingMonitor(FakeMonitor):
+    async def async_close(self):
+        await super().async_close()
+        raise RuntimeError(f"failed to close {self.station_id}")
+
+
 class StationRegistryTest(unittest.IsolatedAsyncioTestCase):
     def make_registry(self, client, closed):
         return StationRegistryCoordinator(
@@ -223,6 +229,56 @@ class StationRegistryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["gate_main"], closed)
         self.assertEqual((), registry.station_ids)
         self.assertEqual([], events)
+
+    async def test_close_cleans_every_monitor_when_one_close_fails(self):
+        closed = []
+        client = FakeClient(
+            snapshot(
+                "0123456789abcdef",
+                1,
+                station("gate_main"),
+                station("gate_side"),
+            )
+        )
+        registry = StationRegistryCoordinator(
+            client,
+            entry_id="entry-1",
+            monitor_factory=lambda _client, _runtime_id, item: (
+                FailingMonitor(item.station_id, closed)
+                if item.station_id == "gate_main"
+                else FakeMonitor(item.station_id, closed)
+            ),
+        )
+        registry.add_listener(lambda _event, _station_id: None)
+        await registry.async_refresh()
+
+        with self.assertRaisesRegex(RuntimeError, "failed to close gate_main"):
+            await registry.async_close()
+
+        self.assertEqual(["gate_main", "gate_side"], closed)
+        self.assertEqual((), registry.station_ids)
+
+    async def test_failed_removal_keeps_monitor_for_retry(self):
+        closed = []
+        client = FakeClient(
+            snapshot("0123456789abcdef", 1, station("gate_main")),
+            snapshot("0123456789abcdef", 2),
+        )
+        registry = StationRegistryCoordinator(
+            client,
+            entry_id="entry-1",
+            monitor_factory=lambda _client, _runtime_id, item: FailingMonitor(
+                item.station_id, closed
+            ),
+        )
+        await registry.async_refresh()
+        monitor = registry.monitor("gate_main")
+
+        with self.assertRaisesRegex(RuntimeError, "failed to close gate_main"):
+            await registry.async_refresh()
+
+        self.assertEqual(("gate_main",), registry.station_ids)
+        self.assertIs(monitor, registry.monitor("gate_main"))
 
     def test_station_entity_uses_child_device_identity(self):
         entity = DoorfastStationEntity("entry-1", station("gate_main"))

@@ -72,8 +72,9 @@ class StationRegistryCoordinator:
         return self._monitor_factory(self.client, runtime_id, station)
 
     async def _remove(self, station_id: str) -> None:
-        monitor = self._monitors.pop(station_id)
+        monitor = self._monitors[station_id]
         await monitor.async_close()
+        self._monitors.pop(station_id)
         self._stations.pop(station_id, None)
         self._notify("removed", station_id)
 
@@ -83,10 +84,9 @@ class StationRegistryCoordinator:
         for station in snapshot.stations:
             if not station.enabled:
                 continue
+            monitor = self._new_monitor(snapshot.runtime_id, station)
             self._stations[station.station_id] = station
-            self._monitors[station.station_id] = self._new_monitor(
-                snapshot.runtime_id, station
-            )
+            self._monitors[station.station_id] = monitor
             self._notify("added", station.station_id)
 
     async def async_refresh(self) -> bool:
@@ -119,10 +119,9 @@ class StationRegistryCoordinator:
                 continue
             previous = self._stations.get(station.station_id)
             if previous is None:
+                monitor = self._new_monitor(snapshot.runtime_id, station)
                 self._stations[station.station_id] = station
-                self._monitors[station.station_id] = self._new_monitor(
-                    snapshot.runtime_id, station
-                )
+                self._monitors[station.station_id] = monitor
                 self._notify("added", station.station_id)
             elif previous != station:
                 self._stations[station.station_id] = station
@@ -135,10 +134,16 @@ class StationRegistryCoordinator:
         if self._closed:
             return
         self._closed = True
+        first_error: Exception | None = None
         for monitor in tuple(self._monitors.values()):
-            await monitor.async_close()
+            try:
+                await monitor.async_close()
+            except Exception as error:
+                if first_error is None:
+                    first_error = error
         self._monitors.clear()
         self._stations.clear()
         self._listeners.clear()
         self._snapshot = None
-
+        if first_error is not None:
+            raise first_error
