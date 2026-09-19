@@ -29,6 +29,7 @@ class FixtureState:
     next_sequence: int = 0
     requests: list[dict[str, Any]] = field(default_factory=list)
     audio_hashes: list[dict[str, Any]] = field(default_factory=list)
+    stations_revision: int = 1
     lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
 
     def status(self) -> dict[str, Any]:
@@ -42,6 +43,19 @@ class FixtureState:
                 "audio": {"snapshot_ready": False, "generation": self.generation, "snapshot_packet_count": 0},
                 "video": {"ready": False, "generation": self.generation},
             }
+
+    def stations(self) -> dict[str, Any]:
+        return {
+            "runtime_id": self.runtime_id,
+            "revision": self.stations_revision,
+            "stations": [
+                {"station_id": "gate_main", "logical_address": "320000000001", "stream_name": "doorfast_one_main", "enabled": True},
+                {"station_id": "gate_side", "logical_address": "320000000002", "stream_name": "doorfast_one_side", "enabled": True},
+            ],
+        }
+
+    def monitor_status(self) -> dict[str, Any]:
+        return {"runtime_id": self.runtime_id, "sessions": []}
 
     def set_generation(self, generation: int, *, talking: bool = True) -> None:
         if generation <= 0:
@@ -94,6 +108,12 @@ class _Handler(BaseHTTPRequestHandler):
         state, relative = self._state_and_path()
         if state is not None and relative == "/api/v1/status":
             self._send_json(200, state.status())
+            return
+        if state is not None and relative == "/api/v1/stations":
+            self._send_json(200, state.stations())
+            return
+        if state is not None and relative == "/api/v1/monitor/status":
+            self._send_json(200, state.monitor_status())
             return
         self._send_json(404, {"status": "error", "error": "not_found"})
 

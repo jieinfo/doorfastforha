@@ -14,6 +14,7 @@ class ReleaseMetadataTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/release.yml").read_text()
 
         self.assertEqual(manifest["domain"], "doorfast")
+        self.assertEqual(manifest["version"], "0.3.0")
         self.assertEqual(hacs["name"], "Doorfast")
         self.assertIn("jieinfo/doorfastforha", readme)
         self.assertIn("category=integration", readme)
