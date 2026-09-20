@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.2
+
+- Recover the monitor lifecycle when Home Assistant WebRTC viewers reconnect during a stopping transition.
+- Treat an idempotent Doorfast monitor stop response as successful during cleanup.
+
 ## 0.3.1
 
 - Retry Home Assistant WebRTC negotiation while the go2rtc producer is starting.
