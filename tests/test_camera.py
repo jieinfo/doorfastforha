@@ -193,7 +193,7 @@ class DoorfastCameraTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             "doorfast_entry-1_station_gate_main_camera", camera.unique_id
         )
-        self.assertTrue(camera.supported_features & CameraEntityFeature.STREAM)
+        self.assertEqual(0, camera.supported_features)
 
     async def test_setup_adds_each_station_and_removes_one_dynamically(self):
         registry = FakeRegistry()
