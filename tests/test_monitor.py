@@ -167,6 +167,52 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
             client.calls,
         )
 
+    async def test_acquire_during_stopping_restarts_generation(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main", grace_seconds=10)
+
+        await coordinator.async_acquire_viewer()
+        await coordinator.async_release_viewer()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "stopping", "status_revision": 1}
+        )
+        client.start_result = {"state": "publishing", "generation": 8}
+
+        self.assertEqual(8, await coordinator.async_acquire_viewer())
+        self.assertEqual("publishing", coordinator.state)
+        self.assertEqual(1, coordinator.viewer_count)
+        self.assertEqual(
+            [
+                ("start", "runtime-a", "gate_main"),
+                ("viewer", "runtime-a", "gate_main", 7, True),
+                ("viewer", "runtime-a", "gate_main", 7, False),
+                ("stop", "runtime-a", "gate_main", 7),
+                ("start", "runtime-a", "gate_main"),
+                ("viewer", "runtime-a", "gate_main", 8, True),
+            ],
+            client.calls,
+        )
+
+    async def test_stop_conflict_is_idempotent_for_local_lifecycle(self):
+        class ConflictError(Exception):
+            status = 409
+
+        class ConflictClient(FakeClient):
+            async def stop_monitor(self, runtime_id, station_id, generation):
+                self.calls.append(("stop", runtime_id, station_id, generation))
+                raise ConflictError("already stopped")
+
+        client = ConflictClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main", grace_seconds=0)
+        await coordinator.async_start()
+
+        await coordinator.async_stop()
+
+        self.assertEqual("idle", coordinator.state)
+        self.assertIsNone(coordinator.generation)
+        self.assertFalse(coordinator.ready)
+        self.assertEqual(0, coordinator.viewer_count)
+
     async def test_preempt_and_stop_events_clear_generation(self):
         client = FakeClient()
         coordinator = MonitorCoordinator(client, "runtime-a", "gate_main", grace_seconds=10)

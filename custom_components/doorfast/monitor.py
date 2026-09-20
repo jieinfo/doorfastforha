@@ -172,7 +172,12 @@ class MonitorCoordinator:
             if self._generation is None or self._state in _IDLE_STATES:
                 await self._start_locked()
             if self._state == "stopping":
-                raise RuntimeError("monitor generation is stopping")
+                # A reconnect can arrive after Doorfast has accepted the
+                # delayed stop but before its status event reaches HA. Finish
+                # that old generation locally, then create a fresh one rather
+                # than exposing the transient state to the WebRTC caller.
+                await self._stop_locked(self._generation)
+                await self._start_locked()
             generation = self._generation
             if generation is None:
                 raise RuntimeError("monitor generation was not created")
@@ -262,9 +267,17 @@ class MonitorCoordinator:
             return
         self._cancel_grace_locked()
         try:
-            response = await self._client.stop_monitor(
-                self.runtime_id, self.station_id, active_generation
-            )
+            try:
+                response = await self._client.stop_monitor(
+                    self.runtime_id, self.station_id, active_generation
+                )
+            except Exception as error:
+                # Doorfast returns 409 when another lifecycle edge already
+                # stopped this generation. For HA this is equivalent to a
+                # successful idempotent stop; always clear local ownership.
+                if getattr(error, "status", None) != 409:
+                    raise
+                response = None
             if isinstance(response, dict):
                 self._set_response_locked(response)
         finally:
