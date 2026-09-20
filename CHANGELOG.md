@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3
+
+- Route Doorfast camera sources exclusively through the native WebRTC provider instead of Home Assistant's generic stream worker.
+
 ## 0.3.2
 
 - Recover the monitor lifecycle when Home Assistant WebRTC viewers reconnect during a stopping transition.
