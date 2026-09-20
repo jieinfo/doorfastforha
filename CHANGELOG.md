@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4
+
+- Keep the camera feature flags as a `CameraEntityFeature` value so Home Assistant can register Doorfast cameras correctly.
+
 ## 0.3.3
 
 - Route Doorfast camera sources exclusively through the native WebRTC provider instead of Home Assistant's generic stream worker.

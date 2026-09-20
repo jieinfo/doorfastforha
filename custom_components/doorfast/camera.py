@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from homeassistant.components.camera import Camera
+from homeassistant.components.camera import Camera, CameraEntityFeature
 from homeassistant.helpers import entity_registry as er
 
 from .const import DOMAIN, STATIONS_KEY
@@ -57,7 +57,7 @@ class DoorfastStationCamera(Camera, DoorfastStationEntity):
 
     _attr_translation_key = "video"
     _attr_content_type = "image/jpeg"
-    _attr_supported_features = 0
+    _attr_supported_features = CameraEntityFeature(0)
 
     def __init__(self, client, entry_id, station, monitor):
         Camera.__init__(self)
