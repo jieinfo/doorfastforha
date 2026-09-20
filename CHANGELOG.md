@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.5
+
+- Keep the typed `STREAM` capability required for Home Assistant's native Doorfast WebRTC provider.
+
 ## 0.3.4
 
 - Keep the camera feature flags as a `CameraEntityFeature` value so Home Assistant can register Doorfast cameras correctly.

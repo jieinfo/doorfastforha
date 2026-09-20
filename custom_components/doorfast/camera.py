@@ -57,7 +57,7 @@ class DoorfastStationCamera(Camera, DoorfastStationEntity):
 
     _attr_translation_key = "video"
     _attr_content_type = "image/jpeg"
-    _attr_supported_features = CameraEntityFeature(0)
+    _attr_supported_features = CameraEntityFeature.STREAM
 
     def __init__(self, client, entry_id, station, monitor):
         Camera.__init__(self)
