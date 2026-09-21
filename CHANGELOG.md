@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.6
+
+- Wait up to 25 seconds for Doorfast monitor startup so stations can recover from repeated busy responses before WebRTC negotiation begins.
+
 ## 0.3.5
 
 - Keep the typed `STREAM` capability required for Home Assistant's native Doorfast WebRTC provider.
