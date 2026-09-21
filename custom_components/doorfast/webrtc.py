@@ -17,7 +17,7 @@ from homeassistant.components.camera import (
 from webrtc_models import RTCIceCandidateInit
 
 from .config_helpers import normalize_go2rtc_api_url
-from .const import DOMAIN
+from .const import DOMAIN, MONITOR_READY_TIMEOUT
 
 try:
     from homeassistant.exceptions import HomeAssistantError
@@ -128,7 +128,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         generation = await coordinator.async_acquire_viewer()
         viewer_released = False
         try:
-            await coordinator.async_wait_ready(generation, timeout=_OFFER_TIMEOUT)
+            await coordinator.async_wait_ready(
+                generation, timeout=MONITOR_READY_TIMEOUT
+            )
             for attempt in range(_NEGOTIATION_ATTEMPTS):
                 state: _Session | None = None
                 final_attempt = attempt == _NEGOTIATION_ATTEMPTS - 1
