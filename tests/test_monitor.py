@@ -43,6 +43,29 @@ class FakeClient:
 
 
 class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_ready_defaults_to_doorfast_retry_window(self):
+        client = FakeClient()
+        client.start_result = {"state": "queued", "generation": 7}
+        coordinator = MonitorCoordinator(
+            client, "runtime-a", "gate_main", grace_seconds=0.01
+        )
+        generation = await coordinator.async_start()
+        observed_timeout = None
+
+        async def capture_wait_for(awaitable, timeout):
+            nonlocal observed_timeout
+            observed_timeout = timeout
+            awaitable.close()
+
+        original_wait_for = monitor_module.asyncio.wait_for
+        monitor_module.asyncio.wait_for = capture_wait_for
+        try:
+            await coordinator.async_wait_ready(generation)
+        finally:
+            monitor_module.asyncio.wait_for = original_wait_for
+
+        self.assertEqual(25.0, observed_timeout)
+
     async def test_start_tracks_generation_and_status_ready(self):
         client = FakeClient()
         coordinator = MonitorCoordinator(client, "runtime-a", "gate_main", grace_seconds=0.01)

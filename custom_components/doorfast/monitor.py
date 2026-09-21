@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from .const import MONITOR_READY_TIMEOUT
+
 
 _READY_STATES = frozenset(("publishing", "viewing"))
 _IDLE_STATES = frozenset(("idle", "stopped", "failed", "unavailable"))
@@ -144,7 +146,9 @@ class MonitorCoordinator:
                 return self._generation
             return await self._start_locked()
 
-    async def async_wait_ready(self, generation: int, timeout: float = 10.0) -> None:
+    async def async_wait_ready(
+        self, generation: int, timeout: float = MONITOR_READY_TIMEOUT
+    ) -> None:
         """Wait until the exact generation is publishing/viewing."""
         if self._generation == generation and self._ready:
             return
