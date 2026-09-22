@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.10
+
+- Fix the Home Assistant options flow for current `OptionsFlow` implementations.
+
 ## 0.3.9
 
 - Authenticate Home Assistant WebRTC signaling against go2rtc APIs that require Basic Auth.

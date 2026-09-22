@@ -22,6 +22,7 @@ class Go2rtcContractTests(unittest.TestCase):
         self.assertIn('CONF_GO2RTC_USERNAME = "go2rtc_username"', constants)
         self.assertIn('CONF_GO2RTC_PASSWORD = "go2rtc_password"', constants)
         self.assertIn("DoorfastOptionsFlow", flow)
+        self.assertNotIn("self.config_entry = config_entry", flow)
         self.assertIn("go2rtc_credentials_required", flow)
         self.assertIn("add_update_listener", setup)
         self.assertNotIn("ws://127.0.0.1:1984/api/ws", provider)
