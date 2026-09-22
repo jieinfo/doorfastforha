@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.9
+
+- Authenticate Home Assistant WebRTC signaling against go2rtc APIs that require Basic Auth.
+- Reload the integration when go2rtc connection options change and validate credential pairs.
+
 ## 0.3.8
 
 - Prevent stale monitor polls and events from invalidating or reviving an active camera generation during WebRTC startup.
