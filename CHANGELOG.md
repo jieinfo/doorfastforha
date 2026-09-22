@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.7
+
+- Keep retrying WebRTC negotiation while slow Doorfast stations bring up their RTSP producer.
+
 ## 0.3.6
 
 - Wait up to 25 seconds for Doorfast monitor startup so stations can recover from repeated busy responses before WebRTC negotiation begins.
