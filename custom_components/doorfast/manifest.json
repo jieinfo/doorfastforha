@@ -1,7 +1,7 @@
 {
   "domain": "doorfast",
   "name": "Doorfast",
-  "version": "0.3.8",
+  "version": "0.3.9",
   "documentation": "https://github.com/jieinfo/doorfastforha",
   "issue_tracker": "https://github.com/jieinfo/doorfastforha/issues",
   "config_flow": true,
