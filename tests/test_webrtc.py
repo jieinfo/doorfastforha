@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 import types
 import unittest
+from unittest.mock import patch
 
 
 class WebRTCMessage:
@@ -266,7 +267,7 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.sleep(0)
         await second_ws.incoming.put({"type": "webrtc/answer", "value": "answer"})
-        await asyncio.wait_for(task, 1)
+        await asyncio.wait_for(task, 2)
 
         self.assertEqual(
             [
@@ -284,6 +285,39 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         await provider.async_close_entry()
         self.assertEqual(1, registry.monitors["gate_main"].released)
 
+    async def test_retries_through_slow_producer_startup(self):
+        websockets = [FakeWebSocket() for _ in range(6)]
+        session = FakeSession(*websockets)
+        provider, registry = self.make_provider(session)
+        messages = []
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "slow", messages.append
+            )
+        )
+
+        with patch.object(webrtc_module, "_NEGOTIATION_ATTEMPTS", 6), patch.object(
+            webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0
+        ):
+            for websocket in websockets[:-1]:
+                await asyncio.sleep(0)
+                await websocket.incoming.put(
+                    {"type": "error", "value": "streams: unknown error"}
+                )
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            await websockets[-1].incoming.put(
+                {"type": "webrtc/answer", "value": "answer"}
+            )
+            await asyncio.wait_for(task, 1)
+
+        self.assertEqual(6, len(session.urls))
+        self.assertEqual(1, len(messages))
+        self.assertIsInstance(messages[0], WebRTCAnswer)
+        self.assertEqual(1, registry.monitors["gate_main"].acquired)
+        self.assertEqual(0, registry.monitors["gate_main"].released)
+        await provider.async_close_entry()
+
     async def test_final_negotiation_failure_notifies_home_assistant(self):
         websockets = [FakeWebSocket() for _ in range(3)]
         provider, registry = self.make_provider(FakeSession(*websockets))
@@ -294,12 +328,15 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        for websocket in websockets:
-            await asyncio.sleep(0)
-            await websocket.incoming.put({"type": "error", "value": "not ready"})
+        with patch.object(webrtc_module, "_NEGOTIATION_ATTEMPTS", 3):
+            for websocket in websockets:
+                await asyncio.sleep(0)
+                await websocket.incoming.put(
+                    {"type": "error", "value": "not ready"}
+                )
 
-        with self.assertRaises(Exception):
-            await asyncio.wait_for(task, 3)
+            with self.assertRaises(Exception):
+                await asyncio.wait_for(task, 3)
         self.assertEqual(1, len(messages))
         self.assertIsInstance(messages[-1], WebRTCError)
         self.assertEqual(1, registry.monitors["gate_main"].released)
