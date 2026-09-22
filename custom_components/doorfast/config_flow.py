@@ -15,6 +15,8 @@ from .config_helpers import (
 )
 from .const import (
     CONF_GO2RTC_API_URL,
+    CONF_GO2RTC_PASSWORD,
+    CONF_GO2RTC_USERNAME,
     CONF_POLL_INTERVAL,
     CONF_SERVER_ADDRESS,
     DEFAULT_GO2RTC_API_URL,
@@ -59,21 +61,39 @@ class DoorfastOptionsFlow(config_entries.OptionsFlow):
     async def async_step_init(self, user_input=None):
         errors = {}
         if user_input is not None:
-            try:
-                address = normalize_go2rtc_api_url(
-                    user_input[CONF_GO2RTC_API_URL]
-                )
-            except ValueError:
-                errors[CONF_GO2RTC_API_URL] = "invalid_url"
+            username = user_input.get(CONF_GO2RTC_USERNAME, "")
+            password = user_input.get(CONF_GO2RTC_PASSWORD, "")
+            if bool(username) != bool(password):
+                errors["base"] = "go2rtc_credentials_required"
             else:
-                return self.async_create_entry(
-                    title="", data={CONF_GO2RTC_API_URL: address}
-                )
+                try:
+                    address = normalize_go2rtc_api_url(
+                        user_input[CONF_GO2RTC_API_URL]
+                    )
+                except ValueError:
+                    errors[CONF_GO2RTC_API_URL] = "invalid_url"
+                else:
+                    return self.async_create_entry(
+                        title="",
+                        data={
+                            CONF_GO2RTC_API_URL: address,
+                            CONF_GO2RTC_USERNAME: username,
+                            CONF_GO2RTC_PASSWORD: password,
+                        },
+                    )
         current = self.config_entry.options.get(
             CONF_GO2RTC_API_URL,
             self.config_entry.data.get(
                 CONF_GO2RTC_API_URL, DEFAULT_GO2RTC_API_URL
             ),
+        )
+        current_username = self.config_entry.options.get(
+            CONF_GO2RTC_USERNAME,
+            self.config_entry.data.get(CONF_GO2RTC_USERNAME, ""),
+        )
+        current_password = self.config_entry.options.get(
+            CONF_GO2RTC_PASSWORD,
+            self.config_entry.data.get(CONF_GO2RTC_PASSWORD, ""),
         )
         return self.async_show_form(
             step_id="init",
@@ -82,7 +102,13 @@ class DoorfastOptionsFlow(config_entries.OptionsFlow):
                 {
                     vol.Required(
                         CONF_GO2RTC_API_URL, default=current
-                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL))
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.URL)),
+                    vol.Optional(
+                        CONF_GO2RTC_USERNAME, default=current_username
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.TEXT)),
+                    vol.Optional(
+                        CONF_GO2RTC_PASSWORD, default=current_password
+                    ): TextSelector(TextSelectorConfig(type=TextSelectorType.PASSWORD)),
                 }
             ),
         )

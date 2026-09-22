@@ -7,6 +7,15 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
 
+try:
+    from aiohttp import BasicAuth
+except ImportError:  # pragma: no cover - dependency-free unit tests
+    class BasicAuth:
+        """Minimal fallback for tests that do not install Home Assistant deps."""
+
+        def __init__(self, login: str, password: str) -> None:
+            self.login = login
+            self.password = password
 from homeassistant.components.camera import (
     Camera,
     CameraWebRTCProvider,
@@ -64,11 +73,18 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         registry: Any,
         go2rtc_api_url: str,
         session: Any | None = None,
+        go2rtc_username: str | None = None,
+        go2rtc_password: str | None = None,
     ) -> None:
         self._hass = hass
         self._entry_id = entry_id
         self._registry = registry
         self._go2rtc_api_url = normalize_go2rtc_api_url(go2rtc_api_url)
+        self._go2rtc_auth = (
+            BasicAuth(go2rtc_username, go2rtc_password or "")
+            if go2rtc_username
+            else None
+        )
         if session is None:
             from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -138,7 +154,12 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 final_attempt = attempt == _NEGOTIATION_ATTEMPTS - 1
                 try:
                     websocket = await self._session.ws_connect(
-                        self.websocket_url(station.stream_name)
+                        self.websocket_url(station.stream_name),
+                        **(
+                            {"auth": self._go2rtc_auth}
+                            if self._go2rtc_auth is not None
+                            else {}
+                        ),
                     )
                     loop = asyncio.get_running_loop()
                     state = _Session(

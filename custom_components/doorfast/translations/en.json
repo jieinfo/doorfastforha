@@ -1,8 +1,12 @@
 {
   "config": {
     "step": {"user": {"title": "Configure Doorfast", "data": {"server_address": "Doorfast bridge address", "poll_interval": "Polling interval (seconds)"}}},
-    "error": {"cannot_connect": "Could not connect to a running Doorfast bridge."},
+    "error": {"cannot_connect": "Could not connect to a running Doorfast bridge.", "go2rtc_credentials_required": "Enter both the go2rtc API username and password, or leave both blank."},
     "abort": {"already_configured": "This Doorfast bridge is already configured."}
+  },
+  "options": {
+    "step": {"init": {"title": "Configure go2rtc", "data": {"go2rtc_api_url": "go2rtc API URL", "go2rtc_username": "go2rtc API username", "go2rtc_password": "go2rtc API password"}}},
+    "error": {"go2rtc_credentials_required": "Enter both the go2rtc API username and password, or leave both blank."}
   },
   "entity": {
     "lock": {"unlock": {"name": "Unlock door"}},
