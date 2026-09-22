@@ -1,8 +1,12 @@
 {
   "config": {
     "step": {"user": {"title": "配置 Doorfast", "data": {"server_address": "Doorfast 网桥地址", "poll_interval": "轮询间隔（秒）"}}},
-    "error": {"cannot_connect": "无法连接到正在运行的 Doorfast 网桥。"},
+    "error": {"cannot_connect": "无法连接到正在运行的 Doorfast 网桥。", "go2rtc_credentials_required": "请同时填写 go2rtc API 用户名和密码，或同时留空。"},
     "abort": {"already_configured": "此 Doorfast 网桥已配置。"}
+  },
+  "options": {
+    "step": {"init": {"title": "配置 go2rtc", "data": {"go2rtc_api_url": "go2rtc API 地址", "go2rtc_username": "go2rtc API 用户名", "go2rtc_password": "go2rtc API 密码"}}},
+    "error": {"go2rtc_credentials_required": "请同时填写 go2rtc API 用户名和密码，或同时留空。"}
   },
   "entity": {
     "lock": {"unlock": {"name": "开门"}},

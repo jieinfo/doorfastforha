@@ -15,6 +15,8 @@ from homeassistant.helpers.event import async_track_time_interval
 from .client import DoorfastClient
 from .const import (
     CONF_GO2RTC_API_URL,
+    CONF_GO2RTC_PASSWORD,
+    CONF_GO2RTC_USERNAME,
     CONF_POLL_INTERVAL,
     CONF_SERVER_ADDRESS,
     DEFAULT_AUDIO_PORT,
@@ -50,6 +52,11 @@ SERVICE_NAMES = (
 _LOGGER = logging.getLogger(__name__)
 
 
+async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Reload the provider when its go2rtc options change."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
 def _service_resource(hass, key, call):
     try:
         return select_client(
@@ -81,8 +88,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         CONF_GO2RTC_API_URL,
         entry.data.get(CONF_GO2RTC_API_URL, DEFAULT_GO2RTC_API_URL),
     )
+    go2rtc_username = options.get(
+        CONF_GO2RTC_USERNAME,
+        entry.data.get(CONF_GO2RTC_USERNAME),
+    )
+    go2rtc_password = options.get(
+        CONF_GO2RTC_PASSWORD,
+        entry.data.get(CONF_GO2RTC_PASSWORD),
+    )
     provider = DoorfastWebRTCProvider(
-        hass, entry.entry_id, station_registry, go2rtc_api_url
+        hass,
+        entry.entry_id,
+        station_registry,
+        go2rtc_api_url,
+        go2rtc_username=go2rtc_username,
+        go2rtc_password=go2rtc_password,
     )
     providers[entry.entry_id] = provider
     unregister_webrtc = None
@@ -213,6 +233,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
                 timedelta(seconds=entry.data.get(CONF_POLL_INTERVAL, 5)),
             )
         )
+        entry.async_on_unload(entry.add_update_listener(_async_update_listener))
         _LOGGER.info(
             "Doorfast configured: config entry ID=%s; relay endpoint=/api/doorfast/%s",
             entry.entry_id, entry.entry_id,

@@ -45,6 +45,10 @@ The go2rtc ingress and field acceptance procedure is documented in
 video path does not imply two-way audio or a confirmed physical door/elevator
 action.
 
+If go2rtc enables API authentication, open the Doorfast integration's options
+and enter the go2rtc API username and password. Keep the API URL credential-free;
+the integration sends Basic Auth only on its HA-to-go2rtc WebSocket connection.
+
 ## Push to talk card
 
 The integration bundles and automatically registers a `doorfast-ptt-card` dashboard

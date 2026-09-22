@@ -116,6 +116,7 @@ class FakeSession:
 
     async def ws_connect(self, url, **kwargs):
         self.urls.append(url)
+        self.kwargs = kwargs
         return self.websockets.pop(0)
 
 
@@ -178,6 +179,25 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         )
         return provider, registry
 
+    async def test_go2rtc_credentials_are_sent_to_websocket(self):
+        websocket = FakeWebSocket()
+        session = FakeSession(websocket)
+        provider = DoorfastWebRTCProvider(
+            FakeHass(),
+            "entry-1",
+            FakeRegistry(),
+            "http://127.0.0.1:1984",
+            session,
+            go2rtc_username="doorfast",
+            go2rtc_password="secret",
+        )
+
+        await self.open_offer(provider, websocket, "gate_main", "auth")
+
+        self.assertEqual("doorfast", session.kwargs["auth"].login)
+        self.assertEqual("secret", session.kwargs["auth"].password)
+        await provider.async_close_entry()
+
     async def open_offer(self, provider, websocket, station_id, session_id):
         messages = []
         task = asyncio.create_task(
@@ -224,6 +244,7 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             ],
             session.urls,
         )
+        self.assertEqual({}, session.kwargs)
         self.assertIsInstance(main_messages[0], WebRTCAnswer)
         self.assertIsInstance(side_messages[0], WebRTCAnswer)
         self.assertEqual(1, registry.monitors["gate_main"].acquired)
