@@ -56,6 +56,22 @@ async def sync_monitor_state(
             item = dict(session)
             item["runtime_id"] = expected_runtime
             item["station_id"] = session_station_id
+            global_revision = status.get("status_revision")
+            session_revision = item.get("status_revision")
+            if (
+                isinstance(global_revision, int)
+                and not isinstance(global_revision, bool)
+                and global_revision >= 0
+                and (
+                    not isinstance(session_revision, int)
+                    or isinstance(session_revision, bool)
+                    or global_revision > session_revision
+                )
+            ):
+                # Doorfast's aggregate monitor revision is authoritative and
+                # may be newer than the per-session revision exposed by older
+                # daemon builds.
+                item["status_revision"] = global_revision
             by_station[session_station_id] = item
         target_station_ids = (
             (station_id,) if station_id in station_ids else station_ids

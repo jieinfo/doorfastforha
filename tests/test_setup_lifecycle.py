@@ -213,6 +213,30 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(1, provider.reconciled)
 
+    async def test_session_uses_global_revision_when_it_is_newer(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+
+        async def monitor_status():
+            return {
+                "runtime_id": "runtime-a",
+                "status_revision": 143,
+                "sessions": [
+                    {
+                        "station_id": "gate_main",
+                        "generation": 7,
+                        "state": "publishing",
+                        "status_revision": 110,
+                    }
+                ],
+            }
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(client, registry, provider)
+
+        self.assertEqual(143, registry.monitors["gate_main"].applied[0]["status_revision"])
+
     async def test_later_poll_replaces_a_relay_accelerated_station_state(self):
         registry = FakeStationRegistry()
         provider = FakeProvider()

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.11
+
+- Use the aggregate Doorfast monitor revision when older daemon builds report a stale per-session revision.
+
 ## 0.3.10
 
 - Fix the Home Assistant options flow for current `OptionsFlow` implementations.
