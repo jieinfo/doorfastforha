@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.8
+
+- Prevent stale monitor polls and events from invalidating or reviving an active camera generation during WebRTC startup.
+
 ## 0.3.7
 
 - Keep retrying WebRTC negotiation while slow Doorfast stations bring up their RTSP producer.
