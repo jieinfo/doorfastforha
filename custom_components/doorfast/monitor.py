@@ -112,7 +112,9 @@ class MonitorCoordinator:
         self._status_revision = revision
         self._status_event.set()
 
-    def _validate_identity(self, payload: dict[str, Any]) -> None:
+    def _validate_identity(
+        self, payload: dict[str, Any], *, check_generation: bool = True
+    ) -> None:
         runtime_id = payload.get("runtime_id")
         if runtime_id is not None and runtime_id != self.runtime_id:
             raise ValueError("monitor status runtime does not match coordinator")
@@ -120,7 +122,7 @@ class MonitorCoordinator:
         if station_id is not None and station_id != self.station_id:
             raise ValueError("monitor status station does not match coordinator")
         generation = payload.get("generation")
-        if (
+        if check_generation and (
             self._generation is not None
             and generation not in (None, 0, self._generation)
         ):
@@ -328,29 +330,42 @@ class MonitorCoordinator:
         for field in ("runtime_id", "station_id"):
             if field in payload:
                 merged[field] = payload[field]
-        self._validate_identity(merged)
         event = payload.get("event")
-        if event in {"monitor_preempted", "monitor_stopped"}:
-            async with self._lock:
+        state = merged.get("state")
+        async with self._lock:
+            self._validate_identity(merged, check_generation=False)
+            has_revision = "status_revision" in merged
+            revision = merged.get("status_revision", self._status_revision)
+            if (
+                isinstance(revision, bool)
+                or not isinstance(revision, int)
+                or revision < 0
+            ):
+                raise ValueError(
+                    "monitor status revision must be a non-negative integer"
+                )
+            if has_revision and revision <= self._status_revision:
+                return
+            self._validate_identity(merged)
+            if event in {"monitor_preempted", "monitor_stopped"}:
                 self._cancel_grace_locked()
                 self._generation = None
                 self._state = "idle"
                 self._ready = False
                 self._viewer_count = 0
+                self._status_revision = revision
                 self._status_event.set()
-            return
-        if event == "monitor_failed":
-            async with self._lock:
+                return
+            if event == "monitor_failed":
                 self._cancel_grace_locked()
                 self._generation = None
                 self._state = "failed"
                 self._ready = False
                 self._viewer_count = 0
+                self._status_revision = revision
                 self._status_event.set()
-            return
-        state = merged.get("state")
-        if state in _IDLE_STATES:
-            async with self._lock:
+                return
+            if state in _IDLE_STATES:
                 generation = merged.get("generation")
                 if generation not in (None, 0):
                     _positive_int(generation, "monitor generation")
@@ -361,12 +376,9 @@ class MonitorCoordinator:
                 )
                 self._ready = False
                 self._viewer_count = 0
-                revision = merged.get("status_revision", self._status_revision)
-                if isinstance(revision, int) and not isinstance(revision, bool):
-                    self._status_revision = revision
+                self._status_revision = revision
                 self._status_event.set()
-            return
-        async with self._lock:
+                return
             self._set_response_locked(merged)
 
 

@@ -22,6 +22,15 @@ async def sync_monitor_state(
     monitor_for_station = getattr(monitor, "monitor", None)
     if station_ids is not None and callable(monitor_for_station):
         expected_runtime = client.status.get("runtime_id")
+        before_poll = {
+            current_station_id: (
+                getattr(monitor_for_station(current_station_id), "generation", None),
+                getattr(
+                    monitor_for_station(current_station_id), "status_revision", 0
+                ),
+            )
+            for current_station_id in station_ids
+        }
         status = await client.monitor_status()
         if not isinstance(status, dict):
             raise ValueError("monitor status must be an object")
@@ -52,8 +61,15 @@ async def sync_monitor_state(
             (station_id,) if station_id in station_ids else station_ids
         )
         for current_station_id in target_station_ids:
+            coordinator = monitor_for_station(current_station_id)
             item = by_station.get(current_station_id)
             if item is None:
+                current_marker = (
+                    getattr(coordinator, "generation", None),
+                    getattr(coordinator, "status_revision", 0),
+                )
+                if current_marker != before_poll[current_station_id]:
+                    continue
                 revision = status.get("status_revision", 0)
                 item = {
                     "runtime_id": expected_runtime,
@@ -66,7 +82,7 @@ async def sync_monitor_state(
                         else 0
                     ),
                 }
-            await monitor_for_station(current_station_id).async_apply_status(item)
+            await coordinator.async_apply_status(item)
         if (
             station_id is not None
             and isinstance(relay_event, dict)

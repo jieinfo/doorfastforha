@@ -81,6 +81,149 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(3, coordinator.status_revision)
         self.assertEqual([("start", "runtime-a", "gate_main")], client.calls)
 
+    async def test_stale_idle_snapshot_does_not_clear_active_generation(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(
+            client, "runtime-a", "gate_main", grace_seconds=0.01
+        )
+
+        await coordinator.async_acquire_viewer()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 10}
+        )
+
+        # A poll started before the publishing event can return later with an
+        # older idle snapshot. It must not invalidate the active viewer.
+        await coordinator.async_apply_status(
+            {"generation": 0, "state": "idle", "status_revision": 9}
+        )
+
+        self.assertEqual(7, coordinator.generation)
+        self.assertEqual("publishing", coordinator.state)
+        self.assertTrue(coordinator.ready)
+        self.assertEqual(1, coordinator.viewer_count)
+
+    async def test_newer_requesting_status_clears_ready(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(
+            client, "runtime-a", "gate_main", grace_seconds=0.01
+        )
+
+        await coordinator.async_acquire_viewer()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 10}
+        )
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "requesting", "status_revision": 11}
+        )
+
+        self.assertEqual(7, coordinator.generation)
+        self.assertEqual("requesting", coordinator.state)
+        self.assertFalse(coordinator.ready)
+
+    async def test_stale_stop_event_does_not_clear_newer_status(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(
+            client, "runtime-a", "gate_main", grace_seconds=0.01
+        )
+
+        await coordinator.async_start()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 10}
+        )
+        await coordinator.async_apply_status(
+            {
+                "event": "monitor_stopped",
+                "generation": 7,
+                "status_revision": 9,
+            }
+        )
+
+        self.assertEqual(7, coordinator.generation)
+        self.assertTrue(coordinator.ready)
+
+    async def test_terminal_event_revision_prevents_generation_revival(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(
+            client, "runtime-a", "gate_main", grace_seconds=0.01
+        )
+
+        await coordinator.async_start()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 10}
+        )
+        await coordinator.async_apply_status(
+            {
+                "event": "monitor_stopped",
+                "generation": 7,
+                "status_revision": 12,
+            }
+        )
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 11}
+        )
+
+        self.assertIsNone(coordinator.generation)
+        self.assertEqual("idle", coordinator.state)
+        self.assertEqual(12, coordinator.status_revision)
+
+    async def test_stale_prior_generation_is_ignored_before_identity_check(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(
+            client, "runtime-a", "gate_main", grace_seconds=0.01
+        )
+        client.start_result = {
+            "state": "publishing",
+            "generation": 8,
+            "status_revision": 10,
+        }
+
+        await coordinator.async_start()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 9}
+        )
+
+        self.assertEqual(8, coordinator.generation)
+        self.assertEqual(10, coordinator.status_revision)
+
+    async def test_stale_poll_waiting_on_start_lock_is_ignored(self):
+        class BlockingClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.start_entered = asyncio.Event()
+                self.release_start = asyncio.Event()
+
+            async def start_monitor(self, runtime_id, station_id):
+                self.calls.append(("start", runtime_id, station_id))
+                self.start_entered.set()
+                await self.release_start.wait()
+                return {
+                    "state": "publishing",
+                    "generation": 7,
+                    "status_revision": 2,
+                }
+
+        client = BlockingClient()
+        coordinator = MonitorCoordinator(
+            client, "runtime-a", "gate_main", grace_seconds=0.01
+        )
+        starting = asyncio.create_task(coordinator.async_start())
+        await client.start_entered.wait()
+        stale_poll = asyncio.create_task(
+            coordinator.async_apply_status(
+                {"generation": 0, "state": "idle", "status_revision": 1}
+            )
+        )
+        await asyncio.sleep(0)
+
+        client.release_start.set()
+        await starting
+        await stale_poll
+
+        self.assertEqual(7, coordinator.generation)
+        self.assertEqual("publishing", coordinator.state)
+        self.assertEqual(2, coordinator.status_revision)
+
     async def test_viewer_reference_count_uses_one_doorfast_viewer(self):
         client = FakeClient()
         coordinator = MonitorCoordinator(client, "runtime-a", "gate_main", grace_seconds=0.01)
@@ -199,6 +342,7 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         await coordinator.async_apply_status(
             {"generation": 7, "state": "stopping", "status_revision": 1}
         )
+        self.assertFalse(coordinator.ready)
         client.start_result = {"state": "publishing", "generation": 8}
 
         self.assertEqual(8, await coordinator.async_acquire_viewer())
