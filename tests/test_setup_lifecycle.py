@@ -85,6 +85,8 @@ class FakeRegistry:
 class FakeStatusMonitor:
     def __init__(self):
         self.applied = []
+        self.generation = None
+        self.status_revision = 0
 
     async def async_apply_status(self, status):
         self.applied.append(status)
@@ -132,6 +134,45 @@ MODULE = load_module()
 
 
 class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_poll_does_not_clear_monitor_start_in_flight(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+
+        async def monitor_status():
+            registry.monitors["gate_main"].generation = 7
+            registry.monitors["gate_main"].status_revision = 1
+            return {"runtime_id": "runtime-a", "status_revision": 9, "sessions": []}
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(client, registry, provider)
+
+        self.assertEqual([], registry.monitors["gate_main"].applied)
+        self.assertEqual(
+            ["idle"],
+            [item.get("state") for item in registry.monitors["gate_side"].applied],
+        )
+
+    async def test_poll_clears_generation_missing_before_and_after_request(self):
+        registry = FakeStationRegistry()
+        registry.monitors["gate_main"].generation = 7
+        registry.monitors["gate_main"].status_revision = 3
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+
+        async def monitor_status():
+            return {"runtime_id": "runtime-a", "status_revision": 9, "sessions": []}
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(
+            client, registry, provider, station_id="gate_main"
+        )
+
+        self.assertEqual(
+            ["idle"],
+            [item.get("state") for item in registry.monitors["gate_main"].applied],
+        )
+
     async def test_polls_authoritative_sessions_by_station_only(self):
         registry = FakeStationRegistry()
         provider = FakeProvider()
