@@ -51,13 +51,10 @@ class DoorfastConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     @staticmethod
     def async_get_options_flow(config_entry):
-        return DoorfastOptionsFlow(config_entry)
+        return DoorfastOptionsFlow()
 
 
 class DoorfastOptionsFlow(config_entries.OptionsFlow):
-    def __init__(self, config_entry):
-        self.config_entry = config_entry
-
     async def async_step_init(self, user_input=None):
         errors = {}
         if user_input is not None:
