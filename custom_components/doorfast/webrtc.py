@@ -29,8 +29,10 @@ except ImportError:  # pragma: no cover - dependency-free tests
 _SOURCE_PREFIX = "doorfast://"
 _SOURCE_SUFFIX = "/preview"
 _OFFER_TIMEOUT = 10.0
-_NEGOTIATION_ATTEMPTS = 3
-_NEGOTIATION_RETRY_DELAY = 0.5
+# Doorfast may report the monitor ready before its RTSP producer is visible
+# to go2rtc. Keep retrying long enough for the slowest observed station.
+_NEGOTIATION_ATTEMPTS = 12
+_NEGOTIATION_RETRY_DELAY = 1.0
 
 
 def _consume_answer_exception(future: asyncio.Future[None]) -> None:
