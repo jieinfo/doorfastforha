@@ -39,8 +39,8 @@ _SOURCE_PREFIX = "doorfast://"
 _SOURCE_SUFFIX = "/preview"
 _OFFER_TIMEOUT = 10.0
 # Doorfast may report the monitor ready before its RTSP producer is visible
-# to go2rtc. Keep retrying long enough for the slowest observed station.
-_NEGOTIATION_ATTEMPTS = 12
+# to go2rtc. Keep retrying while the HA WebRTC request remains open. The
+# frontend closes the session when the viewer leaves, which cancels this loop.
 _NEGOTIATION_RETRY_DELAY = 1.0
 
 
@@ -61,6 +61,10 @@ class _Session:
     released: bool = False
     negotiating: bool = True
     notify_error: bool = False
+
+
+class _ProducerNotReadyError(RuntimeError):
+    """The go2rtc stream is not published yet and can be retried."""
 
 
 class DoorfastWebRTCProvider(CameraWebRTCProvider):
@@ -135,9 +139,13 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         station_id = self._station_id(source) if isinstance(source, str) else None
         if station_id is None:
             raise HomeAssistantError("Doorfast camera source is not supported")
+        current_task = asyncio.current_task()
+        previous = self._negotiations.get(session_id)
+        if previous is not None and previous is not current_task:
+            previous.cancel()
+            await asyncio.gather(previous, return_exceptions=True)
         if session_id in self._sessions:
             await self._cleanup_session(session_id)
-        current_task = asyncio.current_task()
         if current_task is not None:
             self._negotiations[session_id] = current_task
 
@@ -149,9 +157,8 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             await coordinator.async_wait_ready(
                 generation, timeout=MONITOR_READY_TIMEOUT
             )
-            for attempt in range(_NEGOTIATION_ATTEMPTS):
+            while True:
                 state: _Session | None = None
-                final_attempt = attempt == _NEGOTIATION_ATTEMPTS - 1
                 try:
                     websocket = await self._session.ws_connect(
                         self.websocket_url(station.stream_name),
@@ -169,7 +176,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         generation=generation,
                         send_message=send_message,
                         answer=loop.create_future(),
-                        notify_error=final_attempt,
+                        notify_error=False,
                     )
                     state.answer.add_done_callback(_consume_answer_exception)
                     self._sessions[session_id] = state
@@ -185,24 +192,22 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 except asyncio.CancelledError:
                     if state is not None and not state.released:
                         await self._cleanup_session(session_id, state)
-                        viewer_released = True
+                    viewer_released = True
                     raise
-                except Exception as error:
-                    final_attempt = attempt == _NEGOTIATION_ATTEMPTS - 1
+                except HomeAssistantError:
                     if state is not None and not state.released:
                         await self._cleanup_session(
-                            session_id, state, release_viewer=final_attempt
+                            session_id, state, release_viewer=False
                         )
-                        viewer_released = final_attempt
-                    elif final_attempt:
-                        await coordinator.async_release_viewer()
-                        viewer_released = True
-                    if final_attempt:
-                        if isinstance(error, HomeAssistantError):
-                            raise
-                        raise HomeAssistantError(
-                            "Doorfast go2rtc negotiation failed"
-                        ) from error
+                    raise
+                except Exception:
+                    if state is not None and not state.released:
+                        await self._cleanup_session(
+                            session_id, state, release_viewer=False
+                        )
+                    # A producer can disappear between attempts while the
+                    # station remains active. Keep the same Doorfast viewer
+                    # lease and retry until HA closes this WebRTC session.
                     await asyncio.sleep(_NEGOTIATION_RETRY_DELAY)
         except asyncio.CancelledError:
             if not viewer_released:
@@ -239,7 +244,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         raise HomeAssistantError("invalid go2rtc ICE candidate")
                     state.send_message(WebRTCCandidate(RTCIceCandidateInit(value)))
                 elif message_type == "error":
-                    error = HomeAssistantError("go2rtc WebRTC signaling failed")
+                    error = _ProducerNotReadyError(
+                        "go2rtc WebRTC producer is not ready"
+                    )
                     if not state.negotiating or state.notify_error:
                         state.send_message(
                             WebRTCError("doorfast_webrtc_failed", str(value))
@@ -306,8 +313,10 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 await state.coordinator.async_release_viewer()
 
     async def async_close_entry(self) -> None:
-        for negotiation in list(self._negotiations.values()):
+        negotiations = list(self._negotiations.values())
+        for negotiation in negotiations:
             negotiation.cancel()
+        await asyncio.gather(*negotiations, return_exceptions=True)
         await asyncio.gather(
             *(self._cleanup_session(session_id) for session_id in list(self._sessions))
         )

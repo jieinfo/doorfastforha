@@ -306,6 +306,22 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         await provider.async_close_entry()
         self.assertEqual(1, registry.monitors["gate_main"].released)
 
+    async def test_invalid_go2rtc_message_fails_without_retrying(self):
+        websocket = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(websocket))
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "invalid", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        await websocket.incoming.put({"type": "unexpected", "value": "bad"})
+        with self.assertRaises(Exception) as context:
+            await asyncio.wait_for(task, 1)
+        self.assertIn("unsupported go2rtc WebSocket message", str(context.exception))
+        self.assertEqual(1, len(provider._session.urls))
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+
     async def test_retries_through_slow_producer_startup(self):
         websockets = [FakeWebSocket() for _ in range(6)]
         session = FakeSession(*websockets)
@@ -317,9 +333,7 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        with patch.object(webrtc_module, "_NEGOTIATION_ATTEMPTS", 6), patch.object(
-            webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0
-        ):
+        with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
             for websocket in websockets[:-1]:
                 await asyncio.sleep(0)
                 await websocket.incoming.put(
@@ -339,28 +353,92 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, registry.monitors["gate_main"].released)
         await provider.async_close_entry()
 
-    async def test_final_negotiation_failure_notifies_home_assistant(self):
-        websockets = [FakeWebSocket() for _ in range(3)]
+    async def test_retries_beyond_previous_attempt_limit_until_producer_recovers(self):
+        websockets = [FakeWebSocket() for _ in range(13)]
         provider, registry = self.make_provider(FakeSession(*websockets))
         messages = []
         task = asyncio.create_task(
             provider.async_handle_async_webrtc_offer(
-                FakeCamera(source("gate_main")), "offer", "failed", messages.append
+                FakeCamera(source("gate_main")), "offer", "long-retry", messages.append
             )
         )
 
-        with patch.object(webrtc_module, "_NEGOTIATION_ATTEMPTS", 3):
-            for websocket in websockets:
+        with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
+            for websocket in websockets[:-1]:
                 await asyncio.sleep(0)
                 await websocket.incoming.put(
                     {"type": "error", "value": "not ready"}
                 )
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            await websockets[-1].incoming.put(
+                {"type": "webrtc/answer", "value": "answer"}
+            )
+            await asyncio.wait_for(task, 1)
 
-            with self.assertRaises(Exception):
-                await asyncio.wait_for(task, 3)
         self.assertEqual(1, len(messages))
-        self.assertIsInstance(messages[-1], WebRTCError)
+        self.assertIsInstance(messages[-1], WebRTCAnswer)
+        self.assertEqual(0, registry.monitors["gate_main"].released)
+        await provider.async_close_entry()
         self.assertEqual(1, registry.monitors["gate_main"].released)
+
+    async def test_retrying_offer_stays_alive_until_home_assistant_closes_session(self):
+        first_ws = FakeWebSocket()
+        second_ws = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(first_ws, second_ws))
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "retry-forever", lambda _: None
+            )
+        )
+
+        with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
+            await asyncio.sleep(0)
+            await first_ws.incoming.put({"type": "error", "value": "not ready"})
+            await asyncio.sleep(0)
+            await second_ws.incoming.put({"type": "error", "value": "not ready"})
+            await asyncio.sleep(0)
+            provider.async_close_session("retry-forever")
+
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+        await provider.async_close_entry()
+
+    async def test_reused_session_id_cancels_previous_retry(self):
+        first_ws = FakeWebSocket()
+        replacement_ws = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(first_ws, replacement_ws))
+        first = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "reused", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        await first_ws.incoming.put({"type": "error", "value": "not ready"})
+        await asyncio.sleep(0)
+
+        second = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "reused", lambda _: None
+            )
+        )
+        for _ in range(20):
+            if len(provider._session.urls) == 2:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(2, len(provider._session.urls))
+        await replacement_ws.incoming.put(
+            {"type": "webrtc/answer", "value": "replacement"}
+        )
+        await asyncio.wait_for(second, 1)
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(first, 1)
+        self.assertEqual(2, registry.monitors["gate_main"].acquired)
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+        await provider.async_close_entry()
+        self.assertEqual(2, registry.monitors["gate_main"].released)
 
     async def test_close_session_cancels_retrying_offer(self):
         first_ws = FakeWebSocket()
