@@ -230,36 +230,42 @@ class MonitorCoordinator:
                 raise
             accepted_generation = self._response_generation(response)
 
-            async with self._lock:
-                self._start_inflight = False
-                terminated = (
-                    self._unloaded or request_epoch != self._terminal_epoch
-                )
-                current_generation = self._generation
-                if not terminated and (
-                    (
-                        current_generation is None
-                        and self._recoverable_generation != accepted_generation
+            try:
+                async with self._lock:
+                    self._start_inflight = False
+                    terminated = (
+                        self._unloaded or request_epoch != self._terminal_epoch
                     )
-                    or current_generation == old_generation
-                    or current_generation == accepted_generation
-                ):
-                    if (
-                        current_generation == accepted_generation
-                        and self._state == "stopping"
+                    current_generation = self._generation
+                    if not terminated and (
+                        (
+                            current_generation is None
+                            and self._recoverable_generation != accepted_generation
+                        )
+                        or current_generation == old_generation
+                        or current_generation == accepted_generation
                     ):
-                        return current_generation
-                    if (
-                        current_generation is None
-                        and self._recoverable_generation == accepted_generation
-                    ):
+                        if (
+                            current_generation == accepted_generation
+                            and self._state == "stopping"
+                        ):
+                            return current_generation
+                        if (
+                            current_generation is None
+                            and self._recoverable_generation == accepted_generation
+                        ):
+                            return accepted_generation
+                        self._set_response_locked(
+                            response, allow_generation_change=True
+                        )
                         return accepted_generation
-                    self._set_response_locked(
-                        response, allow_generation_change=True
-                    )
-                    return accepted_generation
-                if not terminated and current_generation is not None:
-                    return current_generation
+                    if not terminated and current_generation is not None:
+                        return current_generation
+            except asyncio.CancelledError:
+                async with self._lock:
+                    self._start_inflight = False
+                await self._stop_remote(accepted_generation)
+                raise
 
             # The service accepted a generation after a terminal event. Do not
             # adopt its response; clean up only the generation this request
@@ -338,25 +344,31 @@ class MonitorCoordinator:
                     self._start_inflight = False
                 raise
             accepted_generation = self._response_generation(response)
-            async with self._lock:
-                self._start_inflight = False
-                terminated = (
-                    self._unloaded or request_epoch != self._terminal_epoch
-                )
-                current_generation = self._generation
-                if not terminated and (
-                    (
-                        current_generation is None
-                        and self._recoverable_generation != accepted_generation
+            try:
+                async with self._lock:
+                    self._start_inflight = False
+                    terminated = (
+                        self._unloaded or request_epoch != self._terminal_epoch
                     )
-                    or current_generation == old_generation
-                ):
-                    self._set_response_locked(
-                        response, allow_generation_change=True
-                    )
-                    return accepted_generation
-                if not terminated and current_generation is not None:
-                    return current_generation
+                    current_generation = self._generation
+                    if not terminated and (
+                        (
+                            current_generation is None
+                            and self._recoverable_generation != accepted_generation
+                        )
+                        or current_generation == old_generation
+                    ):
+                        self._set_response_locked(
+                            response, allow_generation_change=True
+                        )
+                        return accepted_generation
+                    if not terminated and current_generation is not None:
+                        return current_generation
+            except asyncio.CancelledError:
+                async with self._lock:
+                    self._start_inflight = False
+                await self._stop_remote(accepted_generation)
+                raise
 
             await self._stop_remote(accepted_generation)
             raise RuntimeError("monitor request was terminated")

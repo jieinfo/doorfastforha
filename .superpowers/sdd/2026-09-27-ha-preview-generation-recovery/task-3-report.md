@@ -59,3 +59,31 @@ The implementation uses `asyncio.Task(..., eager_start=True)` to preserve the
 existing synchronous ordering of start requests. This requires a Python
 runtime that supports the eager task start option; the current test runtime is
 Python 3.14.7.
+
+## Follow-up RED/GREEN
+
+The first implementation still leaked an accepted generation if cancellation
+arrived after the start response had been parsed but while the coordinator
+waited to reacquire `_lock`. A regression test held `_lock`, gated the response,
+waited until `_response_generation` had run, then cancelled acquire. RED showed
+only `start` in the remote calls and no `stop(..., 8)`.
+
+The fix now covers the post-response local state transition in a
+`CancelledError` handler. It clears `_start_inflight`, stops only the parsed
+accepted generation while the lifecycle lock remains held, and re-raises the
+cancellation. The same boundary is applied to recovery starts.
+
+Follow-up verification:
+
+```text
+python3 -m unittest tests.test_monitor
+Ran 35 tests in 0.067s
+OK
+
+python3 -m unittest discover -s tests
+Ran 180 tests in 3.270s
+OK
+
+python3 -m compileall -q custom_components tests
+git diff --check
+```
