@@ -510,6 +510,7 @@ class MonitorCoordinator:
                                 self._generation = None
                                 self._state = "idle"
                                 self._ready = False
+                                self._recoverable_generation = None
                                 self._leases.clear()
                                 self._status_event.set()
 
