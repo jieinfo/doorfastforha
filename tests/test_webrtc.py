@@ -120,6 +120,11 @@ class FakeSession:
         return self.websockets.pop(0)
 
 
+class BlockingSession:
+    async def ws_connect(self, url, **kwargs):
+        await asyncio.Event().wait()
+
+
 class FakeCoordinator:
     def __init__(self, generation):
         self.generation = generation
@@ -199,6 +204,19 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("doorfast", session.kwargs["auth"].login)
         self.assertEqual("secret", session.kwargs["auth"].password)
         await provider.async_close_entry()
+
+    async def test_ws_connect_cancellation_releases_viewer_lease(self):
+        provider, registry = self.make_provider(BlockingSession())
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "connect-cancel", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(1, registry.monitors["gate_main"].released)
 
     async def open_offer(self, provider, websocket, station_id, session_id):
         messages = []

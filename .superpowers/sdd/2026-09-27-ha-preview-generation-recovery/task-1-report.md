@@ -49,3 +49,35 @@ Additional check: `git diff --check` passed.
 - `_terminal_epoch` is initialized to zero as required; lifecycle epoch advancement belongs to Task 2 and is intentionally not implemented here.
 - The WebRTC negotiation retry loop and delay were left unchanged; one lease is retained across retries and released only by the existing session/error cleanup paths.
 - No unresolved concerns identified for Task 1.
+
+## Follow-up review fix
+
+Review identified a lease leak when cancellation arrived while `ws_connect()` was
+still pending: the inner handler marked the lease released even though no session
+existed, causing the outer cleanup to skip release. Added a regression test using a
+blocking WebSocket connector, and changed the flag to be set only after an existing
+session has actually been cleaned up and released.
+
+Also corrected the `async_acquire_viewer()` docstring to describe its lease return.
+
+Follow-up RED:
+
+```text
+$ python3 -m unittest tests.test_webrtc.ProviderTest.test_ws_connect_cancellation_releases_viewer_lease
+FAILED (failures=1)
+AssertionError: 1 != 0
+```
+
+Follow-up GREEN:
+
+```text
+$ python3 -m unittest tests.test_webrtc tests.test_monitor
+Ran 35 tests in 1.097s
+OK
+
+$ python3 -m unittest discover -s tests
+Ran 167 tests in 3.249s
+OK
+
+$ git diff --check
+```

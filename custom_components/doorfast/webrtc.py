@@ -195,7 +195,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 except asyncio.CancelledError:
                     if state is not None and not state.released:
                         await self._cleanup_session(session_id, state)
-                    viewer_released = True
+                        viewer_released = True
                     raise
                 except HomeAssistantError:
                     if state is not None and not state.released:

@@ -184,7 +184,7 @@ class MonitorCoordinator:
             await self._status_event.wait()
 
     async def async_acquire_viewer(self) -> MonitorLease:
-        """Register one HA viewer and return the active Doorfast generation."""
+        """Register one HA viewer and return its generation lease."""
         async with self._lock:
             self._cancel_grace_locked()
             if self._generation is None or self._state in _IDLE_STATES:
