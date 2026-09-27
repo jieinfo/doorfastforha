@@ -373,6 +373,37 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, coordinator.viewer_count)
         self.assertIn(("stop", "runtime-a", "gate_main", 7), client.calls)
 
+    async def test_cancelled_pending_start_stops_accepted_generation(self):
+        class GatedClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.start_accepted = asyncio.Event()
+                self.finish_start = asyncio.Event()
+                self.start_result = {"state": "publishing", "generation": 8}
+
+            async def start_monitor(self, runtime_id, station_id):
+                self.calls.append(("start", runtime_id, station_id))
+                self.start_accepted.set()
+                await self.finish_start.wait()
+                return dict(self.start_result)
+
+        client = GatedClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        acquire = asyncio.create_task(coordinator.async_acquire_viewer())
+        await client.start_accepted.wait()
+        acquire.cancel()
+        client.finish_start.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await acquire
+        self.assertIn(("stop", "runtime-a", "gate_main", 8), client.calls)
+        self.assertEqual(0, coordinator.viewer_count)
+
+        await coordinator.async_apply_status(
+            {"event": "monitor_stopped", "generation": 7}
+        )
+        self.assertNotIn(("stop", "runtime-a", "gate_main", 7), client.calls)
+
     async def test_pending_start_response_does_not_overwrite_stopping_status(self):
         class GatedClient(FakeClient):
             def __init__(self):

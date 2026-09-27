@@ -186,6 +186,25 @@ class MonitorCoordinator:
                 self._status_event.clear()
             await self._status_event.wait()
 
+    async def _await_start_response(self) -> dict[str, Any]:
+        """Keep an accepted start alive long enough to clean it up on cancel."""
+        start_task = asyncio.Task(
+            self._client.start_monitor(self.runtime_id, self.station_id),
+            eager_start=True,
+        )
+        try:
+            response = await asyncio.shield(start_task)
+        except asyncio.CancelledError:
+            response = await asyncio.shield(start_task)
+            if not isinstance(response, dict):
+                raise ValueError("Doorfast monitor start returned a non-object")
+            generation = self._response_generation(response)
+            await self._stop_remote(generation)
+            raise
+        if not isinstance(response, dict):
+            raise ValueError("Doorfast monitor start returned a non-object")
+        return response
+
     async def _start_generation(self, request_epoch: int, old_generation: int) -> int:
         """Start one generation while serializing remote lifecycle calls."""
         async with self._lifecycle_lock:
@@ -204,17 +223,11 @@ class MonitorCoordinator:
                 self._start_inflight = True
 
             try:
-                response = await self._client.start_monitor(
-                    self.runtime_id, self.station_id
-                )
+                response = await self._await_start_response()
             except BaseException:
                 async with self._lock:
                     self._start_inflight = False
                 raise
-            if not isinstance(response, dict):
-                async with self._lock:
-                    self._start_inflight = False
-                raise ValueError("Doorfast monitor start returned a non-object")
             accepted_generation = self._response_generation(response)
 
             async with self._lock:
@@ -224,7 +237,10 @@ class MonitorCoordinator:
                 )
                 current_generation = self._generation
                 if not terminated and (
-                    current_generation is None
+                    (
+                        current_generation is None
+                        and self._recoverable_generation != accepted_generation
+                    )
                     or current_generation == old_generation
                     or current_generation == accepted_generation
                 ):
@@ -233,6 +249,11 @@ class MonitorCoordinator:
                         and self._state == "stopping"
                     ):
                         return current_generation
+                    if (
+                        current_generation is None
+                        and self._recoverable_generation == accepted_generation
+                    ):
+                        return accepted_generation
                     self._set_response_locked(
                         response, allow_generation_change=True
                     )
@@ -311,17 +332,11 @@ class MonitorCoordinator:
                 self._start_inflight = True
 
             try:
-                response = await self._client.start_monitor(
-                    self.runtime_id, self.station_id
-                )
+                response = await self._await_start_response()
             except BaseException:
                 async with self._lock:
                     self._start_inflight = False
                 raise
-            if not isinstance(response, dict):
-                async with self._lock:
-                    self._start_inflight = False
-                raise ValueError("Doorfast monitor start returned a non-object")
             accepted_generation = self._response_generation(response)
             async with self._lock:
                 self._start_inflight = False
@@ -330,7 +345,10 @@ class MonitorCoordinator:
                 )
                 current_generation = self._generation
                 if not terminated and (
-                    current_generation is None
+                    (
+                        current_generation is None
+                        and self._recoverable_generation != accepted_generation
+                    )
                     or current_generation == old_generation
                 ):
                     self._set_response_locked(
