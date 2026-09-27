@@ -84,6 +84,7 @@ monitor_module = load_component("monitor")
 MonitorLease = monitor_module.MonitorLease
 webrtc_module = load_component("webrtc")
 DoorfastWebRTCProvider = webrtc_module.DoorfastWebRTCProvider
+HomeAssistantError = webrtc_module.HomeAssistantError
 
 
 class FakeCamera:
@@ -562,6 +563,152 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             await offer_task
         coordinator.allow_release.set()
         await cleanup_task
+
+        self.assertEqual([state.lease], coordinator.released_leases)
+
+    async def test_parallel_cleanup_and_answer_error_release_lease_once(self):
+        class GatedCloseWebSocket(FakeWebSocket):
+            def __init__(self):
+                super().__init__()
+                self.close_started = asyncio.Event()
+                self.allow_close = asyncio.Event()
+
+            async def close(self):
+                self.closed = True
+                self.close_started.set()
+                await self.allow_close.wait()
+                await self.incoming.put(None)
+
+        class GatedReleaseCoordinator(FakeCoordinator):
+            def __init__(self):
+                super().__init__(9)
+                self.release_started = asyncio.Event()
+                self.allow_release = asyncio.Event()
+
+            async def async_release_viewer(self, lease):
+                self.released_leases.append(lease)
+                if len(self.released_leases) == 1:
+                    self.release_started.set()
+                    await self.allow_release.wait()
+                self._active_leases.discard(lease)
+
+        websocket = GatedCloseWebSocket()
+        coordinator = GatedReleaseCoordinator()
+        registry = FakeRegistry()
+        registry.monitors["gate_main"] = coordinator
+        provider = DoorfastWebRTCProvider(
+            FakeHass(), "entry-1", registry, "http://127.0.0.1:1984",
+            FakeSession(websocket),
+        )
+        offer_task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "answer-error", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        state = provider._sessions["answer-error"]
+        cleanup_task = asyncio.create_task(
+            provider._cleanup_session("answer-error", state)
+        )
+        await websocket.close_started.wait()
+        state.answer.set_exception(HomeAssistantError("answer failed"))
+        websocket.allow_close.set()
+        await coordinator.release_started.wait()
+
+        with self.assertRaises(HomeAssistantError):
+            await offer_task
+        coordinator.allow_release.set()
+        await cleanup_task
+
+        self.assertEqual([state.lease], coordinator.released_leases)
+
+    async def test_parallel_cleanup_and_retry_invalidation_release_lease_once(self):
+        class GatedCloseWebSocket(FakeWebSocket):
+            def __init__(self):
+                super().__init__()
+                self.close_started = asyncio.Event()
+                self.allow_close = asyncio.Event()
+
+            async def close(self):
+                self.closed = True
+                self.close_started.set()
+                await self.allow_close.wait()
+                await self.incoming.put(None)
+
+        class GatedReleaseCoordinator(FakeCoordinator):
+            def __init__(self):
+                super().__init__(9)
+                self.release_started = asyncio.Event()
+                self.allow_release = asyncio.Event()
+
+            async def async_release_viewer(self, lease):
+                self.released_leases.append(lease)
+                if len(self.released_leases) == 1:
+                    self.release_started.set()
+                    await self.allow_release.wait()
+                self._active_leases.discard(lease)
+
+        first_ws = GatedCloseWebSocket()
+        coordinator = GatedReleaseCoordinator()
+        registry = FakeRegistry()
+        registry.monitors["gate_main"] = coordinator
+        provider = DoorfastWebRTCProvider(
+            FakeHass(), "entry-1", registry, "http://127.0.0.1:1984",
+            FakeSession(first_ws),
+        )
+        offer_task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "retry-error", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        state = provider._sessions["retry-error"]
+        cleanup_task = asyncio.create_task(
+            provider._cleanup_session("retry-error", state)
+        )
+        await first_ws.close_started.wait()
+        state.answer.set_exception(webrtc_module._ProducerNotReadyError("not ready"))
+        first_ws.allow_close.set()
+        await coordinator.release_started.wait()
+        coordinator.allow_release.set()
+        await cleanup_task
+
+        with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
+            with self.assertRaises(RuntimeError):
+                await offer_task
+
+        self.assertEqual([state.lease], coordinator.released_leases)
+
+    async def test_release_error_after_cleanup_claim_does_not_retry_release(self):
+        class FailingReleaseCoordinator(FakeCoordinator):
+            async def async_release_viewer(self, lease):
+                self.released_leases.append(lease)
+                raise RuntimeError("release failed")
+
+        websocket = FakeWebSocket()
+        coordinator = FailingReleaseCoordinator(9)
+        registry = FakeRegistry()
+        registry.monitors["gate_main"] = coordinator
+        provider = DoorfastWebRTCProvider(
+            FakeHass(), "entry-1", registry, "http://127.0.0.1:1984",
+            FakeSession(websocket),
+        )
+        offer_task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "release-error", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        state = provider._sessions["release-error"]
+        cleanup_task = asyncio.create_task(
+            provider._cleanup_session("release-error", state)
+        )
+        with self.assertRaises(RuntimeError):
+            await cleanup_task
+
+        offer_task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await offer_task
 
         self.assertEqual([state.lease], coordinator.released_leases)
 
