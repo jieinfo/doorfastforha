@@ -152,14 +152,17 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
 
         station = self._registry.station(station_id)
         coordinator = self._registry.monitor(station_id)
-        lease = await coordinator.async_acquire_viewer()
-        generation = lease.generation
+        lease = None
         viewer_released = False
         try:
+            lease = await coordinator.async_acquire_viewer()
+            generation = lease.generation
             await coordinator.async_wait_ready(
                 generation, timeout=MONITOR_READY_TIMEOUT
             )
             while True:
+                if not coordinator.lease_active(lease):
+                    raise RuntimeError("monitor viewer lease is no longer active")
                 state: _Session | None = None
                 try:
                     websocket = await self._session.ws_connect(
@@ -213,11 +216,11 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     # lease and retry until HA closes this WebRTC session.
                     await asyncio.sleep(_NEGOTIATION_RETRY_DELAY)
         except asyncio.CancelledError:
-            if not viewer_released:
+            if lease is not None and not viewer_released:
                 await coordinator.async_release_viewer(lease)
             raise
         except Exception:
-            if not viewer_released:
+            if lease is not None and not viewer_released:
                 # Covers failures before a WebSocket session is created.
                 await coordinator.async_release_viewer(lease)
             raise
@@ -285,8 +288,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         negotiation = self._negotiations.get(session_id)
         if negotiation is not None:
             negotiation.cancel()
-        if session_id in self._sessions:
-            self._hass.async_create_task(self._cleanup_session(session_id))
+        state = self._sessions.get(session_id)
+        if state is not None:
+            self._hass.async_create_task(self._cleanup_session(session_id, state))
 
     async def _cleanup_session(
         self,
@@ -321,24 +325,29 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             negotiation.cancel()
         await asyncio.gather(*negotiations, return_exceptions=True)
         await asyncio.gather(
-            *(self._cleanup_session(session_id) for session_id in list(self._sessions))
+            *(
+                self._cleanup_session(session_id, state)
+                for session_id, state in list(self._sessions.items())
+            )
         )
 
     async def async_reconcile_monitor(self) -> None:
-        stale = []
+        stale: list[tuple[str, _Session]] = []
         for session_id, state in self._sessions.items():
             try:
                 coordinator = self._registry.monitor(state.station_id)
             except KeyError:
-                stale.append(session_id)
+                stale.append((session_id, state))
                 continue
             if (
                 coordinator is not state.coordinator
                 or coordinator.generation != state.generation
                 or not coordinator.ready
             ):
-                stale.append(session_id)
-        await asyncio.gather(*(self._cleanup_session(item) for item in stale))
+                stale.append((session_id, state))
+        await asyncio.gather(
+            *(self._cleanup_session(session_id, state) for session_id, state in stale)
+        )
 
     async def async_teardown(self) -> None:
         await self.async_close_entry()

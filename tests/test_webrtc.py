@@ -80,6 +80,8 @@ def load_component(name):
 
 load_component("config_helpers")
 load_component("const")
+monitor_module = load_component("monitor")
+MonitorLease = monitor_module.MonitorLease
 webrtc_module = load_component("webrtc")
 DoorfastWebRTCProvider = webrtc_module.DoorfastWebRTCProvider
 
@@ -126,24 +128,41 @@ class BlockingSession:
 
 
 class FakeCoordinator:
-    def __init__(self, generation):
+    def __init__(self, generation, leases=None):
         self.generation = generation
         self.ready = True
         self.acquired = 0
-        self.released = 0
-        self.lease = types.SimpleNamespace(generation=generation, lease_id=1, epoch=0)
+        self.leases = list(leases or [MonitorLease(generation, 1, 0)])
+        self.released_leases = []
+        self._active_leases = set()
+
+    @property
+    def released(self):
+        return len(self.released_leases)
+
+    @property
+    def lease(self):
+        return self.leases[min(self.acquired - 1, len(self.leases) - 1)]
 
     async def async_acquire_viewer(self):
         self.acquired += 1
-        return self.lease
+        lease = self.leases[min(self.acquired - 1, len(self.leases) - 1)]
+        self._active_leases.add(lease)
+        return lease
 
     async def async_wait_ready(self, generation, timeout=10):
         assert generation == self.generation
         assert timeout == 25.0
 
     async def async_release_viewer(self, lease):
-        assert lease is self.lease
-        self.released += 1
+        self.released_leases.append(lease)
+        self._active_leases.discard(lease)
+
+    def lease_active(self, lease):
+        return lease in self._active_leases
+
+    def invalidate_leases(self):
+        self._active_leases.clear()
 
 
 class FakeRegistry:
@@ -459,6 +478,71 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, registry.monitors["gate_main"].released)
         await provider.async_close_entry()
         self.assertEqual(2, registry.monitors["gate_main"].released)
+
+    async def test_late_cleanup_for_reused_session_releases_only_old_lease(self):
+        old_ws = FakeWebSocket()
+        new_ws = FakeWebSocket()
+        coordinator = FakeCoordinator(
+            9,
+            [MonitorLease(9, 1, 0), MonitorLease(10, 2, 0)],
+        )
+        registry = FakeRegistry()
+        registry.monitors["gate_main"] = coordinator
+        provider = DoorfastWebRTCProvider(
+            FakeHass(), "entry-1", registry, "http://127.0.0.1:1984",
+            FakeSession(old_ws, new_ws),
+        )
+
+        await self.open_offer(provider, old_ws, "gate_main", "reused")
+        old_state = provider._sessions["reused"]
+        deferred_cleanup = []
+        provider._hass.async_create_task = deferred_cleanup.append
+        provider.async_close_session("reused")
+
+        coordinator.generation = 10
+        await self.open_offer(provider, new_ws, "gate_main", "reused")
+        await deferred_cleanup.pop()
+
+        self.assertEqual([MonitorLease(9, 1, 0)], coordinator.released_leases)
+        self.assertEqual(MonitorLease(10, 2, 0), provider._sessions["reused"].lease)
+        await provider.async_close_entry()
+
+    async def test_close_during_initial_offer_wait_releases_lease(self):
+        websocket = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(websocket))
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "initial-close", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        provider.async_close_session("initial-close")
+
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        await asyncio.gather(*provider._hass.tasks)
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+
+    async def test_retry_stops_when_monitor_lease_becomes_inactive(self):
+        first_ws = FakeWebSocket()
+        second_ws = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(first_ws, second_ws))
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "expired", lambda _: None
+            )
+        )
+
+        with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
+            await asyncio.sleep(0)
+            await first_ws.incoming.put({"type": "error", "value": "not ready"})
+            await asyncio.sleep(0)
+            registry.monitors["gate_main"].invalidate_leases()
+            with self.assertRaises(RuntimeError):
+                await asyncio.wait_for(task, 1)
+
+        self.assertEqual(1, len(provider._session.urls))
+        self.assertEqual(1, registry.monitors["gate_main"].released)
 
     async def test_close_session_cancels_retrying_offer(self):
         first_ws = FakeWebSocket()
