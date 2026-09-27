@@ -60,6 +60,7 @@ class _Session:
     answer: asyncio.Future[None]
     reader: asyncio.Task[None] | None = None
     released: bool = False
+    lease_released: bool = False
     negotiating: bool = True
     notify_error: bool = False
 
@@ -199,6 +200,8 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     if state is not None and not state.released:
                         await self._cleanup_session(session_id, state)
                         viewer_released = True
+                    elif state is not None and state.lease_released:
+                        viewer_released = True
                     raise
                 except HomeAssistantError:
                     if state is not None and not state.released:
@@ -303,6 +306,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             return
         self._sessions.pop(session_id, None)
         state.released = True
+        release_lease = release_viewer and not state.lease_released
+        if release_lease:
+            state.lease_released = True
         current = asyncio.current_task()
         if state.reader is not None and state.reader is not current:
             state.reader.cancel()
@@ -316,7 +322,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     state.answer.set_exception(
                         HomeAssistantError("go2rtc WebRTC session closed")
                     )
-            if release_viewer:
+            if release_lease:
                 await state.coordinator.async_release_viewer(state.lease)
 
     async def async_close_entry(self) -> None:
