@@ -712,6 +712,40 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([state.lease], coordinator.released_leases)
 
+    async def test_release_error_keeps_session_for_later_cleanup_retry(self):
+        class FailOnceCoordinator(FakeCoordinator):
+            def __init__(self):
+                super().__init__(9)
+                self.fail_release = True
+
+            async def async_release_viewer(self, lease):
+                self.released_leases.append(lease)
+                if self.fail_release:
+                    self.fail_release = False
+                    raise RuntimeError("release failed")
+                self._active_leases.discard(lease)
+
+        websocket = FakeWebSocket()
+        coordinator = FailOnceCoordinator()
+        registry = FakeRegistry()
+        registry.monitors["gate_main"] = coordinator
+        provider = DoorfastWebRTCProvider(
+            FakeHass(), "entry-1", registry, "http://127.0.0.1:1984",
+            FakeSession(websocket),
+        )
+        await self.open_offer(provider, websocket, "gate_main", "retry-cleanup")
+        state = provider._sessions["retry-cleanup"]
+
+        with self.assertRaises(RuntimeError):
+            await provider._cleanup_session("retry-cleanup", state)
+        self.assertIn("retry-cleanup", provider._sessions)
+        self.assertFalse(state.lease_released)
+
+        await provider._cleanup_session("retry-cleanup", state)
+        self.assertNotIn("retry-cleanup", provider._sessions)
+        self.assertEqual([state.lease, state.lease], coordinator.released_leases)
+        self.assertEqual(0, len(coordinator._active_leases))
+
     async def test_retry_stops_when_monitor_lease_becomes_inactive(self):
         first_ws = FakeWebSocket()
         second_ws = FakeWebSocket()

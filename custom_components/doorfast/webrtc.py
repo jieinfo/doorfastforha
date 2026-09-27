@@ -61,6 +61,8 @@ class _Session:
     reader: asyncio.Task[None] | None = None
     released: bool = False
     lease_released: bool = False
+    cleanup_task: asyncio.Task[None] | None = None
+    cleanup_failed: bool = False
     negotiating: bool = True
     notify_error: bool = False
 
@@ -198,10 +200,16 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     state.negotiating = False
                     return
                 except asyncio.CancelledError:
-                    if state is not None and not state.released:
+                    if (
+                        state is not None
+                        and not state.released
+                        and not state.cleanup_failed
+                    ):
                         await self._cleanup_session(session_id, state)
                         viewer_released = True
-                    elif state is not None and state.lease_released:
+                    elif state is not None and (
+                        state.lease_released or state.cleanup_failed
+                    ):
                         viewer_released = True
                     raise
                 except HomeAssistantError:
@@ -209,7 +217,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         await self._cleanup_session(
                             session_id, state, release_viewer=False
                         )
-                    if state is not None and state.lease_released:
+                    if state is not None and (
+                        state.lease_released or state.cleanup_failed
+                    ):
                         viewer_released = True
                     raise
                 except Exception:
@@ -217,7 +227,9 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         await self._cleanup_session(
                             session_id, state, release_viewer=False
                         )
-                    if state is not None and state.lease_released:
+                    if state is not None and (
+                        state.lease_released or state.cleanup_failed
+                    ):
                         viewer_released = True
                     # A producer can disappear between attempts while the
                     # station remains active. Keep the same Doorfast viewer
@@ -227,7 +239,10 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             if (
                 lease is not None
                 and not viewer_released
-                and not (state is not None and state.lease_released)
+                and not (
+                    state is not None
+                    and (state.lease_released or state.cleanup_failed)
+                )
             ):
                 await coordinator.async_release_viewer(lease)
             raise
@@ -235,7 +250,10 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             if (
                 lease is not None
                 and not viewer_released
-                and not (state is not None and state.lease_released)
+                and not (
+                    state is not None
+                    and (state.lease_released or state.cleanup_failed)
+                )
             ):
                 # Covers failures before a WebSocket session is created.
                 await coordinator.async_release_viewer(lease)
@@ -317,26 +335,43 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         state = self._sessions.get(session_id)
         if state is None or (expected is not None and state is not expected):
             return
-        self._sessions.pop(session_id, None)
+        current = asyncio.current_task()
+        if state.cleanup_task is not None and state.cleanup_task is not current:
+            await asyncio.shield(state.cleanup_task)
+            return
+        if state.released and not state.cleanup_failed:
+            return
+        state.cleanup_task = current
         state.released = True
         release_lease = release_viewer and not state.lease_released
         if release_lease:
             state.lease_released = True
-        current = asyncio.current_task()
         if state.reader is not None and state.reader is not current:
             state.reader.cancel()
         try:
-            await state.websocket.close()
-        finally:
-            if not state.answer.done():
-                if state.negotiating:
-                    state.answer.cancel()
-                else:
-                    state.answer.set_exception(
-                        HomeAssistantError("go2rtc WebRTC session closed")
-                    )
+            try:
+                await state.websocket.close()
+            finally:
+                if not state.answer.done():
+                    if state.negotiating:
+                        state.answer.cancel()
+                    else:
+                        state.answer.set_exception(
+                            HomeAssistantError("go2rtc WebRTC session closed")
+                        )
             if release_lease:
                 await state.coordinator.async_release_viewer(state.lease)
+        except BaseException:
+            if release_lease:
+                state.lease_released = False
+                state.cleanup_failed = True
+                state.released = False
+            state.cleanup_task = None
+            raise
+        else:
+            self._sessions.pop(session_id, None)
+            state.cleanup_task = None
+            state.cleanup_failed = False
 
     async def async_close_entry(self) -> None:
         negotiations = list(self._negotiations.values())

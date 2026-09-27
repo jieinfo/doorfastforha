@@ -442,6 +442,124 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("stop", "runtime-a", "gate_main", 8), client.calls)
         self.assertEqual(0, coordinator.viewer_count)
 
+    async def test_cancelled_acquire_after_start_response_stops_own_generation(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        wait_entered = asyncio.Event()
+        release_wait = asyncio.Event()
+
+        async def gated_wait(generation, timeout=25.0):
+            wait_entered.set()
+            await release_wait.wait()
+
+        coordinator.async_wait_ready = gated_wait
+        acquire = asyncio.create_task(coordinator.async_acquire_viewer())
+        await wait_entered.wait()
+        acquire.cancel()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await acquire
+        self.assertIn(("stop", "runtime-a", "gate_main", 7), client.calls)
+        self.assertEqual(0, coordinator.viewer_count)
+
+    async def test_cancelled_acquire_during_viewer_enable_cleans_viewer_edge(self):
+        class GatedClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.viewer_enabled = asyncio.Event()
+                self.release_viewer = asyncio.Event()
+
+            async def set_monitor_viewer(self, runtime_id, station_id, generation, active):
+                self.calls.append(("viewer", runtime_id, station_id, generation, active))
+                if active:
+                    self.viewer_enabled.set()
+                    await self.release_viewer.wait()
+                return {"state": "publishing", "generation": generation}
+
+        client = GatedClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        acquire = asyncio.create_task(coordinator.async_acquire_viewer())
+        await client.viewer_enabled.wait()
+        acquire.cancel()
+        client.release_viewer.set()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await acquire
+        self.assertIn(("viewer", "runtime-a", "gate_main", 7, False), client.calls)
+        self.assertIn(("stop", "runtime-a", "gate_main", 7), client.calls)
+        self.assertEqual(0, coordinator.viewer_count)
+
+    async def test_cancelled_after_viewer_enable_before_lease_registration_cleans_edge(self):
+        class CancellingClient(FakeClient):
+            async def set_monitor_viewer(self, runtime_id, station_id, generation, active):
+                self.calls.append(("viewer", runtime_id, station_id, generation, active))
+                if active:
+                    asyncio.current_task().cancel()
+                return {"state": "publishing", "generation": generation}
+
+        client = CancellingClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        acquire = asyncio.create_task(coordinator.async_acquire_viewer())
+
+        with self.assertRaises(asyncio.CancelledError):
+            await acquire
+        self.assertIn(("viewer", "runtime-a", "gate_main", 7, False), client.calls)
+        self.assertIn(("stop", "runtime-a", "gate_main", 7), client.calls)
+        self.assertEqual(0, coordinator.viewer_count)
+
+    async def test_invalid_registration_release_failure_stops_and_resets_generation(self):
+        class GatedFailingClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.viewer_enabled = asyncio.Event()
+                self.release_viewer = asyncio.Event()
+
+            async def set_monitor_viewer(self, runtime_id, station_id, generation, active):
+                self.calls.append(("viewer", runtime_id, station_id, generation, active))
+                if active:
+                    self.viewer_enabled.set()
+                    await self.release_viewer.wait()
+                else:
+                    raise RuntimeError("viewer disable failed")
+                return {"state": "publishing", "generation": generation}
+
+        client = GatedFailingClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        acquire = asyncio.create_task(coordinator.async_acquire_viewer())
+        await client.viewer_enabled.wait()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "stopping", "status_revision": 1}
+        )
+        client.release_viewer.set()
+
+        with self.assertRaises(RuntimeError):
+            await acquire
+        self.assertIn(("viewer", "runtime-a", "gate_main", 7, False), client.calls)
+        self.assertIn(("stop", "runtime-a", "gate_main", 7), client.calls)
+        self.assertIsNone(coordinator.generation)
+        self.assertEqual(0, coordinator.viewer_count)
+
+    async def test_cancelled_second_acquire_does_not_stop_existing_generation(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        existing = await coordinator.async_acquire_viewer()
+        wait_entered = asyncio.Event()
+        release_wait = asyncio.Event()
+
+        async def gated_wait(generation, timeout=25.0):
+            wait_entered.set()
+            await release_wait.wait()
+
+        coordinator.async_wait_ready = gated_wait
+        acquire = asyncio.create_task(coordinator.async_acquire_viewer())
+        await wait_entered.wait()
+        acquire.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await acquire
+        self.assertNotIn(("stop", "runtime-a", "gate_main", 7), client.calls)
+        self.assertEqual(1, coordinator.viewer_count)
+        await coordinator.async_release_viewer(existing)
+
     async def test_pending_start_response_does_not_overwrite_stopping_status(self):
         class GatedClient(FakeClient):
             def __init__(self):
@@ -473,6 +591,90 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         lease = await asyncio.wait_for(acquire, 1)
         self.assertEqual(8, lease.generation)
         self.assertEqual(2, client.calls.count(("start", "runtime-a", "gate_main")))
+
+    async def test_start_response_does_not_overwrite_newer_publishing_status(self):
+        class GatedClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.start_entered = asyncio.Event()
+                self.release_start = asyncio.Event()
+
+            async def start_monitor(self, runtime_id, station_id):
+                self.calls.append(("start", runtime_id, station_id))
+                self.start_entered.set()
+                await self.release_start.wait()
+                return {"state": "queued", "generation": 7}
+
+        client = GatedClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        start = asyncio.create_task(coordinator.async_start())
+        await client.start_entered.wait()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 1}
+        )
+        client.release_start.set()
+
+        self.assertEqual(7, await start)
+        self.assertEqual("publishing", coordinator.state)
+        self.assertTrue(coordinator.ready)
+        self.assertEqual(1, coordinator.status_revision)
+
+    async def test_recovery_start_response_does_not_overwrite_newer_status(self):
+        class GatedClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.start_entered = asyncio.Event()
+                self.release_start = asyncio.Event()
+
+            async def start_monitor(self, runtime_id, station_id):
+                self.calls.append(("start", runtime_id, station_id))
+                self.start_entered.set()
+                await self.release_start.wait()
+                return {"state": "queued", "generation": 7}
+
+        client = GatedClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        client.release_start.set()
+        await coordinator.async_start()
+        await coordinator.async_apply_status(
+            {"event": "monitor_stopped", "generation": 7, "status_revision": 1}
+        )
+        client.start_entered.clear()
+        client.release_start.clear()
+        acquire = asyncio.create_task(coordinator.async_acquire_viewer())
+        await client.start_entered.wait()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "status_revision": 2}
+        )
+        client.release_start.set()
+
+        lease = await asyncio.wait_for(acquire, 1)
+        self.assertEqual(7, lease.generation)
+        self.assertEqual("publishing", coordinator.state)
+        self.assertTrue(coordinator.ready)
+        self.assertEqual(2, coordinator.status_revision)
+
+    async def test_release_failure_restores_lease_for_later_cleanup(self):
+        class FlakyClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.fail_release = True
+
+            async def set_monitor_viewer(self, runtime_id, station_id, generation, active):
+                self.calls.append(("viewer", runtime_id, station_id, generation, active))
+                if not active and self.fail_release:
+                    self.fail_release = False
+                    raise RuntimeError("viewer release failed")
+                return {"state": "publishing", "generation": generation}
+
+        client = FlakyClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        lease = await coordinator.async_acquire_viewer()
+        with self.assertRaises(RuntimeError):
+            await coordinator.async_release_viewer(lease)
+        self.assertEqual(1, coordinator.viewer_count)
+        await coordinator.async_release_viewer(lease)
+        self.assertEqual(0, coordinator.viewer_count)
 
     async def test_wait_ready_defaults_to_doorfast_retry_window(self):
         client = FakeClient()

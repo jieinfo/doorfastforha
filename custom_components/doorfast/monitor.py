@@ -255,6 +255,15 @@ class MonitorCoordinator:
                             and self._recoverable_generation == accepted_generation
                         ):
                             return accepted_generation
+                        response_revision = response.get("status_revision", 0)
+                        if (
+                            current_generation == accepted_generation
+                            and self._status_revision > 0
+                            and isinstance(response_revision, int)
+                            and not isinstance(response_revision, bool)
+                            and response_revision <= self._status_revision
+                        ):
+                            return current_generation
                         self._set_response_locked(
                             response, allow_generation_change=True
                         )
@@ -358,6 +367,15 @@ class MonitorCoordinator:
                         )
                         or current_generation == old_generation
                     ):
+                        response_revision = response.get("status_revision", 0)
+                        if (
+                            current_generation == accepted_generation
+                            and self._status_revision > 0
+                            and isinstance(response_revision, int)
+                            and not isinstance(response_revision, bool)
+                            and response_revision <= self._status_revision
+                        ):
+                            return current_generation
                         self._set_response_locked(
                             response, allow_generation_change=True
                         )
@@ -379,53 +397,84 @@ class MonitorCoordinator:
             request_epoch = self._terminal_epoch
             old_generation = self._generation or self._recoverable_generation or 0
 
-        while True:
-            async with self._lock:
-                if self._unloaded or request_epoch != self._terminal_epoch:
-                    raise RuntimeError("monitor request was terminated")
-                generation = self._generation
-                state = self._state
-                recoverable = self._recoverable_generation
-            if generation is None or state in _IDLE_STATES:
-                if recoverable is not None:
+        started_here = False
+        generation: int | None = None
+        try:
+            while True:
+                async with self._lock:
+                    if self._unloaded or request_epoch != self._terminal_epoch:
+                        raise RuntimeError("monitor request was terminated")
+                    generation = self._generation
+                    state = self._state
+                    recoverable = self._recoverable_generation
+                if generation is None or state in _IDLE_STATES:
+                    started_here = True
+                    if recoverable is not None:
+                        generation = await self._recover_generation(
+                            request_epoch, old_generation
+                        )
+                    else:
+                        generation = await self._start_generation(
+                            request_epoch, old_generation
+                        )
+                elif state == "stopping":
+                    started_here = True
                     generation = await self._recover_generation(
                         request_epoch, old_generation
                     )
-                else:
-                    generation = await self._start_generation(
-                        request_epoch, old_generation
-                    )
-            elif state == "stopping":
-                generation = await self._recover_generation(
-                    request_epoch, old_generation
-                )
 
-            try:
-                await self.async_wait_ready(generation)
-            except RuntimeError:
-                async with self._lock:
-                    if (
-                        self._unloaded
-                        or request_epoch != self._terminal_epoch
-                    ):
-                        raise RuntimeError("monitor request was terminated")
-                    recoverable = self._recoverable_generation
-                    if self._generation is not None and self._generation != generation:
-                        if self._generation > generation:
-                            generation = self._generation
+                try:
+                    await self.async_wait_ready(generation)
+                except RuntimeError:
+                    async with self._lock:
+                        if (
+                            self._unloaded
+                            or request_epoch != self._terminal_epoch
+                        ):
+                            raise RuntimeError("monitor request was terminated")
+                        recoverable = self._recoverable_generation
+                        if self._generation is not None and self._generation != generation:
+                            if self._generation > generation:
+                                generation = self._generation
+                                continue
+                        if recoverable not in (None, generation):
+                            raise
+                        if self._state == "stopping" or self._generation is None:
+                            old_generation = max(old_generation, generation)
                             continue
-                    if recoverable not in (None, generation):
-                        raise
-                    if self._state == "stopping" or self._generation is None:
-                        old_generation = max(old_generation, generation)
-                        continue
-                raise
+                    raise
 
-            try:
-                return await self._register_lease(generation, request_epoch)
-            except _RetryAcquire:
-                old_generation = max(old_generation, generation)
-                continue
+                try:
+                    return await self._register_lease(generation, request_epoch)
+                except _RetryAcquire:
+                    old_generation = max(old_generation, generation)
+                    continue
+        except asyncio.CancelledError:
+            if started_here and generation is not None:
+                await asyncio.shield(
+                    self._cleanup_cancelled_acquire(generation, request_epoch)
+                )
+            raise
+
+    async def _cleanup_cancelled_acquire(
+        self, generation: int, request_epoch: int
+    ) -> None:
+        async with self._lifecycle_lock:
+            async with self._lock:
+                if (
+                    self._generation != generation
+                    or request_epoch != self._terminal_epoch
+                    or self.viewer_count != 0
+                ):
+                    return
+            await self._stop_remote(generation)
+            async with self._lock:
+                if self._generation == generation and self.viewer_count == 0:
+                    self._generation = None
+                    self._state = "idle"
+                    self._ready = False
+                    self._recoverable_generation = None
+                    self._status_event.set()
 
     async def _register_lease(
         self, generation: int, request_epoch: int
@@ -447,11 +496,31 @@ class MonitorCoordinator:
                     raise _RetryAcquire
                 enable_viewer = self.viewer_count == 0
 
+            async def rollback_viewer_edge() -> None:
+                try:
+                    await self._client.set_monitor_viewer(
+                        self.runtime_id, self.station_id, generation, False
+                    )
+                finally:
+                    try:
+                        await self._stop_remote(generation)
+                    finally:
+                        async with self._lock:
+                            if self._generation == generation:
+                                self._generation = None
+                                self._state = "idle"
+                                self._ready = False
+                                self._leases.clear()
+                                self._status_event.set()
+
             if enable_viewer:
                 try:
                     await self._client.set_monitor_viewer(
                         self.runtime_id, self.station_id, generation, True
                     )
+                except asyncio.CancelledError:
+                    await rollback_viewer_edge()
+                    raise
                 except Exception:
                     try:
                         await self._stop_remote(generation)
@@ -464,45 +533,52 @@ class MonitorCoordinator:
                                 self._leases.clear()
                                 self._status_event.set()
                     raise
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    await rollback_viewer_edge()
+                    raise asyncio.CancelledError
 
-            async with self._lock:
-                valid = (
-                    not self._unloaded
-                    and request_epoch == self._terminal_epoch
-                    and self._generation == generation
-                    and self._ready
-                    and self._state not in _IDLE_STATES
-                    and self._state != "stopping"
-                )
-            if not valid:
-                if enable_viewer:
-                    await self._client.set_monitor_viewer(
-                        self.runtime_id, self.station_id, generation, False
-                    )
+            try:
                 async with self._lock:
-                    terminated = (
+                    valid = (
+                        not self._unloaded
+                        and request_epoch == self._terminal_epoch
+                        and self._generation == generation
+                        and self._ready
+                        and self._state not in _IDLE_STATES
+                        and self._state != "stopping"
+                    )
+                if not valid:
+                    if enable_viewer:
+                        await rollback_viewer_edge()
+                    async with self._lock:
+                        terminated = (
+                            self._unloaded
+                            or request_epoch != self._terminal_epoch
+                        )
+                    if terminated:
+                        raise RuntimeError("monitor request was terminated")
+                    raise _RetryAcquire
+                async with self._lock:
+                    if (
                         self._unloaded
                         or request_epoch != self._terminal_epoch
+                        or self._generation != generation
+                        or not self._ready
+                        or self._state in _IDLE_STATES
+                        or self._state == "stopping"
+                    ):
+                        raise _RetryAcquire
+                    self._next_lease_id += 1
+                    lease = MonitorLease(
+                        generation, self._next_lease_id, self._terminal_epoch
                     )
-                if terminated:
-                    raise RuntimeError("monitor request was terminated")
-                raise _RetryAcquire
-            async with self._lock:
-                if (
-                    self._unloaded
-                    or request_epoch != self._terminal_epoch
-                    or self._generation != generation
-                    or not self._ready
-                    or self._state in _IDLE_STATES
-                    or self._state == "stopping"
-                ):
-                    raise _RetryAcquire
-                self._next_lease_id += 1
-                lease = MonitorLease(
-                    generation, self._next_lease_id, self._terminal_epoch
-                )
-                self._leases[lease.lease_id] = lease
-                return lease
+                    self._leases[lease.lease_id] = lease
+                    return lease
+            except asyncio.CancelledError:
+                if enable_viewer:
+                    await rollback_viewer_edge()
+                raise
 
     async def async_release_viewer(self, lease: MonitorLease) -> None:
         """Release one viewer and schedule a delayed stop at the last edge."""
