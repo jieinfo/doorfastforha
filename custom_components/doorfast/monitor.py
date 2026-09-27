@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 from .const import MONITOR_READY_TIMEOUT
@@ -10,6 +11,13 @@ from .const import MONITOR_READY_TIMEOUT
 
 _READY_STATES = frozenset(("publishing", "viewing"))
 _IDLE_STATES = frozenset(("idle", "stopped", "failed", "unavailable"))
+
+
+@dataclass(frozen=True)
+class MonitorLease:
+    generation: int
+    lease_id: int
+    epoch: int
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -44,7 +52,9 @@ class MonitorCoordinator:
         self._generation: int | None = None
         self._state = "idle"
         self._ready = False
-        self._viewer_count = 0
+        self._next_lease_id = 0
+        self._leases: dict[int, MonitorLease] = {}
+        self._terminal_epoch = 0
         self._status_revision = 0
         self._unloaded = False
         self._status_event = asyncio.Event()
@@ -63,7 +73,9 @@ class MonitorCoordinator:
 
     @property
     def viewer_count(self) -> int:
-        return self._viewer_count
+        if self._generation is None:
+            return 0
+        return sum(lease.generation == self._generation for lease in self._leases.values())
 
     @property
     def status_revision(self) -> int:
@@ -77,7 +89,7 @@ class MonitorCoordinator:
             "generation": self._generation,
             "state": self._state,
             "ready": self._ready,
-            "viewer_count": self._viewer_count,
+            "viewer_count": self.viewer_count,
             "status_revision": self._status_revision,
         }
 
@@ -171,7 +183,7 @@ class MonitorCoordinator:
                 self._status_event.clear()
             await self._status_event.wait()
 
-    async def async_acquire_viewer(self) -> int:
+    async def async_acquire_viewer(self) -> MonitorLease:
         """Register one HA viewer and return the active Doorfast generation."""
         async with self._lock:
             self._cancel_grace_locked()
@@ -199,7 +211,7 @@ class MonitorCoordinator:
                     or self._state in _IDLE_STATES
                 ):
                     raise RuntimeError("monitor generation is no longer ready")
-                if self._viewer_count == 0:
+                if self.viewer_count == 0:
                     try:
                         await self._client.set_monitor_viewer(
                             self.runtime_id, self.station_id, generation, True
@@ -207,13 +219,15 @@ class MonitorCoordinator:
                     except Exception:
                         await self._stop_locked(generation)
                         raise
-                self._viewer_count += 1
-                return generation
+                self._next_lease_id += 1
+                lease = MonitorLease(generation, self._next_lease_id, self._terminal_epoch)
+                self._leases[lease.lease_id] = lease
+                return lease
         except asyncio.CancelledError:
             async with self._lock:
                 if (
                     self._generation == generation
-                    and self._viewer_count == 0
+                    and self.viewer_count == 0
                     and self._state not in _IDLE_STATES
                 ):
                     await self._stop_locked(generation)
@@ -222,27 +236,28 @@ class MonitorCoordinator:
             async with self._lock:
                 if (
                     self._generation == generation
-                    and self._viewer_count == 0
+                    and self.viewer_count == 0
                     and self._state not in _IDLE_STATES
                 ):
                     await self._stop_locked(generation)
             raise
 
-    async def async_release_viewer(self) -> None:
+    async def async_release_viewer(self, lease: MonitorLease) -> None:
         """Release one viewer and schedule a delayed stop at the last edge."""
         async with self._lock:
-            if self._viewer_count == 0:
+            current = self._leases.get(lease.lease_id)
+            if current != lease:
                 return
-            self._viewer_count -= 1
+            del self._leases[lease.lease_id]
             generation = self._generation
-            if self._viewer_count != 0 or generation is None:
+            if self.viewer_count != 0 or generation is None or lease.generation != generation:
                 return
             try:
                 await self._client.set_monitor_viewer(
                     self.runtime_id, self.station_id, generation, False
                 )
             except Exception:
-                self._viewer_count = 1
+                self._leases[lease.lease_id] = lease
                 raise
             self._cancel_grace_locked()
             self._stop_task = asyncio.create_task(
@@ -253,7 +268,7 @@ class MonitorCoordinator:
         try:
             await asyncio.sleep(self._grace_seconds)
             async with self._lock:
-                if self._generation == generation and self._viewer_count == 0:
+                if self._generation == generation and self.viewer_count == 0:
                     await self._stop_locked(generation)
         except asyncio.CancelledError:
             return
@@ -265,7 +280,7 @@ class MonitorCoordinator:
         if self._generation is None:
             self._state = "idle"
             self._ready = False
-            self._viewer_count = 0
+            self._leases.clear()
             self._status_event.set()
             return
         active_generation = self._generation
@@ -290,7 +305,7 @@ class MonitorCoordinator:
             self._generation = None
             self._state = "idle"
             self._ready = False
-            self._viewer_count = 0
+            self._leases.clear()
             self._status_event.set()
 
     async def async_stop(self) -> None:
@@ -352,7 +367,7 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "idle"
                 self._ready = False
-                self._viewer_count = 0
+                self._leases.clear()
                 self._status_revision = revision
                 self._status_event.set()
                 return
@@ -361,7 +376,7 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "failed"
                 self._ready = False
-                self._viewer_count = 0
+                self._leases.clear()
                 self._status_revision = revision
                 self._status_event.set()
                 return
@@ -375,7 +390,7 @@ class MonitorCoordinator:
                     state if state in {"failed", "unavailable"} else "idle"
                 )
                 self._ready = False
-                self._viewer_count = 0
+                self._leases.clear()
                 self._status_revision = revision
                 self._status_event.set()
                 return

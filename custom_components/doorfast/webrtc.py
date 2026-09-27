@@ -54,6 +54,7 @@ class _Session:
     websocket: Any
     station_id: str
     coordinator: Any
+    lease: Any
     generation: int
     send_message: Callable[[Any], None]
     answer: asyncio.Future[None]
@@ -151,7 +152,8 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
 
         station = self._registry.station(station_id)
         coordinator = self._registry.monitor(station_id)
-        generation = await coordinator.async_acquire_viewer()
+        lease = await coordinator.async_acquire_viewer()
+        generation = lease.generation
         viewer_released = False
         try:
             await coordinator.async_wait_ready(
@@ -173,6 +175,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         websocket=websocket,
                         station_id=station_id,
                         coordinator=coordinator,
+                        lease=lease,
                         generation=generation,
                         send_message=send_message,
                         answer=loop.create_future(),
@@ -211,12 +214,12 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     await asyncio.sleep(_NEGOTIATION_RETRY_DELAY)
         except asyncio.CancelledError:
             if not viewer_released:
-                await coordinator.async_release_viewer()
+                await coordinator.async_release_viewer(lease)
             raise
         except Exception:
             if not viewer_released:
                 # Covers failures before a WebSocket session is created.
-                await coordinator.async_release_viewer()
+                await coordinator.async_release_viewer(lease)
             raise
         finally:
             if self._negotiations.get(session_id) is current_task:
@@ -310,7 +313,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         HomeAssistantError("go2rtc WebRTC session closed")
                     )
             if release_viewer:
-                await state.coordinator.async_release_viewer()
+                await state.coordinator.async_release_viewer(state.lease)
 
     async def async_close_entry(self) -> None:
         negotiations = list(self._negotiations.values())

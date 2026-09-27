@@ -228,17 +228,17 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         client = FakeClient()
         coordinator = MonitorCoordinator(client, "runtime-a", "gate_main", grace_seconds=0.01)
 
-        await coordinator.async_acquire_viewer()
-        await coordinator.async_acquire_viewer()
+        first = await coordinator.async_acquire_viewer()
+        second = await coordinator.async_acquire_viewer()
         self.assertEqual(2, coordinator.viewer_count)
         self.assertEqual(
             [("start", "runtime-a", "gate_main"),
              ("viewer", "runtime-a", "gate_main", 7, True)], client.calls
         )
 
-        await coordinator.async_release_viewer()
+        await coordinator.async_release_viewer(first)
         self.assertEqual(1, coordinator.viewer_count)
-        await coordinator.async_release_viewer()
+        await coordinator.async_release_viewer(second)
         self.assertEqual(0, coordinator.viewer_count)
         self.assertEqual(
             [("start", "runtime-a", "gate_main"),
@@ -255,6 +255,23 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
              ("stop", "runtime-a", "gate_main", 7)],
             client.calls,
         )
+
+    async def test_late_release_from_old_generation_does_not_touch_new_generation(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main", grace_seconds=10)
+
+        old = await coordinator.async_acquire_viewer()
+        self.assertEqual(7, old.generation)
+        await coordinator.async_apply_status(
+            {"event": "monitor_stopped", "generation": 7, "status_revision": 1}
+        )
+        client.start_result = {"state": "publishing", "generation": 8}
+        new = await coordinator.async_acquire_viewer()
+        await coordinator.async_release_viewer(old)
+        self.assertEqual(1, coordinator.viewer_count)
+        self.assertEqual(8, coordinator.generation)
+        await coordinator.async_release_viewer(new)
+        self.assertEqual(0, coordinator.viewer_count)
 
     async def test_acquire_waits_for_publishing_before_enabling_viewer(self):
         class StrictClient(FakeClient):
@@ -276,7 +293,8 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         await coordinator.async_apply_status(
             {"generation": 7, "state": "publishing", "status_revision": 1}
         )
-        self.assertEqual(7, await asyncio.wait_for(task, 1))
+        lease = await asyncio.wait_for(task, 1)
+        self.assertEqual(7, lease.generation)
         self.assertEqual(
             [("start", "runtime-a", "gate_main"),
              ("viewer", "runtime-a", "gate_main", 7, True)],
@@ -337,15 +355,16 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         client = FakeClient()
         coordinator = MonitorCoordinator(client, "runtime-a", "gate_main", grace_seconds=10)
 
-        await coordinator.async_acquire_viewer()
-        await coordinator.async_release_viewer()
+        lease = await coordinator.async_acquire_viewer()
+        await coordinator.async_release_viewer(lease)
         await coordinator.async_apply_status(
             {"generation": 7, "state": "stopping", "status_revision": 1}
         )
         self.assertFalse(coordinator.ready)
         client.start_result = {"state": "publishing", "generation": 8}
 
-        self.assertEqual(8, await coordinator.async_acquire_viewer())
+        lease = await coordinator.async_acquire_viewer()
+        self.assertEqual(8, lease.generation)
         self.assertEqual("publishing", coordinator.state)
         self.assertEqual(1, coordinator.viewer_count)
         self.assertEqual(

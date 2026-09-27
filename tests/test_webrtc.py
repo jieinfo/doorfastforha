@@ -126,16 +126,18 @@ class FakeCoordinator:
         self.ready = True
         self.acquired = 0
         self.released = 0
+        self.lease = types.SimpleNamespace(generation=generation, lease_id=1, epoch=0)
 
     async def async_acquire_viewer(self):
         self.acquired += 1
-        return self.generation
+        return self.lease
 
     async def async_wait_ready(self, generation, timeout=10):
         assert generation == self.generation
         assert timeout == 25.0
 
-    async def async_release_viewer(self):
+    async def async_release_viewer(self, lease):
+        assert lease is self.lease
         self.released += 1
 
 
