@@ -6,6 +6,7 @@ import sys
 import types
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).parents[1]
@@ -43,6 +44,24 @@ class FakeClient:
 
 
 class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
+    async def test_start_works_when_eager_task_requires_explicit_loop(self):
+        original_task = asyncio.Task
+
+        def task_requiring_loop(coro, *, loop=None, eager_start=False, **kwargs):
+            if eager_start and loop is None:
+                coro.close()
+                raise AttributeError("'NoneType' object has no attribute 'is_running'")
+            return original_task(coro, loop=loop, eager_start=eager_start, **kwargs)
+
+        client = FakeClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+
+        with patch.object(monitor_module.asyncio, "Task", task_requiring_loop):
+            generation = await coordinator.async_start()
+
+        self.assertEqual(7, generation)
+        self.assertEqual([("start", "runtime-a", "gate_main")], client.calls)
+
     async def test_acquire_recovers_same_generation_after_stopping(self):
         class GatedClient(FakeClient):
             def __init__(self):

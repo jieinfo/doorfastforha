@@ -190,6 +190,7 @@ class MonitorCoordinator:
         """Keep an accepted start alive long enough to clean it up on cancel."""
         start_task = asyncio.Task(
             self._client.start_monitor(self.runtime_id, self.station_id),
+            loop=asyncio.get_running_loop(),
             eager_start=True,
         )
         try:
