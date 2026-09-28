@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import logging
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -42,6 +43,7 @@ _OFFER_TIMEOUT = 10.0
 # to go2rtc. Keep retrying while the HA WebRTC request remains open. The
 # frontend closes the session when the viewer leaves, which cancels this loop.
 _NEGOTIATION_RETRY_DELAY = 1.0
+_LOGGER = logging.getLogger(__name__)
 
 
 def _consume_answer_exception(future: asyncio.Future[None]) -> None:
@@ -69,6 +71,12 @@ class _Session:
 
 class _ProducerNotReadyError(RuntimeError):
     """The go2rtc stream is not published yet and can be retried."""
+
+
+def _retryable_offer_error(error: Exception) -> bool:
+    if isinstance(error, (_ProducerNotReadyError, asyncio.TimeoutError)):
+        return True
+    return getattr(error, "status", None) in (404, 503)
 
 
 class DoorfastWebRTCProvider(CameraWebRTCProvider):
@@ -150,11 +158,13 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             await asyncio.gather(previous, return_exceptions=True)
         if session_id in self._sessions:
             await self._cleanup_session(session_id)
+        try:
+            station = self._registry.station(station_id)
+            coordinator = self._registry.monitor(station_id)
+        except KeyError as error:
+            raise HomeAssistantError("Doorfast station is no longer available") from error
         if current_task is not None:
             self._negotiations[session_id] = current_task
-
-        station = self._registry.station(station_id)
-        coordinator = self._registry.monitor(station_id)
         lease = None
         state: _Session | None = None
         viewer_released = False
@@ -165,8 +175,8 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 generation, timeout=MONITOR_READY_TIMEOUT
             )
             while True:
-                if not coordinator.lease_active(lease):
-                    raise RuntimeError("monitor viewer lease is no longer active")
+                if not coordinator.lease_owned(lease):
+                    raise HomeAssistantError("Doorfast monitor viewer lease is no longer owned")
                 state = None
                 try:
                     websocket = await self._session.ws_connect(
@@ -212,7 +222,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     ):
                         viewer_released = True
                     raise
-                except HomeAssistantError:
+                except Exception as error:
                     if state is not None and not state.released:
                         await self._cleanup_session(
                             session_id, state, release_viewer=False
@@ -221,19 +231,40 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         state.lease_released or state.cleanup_failed
                     ):
                         viewer_released = True
-                    raise
-                except Exception:
-                    if state is not None and not state.released:
-                        await self._cleanup_session(
-                            session_id, state, release_viewer=False
+                    raw_status = getattr(error, "status", None)
+                    status = raw_status if type(raw_status) is int else None
+                    owned = coordinator.lease_owned(lease)
+                    if not owned or not _retryable_offer_error(error):
+                        _LOGGER.warning(
+                            "WebRTC offer failed station=%s session=%s generation=%s error=%s status=%s",
+                            station_id,
+                            session_id,
+                            generation,
+                            type(error).__name__,
+                            status,
                         )
-                    if state is not None and (
-                        state.lease_released or state.cleanup_failed
-                    ):
-                        viewer_released = True
-                    # A producer can disappear between attempts while the
-                    # station remains active. Keep the same Doorfast viewer
-                    # lease and retry until HA closes this WebRTC session.
+                        if not owned:
+                            raise HomeAssistantError(
+                                "Doorfast monitor viewer lease is no longer owned"
+                            ) from error
+                        if isinstance(error, HomeAssistantError):
+                            raise
+                        detail = (
+                            f"HTTP {status}"
+                            if status is not None
+                            else type(error).__name__
+                        )
+                        raise HomeAssistantError(
+                            f"Doorfast WebRTC offer failed: {detail}"
+                        ) from error
+                    _LOGGER.debug(
+                        "WebRTC offer retry station=%s session=%s generation=%s error=%s status=%s",
+                        station_id,
+                        session_id,
+                        generation,
+                        type(error).__name__,
+                        status,
+                    )
                     await asyncio.sleep(_NEGOTIATION_RETRY_DELAY)
         except asyncio.CancelledError:
             if (
@@ -284,8 +315,12 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         raise HomeAssistantError("invalid go2rtc ICE candidate")
                     state.send_message(WebRTCCandidate(RTCIceCandidateInit(value)))
                 elif message_type == "error":
-                    error = _ProducerNotReadyError(
-                        "go2rtc WebRTC producer is not ready"
+                    if not isinstance(value, str):
+                        raise HomeAssistantError("invalid go2rtc WebSocket error")
+                    error = (
+                        _ProducerNotReadyError("go2rtc WebRTC producer is not ready")
+                        if value.strip().lower() in ("not ready", "streams: unknown error")
+                        else HomeAssistantError("go2rtc WebRTC signaling failed")
                     )
                     if not state.negotiating or state.notify_error:
                         state.send_message(
