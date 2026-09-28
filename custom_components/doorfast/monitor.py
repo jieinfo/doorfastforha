@@ -179,7 +179,7 @@ class MonitorCoordinator:
         self, generation: int, timeout: float | None = MONITOR_READY_TIMEOUT
     ) -> None:
         """Wait until the exact generation is publishing/viewing."""
-        if self._generation == generation and self._ready:
+        if self._generation == generation and self._ready and self._state != "stopping":
             return
         await asyncio.wait_for(self._wait_ready(generation), timeout)
 
@@ -189,11 +189,16 @@ class MonitorCoordinator:
                 if (
                     self._generation != generation
                     or self._state
-                    in {"failed", "idle", "stopped", "stopping", "unavailable"}
+                    in {"failed", "idle", "stopped", "unavailable"}
+                    or (
+                        self._state == "stopping"
+                        and self._publisher_running is not True
+                        and self.viewer_count == 0
+                    )
                     or self._unloaded
                 ):
                     raise RuntimeError("monitor generation is no longer ready")
-                if self._ready:
+                if self._ready and self._state != "stopping":
                     return
                 self._status_event.clear()
             await self._status_event.wait()
@@ -334,6 +339,11 @@ class MonitorCoordinator:
             async with self._lock:
                 if self._unloaded or request_epoch != self._terminal_epoch:
                     raise RuntimeError("monitor request was terminated")
+                # Source retries must not restart an established shared publication.
+                if self._generation is not None and (
+                    self._publisher_running is True or self.viewer_count != 0
+                ):
+                    return self._generation
                 follow_generation = (
                     self._generation
                     if self._generation is not None

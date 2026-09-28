@@ -44,6 +44,60 @@ class FakeClient:
 
 
 class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
+    async def test_shared_stopping_wait_yields_even_with_explicit_ready(self):
+        coordinator = MonitorCoordinator(FakeClient(), "runtime-a", "gate_main")
+        lease = await coordinator.async_acquire_viewer()
+        await coordinator.async_apply_status({
+            "generation": 7, "state": "stopping", "ready": True,
+            "encoder_running": True, "status_revision": 1,
+        })
+        wait = asyncio.create_task(coordinator.async_wait_ready(7))
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(wait.done())
+            self.assertTrue(coordinator.lease_owned(lease))
+            await coordinator.async_apply_status({
+                "generation": 7, "state": "publishing", "ready": True,
+                "encoder_running": True, "status_revision": 2,
+            })
+            await asyncio.wait_for(wait, 1)
+        finally:
+            wait.cancel()
+            await asyncio.gather(wait, return_exceptions=True)
+            await coordinator.async_stop()
+
+    async def test_second_viewer_preserves_published_generation_during_stopping(self):
+        client = FakeClient()
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        first = await coordinator.async_acquire_viewer()
+        await coordinator.async_apply_status({
+            "generation": 7, "state": "stopping", "ready": False,
+            "encoder_running": True, "status_revision": 1,
+        })
+        client.start_result = {"generation": 8, "state": "publishing"}
+        second_task = asyncio.create_task(coordinator.async_acquire_viewer())
+        try:
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.assertTrue(coordinator.lease_owned(first))
+            self.assertEqual(7, coordinator.generation)
+            self.assertNotIn(("stop", "runtime-a", "gate_main", 7), client.calls)
+            self.assertFalse(second_task.done())
+            await coordinator.async_apply_status({
+                "generation": 7, "state": "publishing", "ready": True,
+                "encoder_running": True, "status_revision": 2,
+            })
+            second = await asyncio.wait_for(second_task, 1)
+            self.assertEqual(7, second.generation)
+            self.assertTrue(coordinator.lease_owned(first))
+            self.assertTrue(coordinator.lease_owned(second))
+            self.assertEqual(2, coordinator.viewer_count)
+            self.assertEqual(1, client.calls.count(("start", "runtime-a", "gate_main")))
+        finally:
+            second_task.cancel()
+            await asyncio.gather(second_task, return_exceptions=True)
+            await coordinator.async_stop()
+
     async def test_start_works_when_eager_task_requires_explicit_loop(self):
         original_task = asyncio.Task
 

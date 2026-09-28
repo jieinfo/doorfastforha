@@ -219,6 +219,61 @@ def source(station_id, entry_id="entry-1"):
 
 
 class ProviderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_reconcile_retries_eof_release_failure_with_owned_live_lease(self):
+        class FlakyClient:
+            def __init__(self):
+                self.releases = 0
+
+            async def start_monitor(self, runtime_id, station_id):
+                return {"generation": 7, "state": "publishing", "ready": True,
+                        "encoder_running": True}
+
+            async def set_monitor_viewer(self, runtime_id, station_id, generation, active):
+                if not active:
+                    self.releases += 1
+                    if self.releases == 1:
+                        raise RuntimeError("temporary viewer release failure")
+                return {"generation": generation, "state": "queued", "active": active}
+
+            async def stop_monitor(self, runtime_id, station_id, generation):
+                return {"generation": generation, "state": "stopping"}
+
+        client = FlakyClient()
+        coordinator = monitor_module.MonitorCoordinator(client, "runtime-a", "gate_main")
+        main_ws, side_ws, side_peer_ws = FakeWebSocket(), FakeWebSocket(), FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(main_ws, side_ws, side_peer_ws))
+        registry.monitors["gate_main"] = coordinator
+        registry.monitors["gate_side"] = FakeCoordinator(
+            12, [MonitorLease(12, 1, 0), MonitorLease(12, 2, 0)]
+        )
+        try:
+            messages = await self.open_offer(provider, main_ws, "gate_main", "main")
+            await self.open_offer(provider, side_ws, "gate_side", "side")
+            await self.open_offer(provider, side_peer_ws, "gate_side", "side-peer")
+            state = provider._sessions["main"]
+            await main_ws.incoming.put(None)
+            result = await asyncio.gather(state.reader, return_exceptions=True)
+            self.assertIsInstance(result[0], RuntimeError)
+            self.assertTrue(state.cleanup_failed)
+            self.assertTrue(coordinator.lease_owned(state.lease))
+            self.assertTrue(coordinator.publisher_running)
+            await provider.async_reconcile_monitor()
+            self.assertNotIn("main", provider._sessions)
+            self.assertFalse(coordinator.lease_owned(state.lease))
+            self.assertEqual(0, coordinator.viewer_count)
+            await provider.async_reconcile_monitor()
+            self.assertEqual(2, client.releases)
+            self.assertEqual(["doorfast_publisher_ended"],
+                             [m.value for m in messages if isinstance(m, WebRTCError)])
+            for session_id, websocket in (("side", side_ws), ("side-peer", side_peer_ws)):
+                self.assertFalse(websocket.closed)
+                peer = provider._sessions[session_id]
+                self.assertTrue(peer.coordinator.lease_owned(peer.lease))
+            self.assertEqual(0, registry.monitors["gate_side"].released)
+        finally:
+            await provider.async_close_entry()
+            await coordinator.async_stop()
+
     async def test_reader_eof_cleans_up_when_error_subscriber_raises(self):
         websocket = FakeWebSocket()
         provider, registry = self.make_provider(FakeSession(websocket))

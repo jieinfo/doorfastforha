@@ -487,7 +487,8 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 stale.append((session_id, state))
                 continue
             if (
-                coordinator is not state.coordinator
+                state.cleanup_failed
+                or coordinator is not state.coordinator
                 or coordinator.generation != state.generation
                 or not coordinator.lease_owned(state.lease)
                 or coordinator.publisher_running is False
