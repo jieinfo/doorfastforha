@@ -433,9 +433,11 @@ class MonitorCoordinator:
 
     async def async_acquire_viewer(self) -> MonitorLease:
         """Register one HA viewer and return its generation lease."""
+        request_epoch = self._terminal_epoch
         async with self._acquire_admission_lock:
             async with self._lock:
-                request_epoch = self._terminal_epoch
+                if self._unloaded or request_epoch != self._terminal_epoch:
+                    raise RuntimeError("monitor request was terminated")
                 old_generation = self._generation or self._recoverable_generation or 0
                 pending = (request_epoch, asyncio.current_task())
                 self._pending_acquires.add(pending)

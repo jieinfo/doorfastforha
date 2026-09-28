@@ -318,6 +318,53 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(7, lease.generation)
         self.assertEqual(1, client.calls.count(("start", "runtime-a", "gate_main")))
 
+    async def test_acquire_waiting_on_admission_cannot_cross_terminal_epoch(self):
+        class BlockingStopClient(FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.start_results = [
+                    {"state": "queued", "generation": 7},
+                    {"state": "publishing", "generation": 8},
+                ]
+                self.stop_entered = asyncio.Event()
+                self.release_stop = asyncio.Event()
+
+            async def start_monitor(self, runtime_id, station_id):
+                self.calls.append(("start", runtime_id, station_id))
+                return dict(self.start_results.pop(0))
+
+            async def stop_monitor(self, runtime_id, station_id, generation):
+                self.calls.append(("stop", runtime_id, station_id, generation))
+                if not self.stop_entered.is_set():
+                    self.stop_entered.set()
+                    await self.release_stop.wait()
+                return {"state": "stopping", "generation": generation}
+
+        for terminal in ("async_stop", "async_preempt"):
+            with self.subTest(terminal=terminal):
+                client = BlockingStopClient()
+                coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+                first = asyncio.create_task(coordinator.async_acquire_viewer())
+                await asyncio.sleep(0)
+                first.cancel()
+                await asyncio.wait_for(client.stop_entered.wait(), 1)
+
+                second = asyncio.create_task(coordinator.async_acquire_viewer())
+                await asyncio.sleep(0)
+                self.assertFalse(second.done())
+                terminate = asyncio.create_task(getattr(coordinator, terminal)())
+                await asyncio.sleep(0)
+                self.assertEqual(1, coordinator._terminal_epoch)
+                client.release_stop.set()
+
+                with self.assertRaises(asyncio.CancelledError):
+                    await first
+                await asyncio.wait_for(terminate, 1)
+                with self.assertRaisesRegex(RuntimeError, "monitor request was terminated"):
+                    await asyncio.wait_for(second, 1)
+                self.assertEqual(1, client.calls.count(("start", "runtime-a", "gate_main")))
+                self.assertEqual(0, coordinator.viewer_count)
+
     async def test_failed_follower_does_not_stop_other_pending_acquire(self):
         client = FakeClient()
         client.start_result = {"state": "queued", "generation": 7}
