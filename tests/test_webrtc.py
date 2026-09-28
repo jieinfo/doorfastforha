@@ -219,6 +219,52 @@ def source(station_id, entry_id="entry-1"):
 
 
 class ProviderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_reader_eof_cleans_up_when_error_subscriber_raises(self):
+        websocket = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(websocket))
+        await self.open_offer(provider, websocket, "gate_main", "main")
+        state = provider._sessions["main"]
+        errors = []
+
+        def disconnected(message):
+            errors.append(message)
+            raise RuntimeError("subscriber disconnected")
+
+        state.send_message = disconnected
+        await websocket.incoming.put(None)
+        result = await asyncio.gather(state.reader, return_exceptions=True)
+        self.assertTrue(websocket.closed)
+        self.assertNotIn("main", provider._sessions)
+        self.assertEqual([state.lease], registry.monitors["gate_main"].released_leases)
+        self.assertEqual([None], result)
+        await provider.async_reconcile_monitor()
+        self.assertEqual(["doorfast_publisher_ended"], [m.value for m in errors])
+
+    async def test_reconcile_cleans_all_stale_sessions_when_one_subscriber_raises(self):
+        main_ws, side_ws = FakeWebSocket(), FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(main_ws, side_ws))
+        await self.open_offer(provider, main_ws, "gate_main", "main")
+        messages = await self.open_offer(provider, side_ws, "gate_side", "side")
+        errors = []
+
+        def disconnected(message):
+            errors.append(message)
+            raise RuntimeError("subscriber disconnected")
+
+        provider._sessions["main"].send_message = disconnected
+        for monitor in registry.monitors.values():
+            await monitor.async_apply_status({"encoder_running": False})
+        result = await asyncio.gather(provider.async_reconcile_monitor(), return_exceptions=True)
+        self.assertTrue(main_ws.closed)
+        self.assertTrue(side_ws.closed)
+        self.assertEqual({}, provider._sessions)
+        self.assertEqual([None], result)
+        await provider.async_reconcile_monitor()
+        self.assertEqual(["doorfast_publisher_ended"], [m.value for m in errors])
+        self.assertEqual(["doorfast_publisher_ended"],
+                         [m.value for m in messages if isinstance(m, WebRTCError)])
+        self.assertEqual([1, 1], [m.released for m in registry.monitors.values()])
+
     async def test_answer_survives_source_gap_and_receives_ice_on_same_socket(self):
         websocket = FakeWebSocket()
         provider, registry = self.make_provider(FakeSession(websocket))

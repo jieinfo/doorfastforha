@@ -386,9 +386,14 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 or state.terminal_error_sent):
             return
         state.terminal_error_sent = True
-        state.send_message(WebRTCError(
-            "doorfast_publisher_ended", "Doorfast preview publication ended"
-        ))
+        try:
+            state.send_message(WebRTCError(
+                "doorfast_publisher_ended", "Doorfast preview publication ended"
+            ))
+        except Exception:
+            # A disconnected subscriber must not prevent publication cleanup.
+            _LOGGER.debug("Unable to notify WebRTC subscriber of publication end",
+                          exc_info=True)
 
     async def async_on_webrtc_candidate(
         self, session_id: str, candidate: RTCIceCandidateInit
