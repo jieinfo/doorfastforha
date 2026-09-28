@@ -53,6 +53,7 @@ class MonitorCoordinator:
         self._grace_seconds = grace_seconds
         self._lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._acquire_admission_lock = asyncio.Lock()
         self._stop_task: asyncio.Task[None] | None = None
         self._generation: int | None = None
         self._recoverable_generation: int | None = None
@@ -432,11 +433,12 @@ class MonitorCoordinator:
 
     async def async_acquire_viewer(self) -> MonitorLease:
         """Register one HA viewer and return its generation lease."""
-        async with self._lock:
-            request_epoch = self._terminal_epoch
-            old_generation = self._generation or self._recoverable_generation or 0
-            pending = (request_epoch, asyncio.current_task())
-            self._pending_acquires.add(pending)
+        async with self._acquire_admission_lock:
+            async with self._lock:
+                request_epoch = self._terminal_epoch
+                old_generation = self._generation or self._recoverable_generation or 0
+                pending = (request_epoch, asyncio.current_task())
+                self._pending_acquires.add(pending)
 
         generation: int | None = None
         try:
@@ -508,24 +510,33 @@ class MonitorCoordinator:
         self, generation: int, request_epoch: int
     ) -> None:
         async with self._lifecycle_lock:
-            async with self._lock:
-                if (
-                    self._generation != generation
-                    or request_epoch != self._terminal_epoch
-                    or self.viewer_count != 0
-                ):
-                    return
-            await self._stop_remote(generation)
-            async with self._lock:
-                if self._generation == generation and self.viewer_count == 0:
-                    self._generation = None
-                    self._state = "idle"
-                    self._ready = False
-                    self._publisher_running = None
-                    self._recoverable_generation = None
-                    if self._pending_owned_generation == (request_epoch, generation):
+            async with self._acquire_admission_lock:
+                async with self._lock:
+                    if (
+                        self._generation != generation
+                        or request_epoch != self._terminal_epoch
+                        or self._pending_owned_generation != (request_epoch, generation)
+                        or any(
+                            epoch == request_epoch
+                            for epoch, _ in self._pending_acquires
+                        )
+                        or self.viewer_count != 0
+                    ):
+                        return
+                await self._stop_remote(generation)
+                async with self._lock:
+                    if (
+                        self._generation == generation
+                        and request_epoch == self._terminal_epoch
+                        and self.viewer_count == 0
+                    ):
+                        self._generation = None
+                        self._state = "idle"
+                        self._ready = False
+                        self._publisher_running = None
+                        self._recoverable_generation = None
                         self._pending_owned_generation = None
-                    self._status_event.set()
+                        self._status_event.set()
 
     async def _register_lease(
         self, generation: int, request_epoch: int

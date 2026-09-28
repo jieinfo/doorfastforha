@@ -282,6 +282,42 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, coordinator.viewer_count)
         self.assertEqual(1, client.calls.count(("stop", "runtime-a", "gate_main", 7)))
 
+    async def test_new_pending_acquire_prevents_queued_cancel_cleanup(self):
+        client = FakeClient()
+        client.start_result = {"state": "queued", "generation": 7}
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+        first = asyncio.create_task(coordinator.async_acquire_viewer())
+        await asyncio.sleep(0)
+        self.assertEqual(7, coordinator.generation)
+
+        await coordinator._lifecycle_lock.acquire()
+        try:
+            first.cancel()
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if not coordinator._pending_acquires:
+                    break
+            self.assertFalse(coordinator._pending_acquires)
+
+            second = asyncio.create_task(coordinator.async_acquire_viewer())
+            for _ in range(10):
+                await asyncio.sleep(0)
+                if len(coordinator._pending_acquires) == 1:
+                    break
+            self.assertEqual(1, len(coordinator._pending_acquires))
+        finally:
+            coordinator._lifecycle_lock.release()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        self.assertNotIn(("stop", "runtime-a", "gate_main", 7), client.calls)
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "ready": True, "status_revision": 1}
+        )
+        lease = await asyncio.wait_for(second, 1)
+        self.assertEqual(7, lease.generation)
+        self.assertEqual(1, client.calls.count(("start", "runtime-a", "gate_main")))
+
     async def test_failed_follower_does_not_stop_other_pending_acquire(self):
         client = FakeClient()
         client.start_result = {"state": "queued", "generation": 7}
