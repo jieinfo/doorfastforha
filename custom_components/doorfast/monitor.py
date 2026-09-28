@@ -59,6 +59,7 @@ class MonitorCoordinator:
         self._start_inflight = False
         self._state = "idle"
         self._ready = False
+        self._publisher_running: bool | None = None
         self._next_lease_id = 0
         self._leases: dict[int, MonitorLease] = {}
         self._terminal_epoch = 0
@@ -77,6 +78,10 @@ class MonitorCoordinator:
     @property
     def ready(self) -> bool:
         return self._ready
+
+    @property
+    def publisher_running(self) -> bool | None:
+        return self._publisher_running
 
     @property
     def viewer_count(self) -> int:
@@ -129,7 +134,11 @@ class MonitorCoordinator:
             raise ValueError("monitor status revision must be a non-negative integer")
         self._generation = generation
         self._state = state
-        self._ready = response.get("ready") is True or state in _READY_STATES
+        ready = response.get("ready")
+        self._ready = ready if isinstance(ready, bool) else state in _READY_STATES
+        publisher_running = response.get("encoder_running")
+        if isinstance(publisher_running, bool):
+            self._publisher_running = publisher_running
         self._status_revision = revision
         if state == "stopping":
             self._recoverable_generation = generation
@@ -331,6 +340,7 @@ class MonitorCoordinator:
                         self._generation = None
                         self._state = "idle"
                         self._ready = False
+                        self._publisher_running = None
                         self._leases.clear()
                         self._status_event.set()
 
@@ -474,6 +484,7 @@ class MonitorCoordinator:
                     self._generation = None
                     self._state = "idle"
                     self._ready = False
+                    self._publisher_running = None
                     self._recoverable_generation = None
                     self._status_event.set()
 
@@ -511,6 +522,7 @@ class MonitorCoordinator:
                                 self._generation = None
                                 self._state = "idle"
                                 self._ready = False
+                                self._publisher_running = None
                                 self._recoverable_generation = None
                                 self._leases.clear()
                                 self._status_event.set()
@@ -532,6 +544,7 @@ class MonitorCoordinator:
                                 self._generation = None
                                 self._state = "idle"
                                 self._ready = False
+                                self._publisher_running = None
                                 self._leases.clear()
                                 self._status_event.set()
                     raise
@@ -629,6 +642,7 @@ class MonitorCoordinator:
                 if active_generation is None:
                     self._state = "idle"
                     self._ready = False
+                    self._publisher_running = None
                     self._leases.clear()
                     self._status_event.set()
                     return
@@ -653,6 +667,7 @@ class MonitorCoordinator:
                         self._generation = None
                         self._state = "idle"
                         self._ready = False
+                        self._publisher_running = None
                         self._leases.clear()
                         self._status_event.set()
 
@@ -683,17 +698,21 @@ class MonitorCoordinator:
         generation = self._generation or self._recoverable_generation
         self._terminal_epoch += 1
         self._recoverable_generation = None
+        self._publisher_running = None
         if unload:
             self._unloaded = True
         return generation
 
-    def lease_active(self, lease: MonitorLease) -> bool:
+    def lease_owned(self, lease: MonitorLease) -> bool:
         return (
-            self._leases.get(lease.lease_id) == lease
+            not self._unloaded
+            and self._leases.get(lease.lease_id) == lease
             and self._generation == lease.generation
             and lease.epoch == self._terminal_epoch
-            and self._ready
         )
+
+    def lease_active(self, lease: MonitorLease) -> bool:
+        return self.lease_owned(lease) and self._ready
 
     async def async_apply_status(self, payload: dict[str, Any]) -> None:
         """Apply a validated monitor status or relay event snapshot."""
@@ -777,6 +796,7 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "idle"
                 self._ready = False
+                self._publisher_running = None
                 self._leases.clear()
                 if event == "monitor_stopped" and current_generation is not None:
                     self._recoverable_generation = current_generation
@@ -790,6 +810,7 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "failed"
                 self._ready = False
+                self._publisher_running = None
                 self._leases.clear()
                 self._recoverable_generation = None
                 self._status_revision = revision
@@ -802,6 +823,7 @@ class MonitorCoordinator:
                     state if state in {"failed", "unavailable"} else "idle"
                 )
                 self._ready = False
+                self._publisher_running = None
                 self._leases.clear()
                 if state == "stopped" and current_generation is not None:
                     self._recoverable_generation = current_generation

@@ -345,6 +345,82 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(coordinator.lease_active(lease))
 
+    async def test_lease_stays_owned_while_publication_is_temporarily_not_ready(self):
+        coordinator = MonitorCoordinator(FakeClient(), "runtime-a", "gate_main")
+        lease = await coordinator.async_acquire_viewer()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "ready": True,
+             "encoder_running": True, "status_revision": 7}
+        )
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "requesting", "ready": False,
+             "encoder_running": True, "status_revision": 8}
+        )
+
+        self.assertTrue(coordinator.lease_owned(lease))
+        self.assertFalse(coordinator.lease_active(lease))
+        self.assertFalse(coordinator.ready)
+        self.assertTrue(coordinator.publisher_running)
+
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "failed", "status_revision": 9}
+        )
+        self.assertFalse(coordinator.lease_owned(lease))
+        self.assertIsNone(coordinator.publisher_running)
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "ready": True,
+             "encoder_running": True, "status_revision": 8}
+        )
+        self.assertFalse(coordinator.lease_owned(lease))
+        self.assertIsNone(coordinator.publisher_running)
+
+    async def test_explicit_ready_and_publisher_status_override_state_heuristics(self):
+        coordinator = MonitorCoordinator(FakeClient(), "runtime-a", "gate_main")
+        await coordinator.async_start()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "ready": False,
+             "encoder_running": "true", "status_revision": 1}
+        )
+        self.assertFalse(coordinator.ready)
+        self.assertIsNone(coordinator.publisher_running)
+
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "requesting", "ready": True,
+             "encoder_running": False, "status_revision": 2}
+        )
+        self.assertTrue(coordinator.ready)
+        self.assertFalse(coordinator.publisher_running)
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "ready": "false",
+             "status_revision": 3}
+        )
+        self.assertTrue(coordinator.ready)
+        self.assertFalse(coordinator.publisher_running)
+
+    async def test_preempt_and_local_stop_clear_publisher_and_lease(self):
+        coordinator = MonitorCoordinator(FakeClient(), "runtime-a", "gate_main")
+        lease = await coordinator.async_acquire_viewer()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "encoder_running": True,
+             "status_revision": 1}
+        )
+        await coordinator.async_apply_status(
+            {"event": "monitor_preempted", "generation": 7,
+             "status_revision": 2}
+        )
+        self.assertFalse(coordinator.lease_owned(lease))
+        self.assertIsNone(coordinator.publisher_running)
+
+        coordinator = MonitorCoordinator(FakeClient(), "runtime-a", "gate_main")
+        lease = await coordinator.async_acquire_viewer()
+        await coordinator.async_apply_status(
+            {"generation": 7, "state": "publishing", "encoder_running": True,
+             "status_revision": 1}
+        )
+        await coordinator.async_stop()
+        self.assertFalse(coordinator.lease_owned(lease))
+        self.assertIsNone(coordinator.publisher_running)
+
     async def test_explicit_preempt_does_not_leave_a_recoverable_generation(self):
         client = FakeClient()
         coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
