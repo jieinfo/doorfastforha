@@ -73,6 +73,8 @@ class _Session:
     cleanup_failed: bool = False
     negotiating: bool = True
     notify_error: bool = False
+    close_requested: bool = False
+    terminal_error_sent: bool = False
 
 
 class _ProducerNotReadyError(RuntimeError):
@@ -360,7 +362,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                         if value.strip().lower() in ("not ready", "streams: unknown error")
                         else HomeAssistantError("go2rtc WebRTC signaling failed")
                     )
-                    if not state.negotiating or state.notify_error:
+                    if state.negotiating and state.notify_error:
                         state.send_message(
                             WebRTCError("doorfast_webrtc_failed", str(value))
                         )
@@ -376,7 +378,17 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 state.answer.set_exception(error)
         finally:
             if not state.negotiating:
+                self._notify_publisher_ended(state)
                 await self._cleanup_session(session_id, state)
+
+    def _notify_publisher_ended(self, state: _Session) -> None:
+        if (state.negotiating or state.close_requested or state.released
+                or state.terminal_error_sent):
+            return
+        state.terminal_error_sent = True
+        state.send_message(WebRTCError(
+            "doorfast_publisher_ended", "Doorfast preview publication ended"
+        ))
 
     async def async_on_webrtc_candidate(
         self, session_id: str, candidate: RTCIceCandidateInit
@@ -397,6 +409,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             negotiation.cancel()
         state = self._sessions.get(session_id)
         if state is not None:
+            state.close_requested = True
             self._hass.async_create_task(self._cleanup_session(session_id, state))
 
     async def _cleanup_session(
@@ -447,6 +460,8 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             state.cleanup_failed = False
 
     async def async_close_entry(self) -> None:
+        for state in self._sessions.values():
+            state.close_requested = True
         negotiations = list(self._negotiations.values())
         for negotiation in negotiations:
             negotiation.cancel()
@@ -469,9 +484,12 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             if (
                 coordinator is not state.coordinator
                 or coordinator.generation != state.generation
-                or not coordinator.ready
+                or not coordinator.lease_owned(state.lease)
+                or coordinator.publisher_running is False
             ):
                 stale.append((session_id, state))
+        for _, state in stale:
+            self._notify_publisher_ended(state)
         await asyncio.gather(
             *(self._cleanup_session(session_id, state) for session_id, state in stale)
         )
