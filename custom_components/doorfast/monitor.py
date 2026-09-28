@@ -173,7 +173,7 @@ class MonitorCoordinator:
         return await self._start_generation(request_epoch, old_generation)
 
     async def async_wait_ready(
-        self, generation: int, timeout: float = MONITOR_READY_TIMEOUT
+        self, generation: int, timeout: float | None = MONITOR_READY_TIMEOUT
     ) -> None:
         """Wait until the exact generation is publishing/viewing."""
         if self._generation == generation and self._ready:
@@ -460,7 +460,7 @@ class MonitorCoordinator:
                 except _RetryAcquire:
                     old_generation = max(old_generation, generation)
                     continue
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             if started_here and generation is not None:
                 await asyncio.shield(
                     self._cleanup_cancelled_acquire(generation, request_epoch)

@@ -153,7 +153,7 @@ class FakeCoordinator:
 
     async def async_wait_ready(self, generation, timeout=10):
         assert generation == self.generation
-        assert timeout == 25.0
+        assert timeout is None
 
     async def async_release_viewer(self, lease):
         self.released_leases.append(lease)
