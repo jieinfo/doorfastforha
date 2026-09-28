@@ -370,6 +370,22 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(provider._session.urls))
         self.assertEqual(1, registry.monitors["gate_main"].released)
 
+    async def test_null_message_before_answer_fails_without_retrying(self):
+        websocket = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(websocket))
+        task = asyncio.create_task(
+            provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "null-answer", lambda _: None
+            )
+        )
+        await asyncio.sleep(0)
+        await websocket.incoming.put(None)
+        with self.assertRaisesRegex(HomeAssistantError, "before answer"):
+            await asyncio.wait_for(task, 1)
+        self.assertTrue(websocket.closed)
+        self.assertEqual(1, len(provider._session.urls))
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+
     async def test_non_recoverable_websocket_error_fails_and_releases_lease(self):
         websocket = FakeWebSocket()
         session = FakeSession(websocket)
@@ -396,10 +412,6 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("invalid credentials", logs.output[0])
 
     async def test_http_handshake_retries_only_missing_or_unavailable_producer(self):
-        class HandshakeError(Exception):
-            def __init__(self, status):
-                self.status = status
-
         class HandshakeSession(FakeSession):
             def __init__(self, status, websocket):
                 super().__init__(websocket)
@@ -409,7 +421,11 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
                 if self.status is not None:
                     status, self.status = self.status, None
                     self.urls.append(url)
-                    raise HandshakeError(status)
+                    raise webrtc_module.WSServerHandshakeError(
+                        types.SimpleNamespace(real_url="ws://go2rtc.test/api/ws"),
+                        (),
+                        status=status,
+                    )
                 return await super().ws_connect(url, **kwargs)
 
         for status in (404, 503):
@@ -417,10 +433,12 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
                 websocket = FakeWebSocket()
                 session = HandshakeSession(status, websocket)
                 provider, registry = self.make_provider(session)
-                with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
-                    messages = await self.open_offer(
-                        provider, websocket, "gate_main", f"http-{status}"
-                    )
+                with self.assertLogs("custom_components.doorfast.webrtc", level="DEBUG") as logs:
+                    with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
+                        messages = await self.open_offer(
+                            provider, websocket, "gate_main", f"http-{status}"
+                        )
+                self.assertIn(f"status={status}", logs.output[0])
                 self.assertEqual(2, len(session.urls))
                 self.assertIsInstance(messages[0], WebRTCAnswer)
                 self.assertEqual(1, registry.monitors["gate_main"].acquired)
@@ -449,6 +467,95 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertNotIn("token=private", logs.output[0])
         self.assertEqual(1, registry.monitors["gate_main"].released)
+
+    async def test_connect_timeout_is_not_answer_timeout(self):
+        class TimeoutSession(FakeSession):
+            async def ws_connect(self, url, **kwargs):
+                self.urls.append(url)
+                raise TimeoutError("connect timed out")
+
+        session = TimeoutSession()
+        provider, registry = self.make_provider(session)
+        with self.assertRaises(HomeAssistantError):
+            await asyncio.wait_for(
+                provider.async_handle_async_webrtc_offer(
+                    FakeCamera(source("gate_main")), "offer", "connect-timeout", lambda _: None
+                ), 1
+            )
+        self.assertEqual(1, len(session.urls))
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+
+    async def test_offer_send_timeout_is_not_answer_timeout(self):
+        class TimeoutWebSocket(FakeWebSocket):
+            async def send_json(self, message):
+                raise TimeoutError("send timed out")
+
+        websocket = TimeoutWebSocket()
+        session = FakeSession(websocket)
+        provider, registry = self.make_provider(session)
+        with self.assertRaises(HomeAssistantError):
+            await asyncio.wait_for(
+                provider.async_handle_async_webrtc_offer(
+                    FakeCamera(source("gate_main")), "offer", "send-timeout", lambda _: None
+                ), 1
+            )
+        self.assertTrue(websocket.closed)
+        self.assertEqual(1, len(session.urls))
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+
+    async def test_non_http_status_404_does_not_retry(self):
+        class NotHttpError(Exception):
+            status = 404
+
+        class BrokenSession(FakeSession):
+            async def ws_connect(self, url, **kwargs):
+                self.urls.append(url)
+                raise NotHttpError("not a handshake")
+
+        session = BrokenSession()
+        provider, registry = self.make_provider(session)
+        with self.assertLogs("custom_components.doorfast.webrtc", level="WARNING") as logs:
+            with self.assertRaises(HomeAssistantError) as context:
+                await asyncio.wait_for(
+                    provider.async_handle_async_webrtc_offer(
+                        FakeCamera(source("gate_main")), "offer", "fake-404", lambda _: None
+                    ), 1
+                )
+        self.assertNotIn("HTTP 404", str(context.exception))
+        self.assertIn("status=None", logs.output[0])
+        self.assertEqual(1, len(session.urls))
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+
+    async def test_answer_timeout_retries_with_same_lease(self):
+        first_ws = FakeWebSocket()
+        second_ws = FakeWebSocket()
+        session = FakeSession(first_ws, second_ws)
+        provider, registry = self.make_provider(session)
+        messages = []
+
+        async def wait_for_retry():
+            while len(session.urls) < 2:
+                await asyncio.sleep(0)
+
+        with (
+            patch.object(webrtc_module, "_OFFER_TIMEOUT", 0.01),
+            patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0),
+        ):
+            task = asyncio.create_task(
+                provider.async_handle_async_webrtc_offer(
+                    FakeCamera(source("gate_main")), "offer", "answer-timeout", messages.append
+                )
+            )
+            await asyncio.wait_for(wait_for_retry(), 1)
+            await second_ws.incoming.put({"type": "webrtc/answer", "value": "answer"})
+            await asyncio.wait_for(task, 1)
+
+        self.assertTrue(first_ws.closed)
+        self.assertEqual(2, len(session.urls))
+        self.assertIsInstance(messages[0], WebRTCAnswer)
+        self.assertEqual(1, registry.monitors["gate_main"].acquired)
+        self.assertEqual(0, registry.monitors["gate_main"].released)
+        await provider.async_close_entry()
 
     async def test_generation_change_during_retry_fails_without_reconnecting(self):
         websocket = FakeWebSocket()
@@ -501,6 +608,26 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(0, registry.monitors["gate_main"].acquired)
         self.assertNotIn("removed", provider._negotiations)
+
+    async def test_wait_ready_identity_error_is_visible_and_releases_once(self):
+        class InvalidatedCoordinator(FakeCoordinator):
+            async def async_wait_ready(self, generation, timeout=10):
+                raise RuntimeError("monitor generation is no longer ready")
+
+        registry = FakeRegistry()
+        registry.monitors["gate_main"] = InvalidatedCoordinator(9)
+        session = FakeSession()
+        provider = DoorfastWebRTCProvider(
+            FakeHass(), "entry-1", registry, "http://127.0.0.1:1984", session
+        )
+        with self.assertRaises(HomeAssistantError) as context:
+            await provider.async_handle_async_webrtc_offer(
+                FakeCamera(source("gate_main")), "offer", "wait-invalid", lambda _: None
+            )
+        self.assertIsInstance(context.exception.__cause__, RuntimeError)
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+        self.assertEqual([], session.urls)
+        self.assertNotIn("wait-invalid", provider._negotiations)
 
     async def test_close_session_interrupts_long_retry_sleep(self):
         websocket = FakeWebSocket()

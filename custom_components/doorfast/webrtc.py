@@ -9,7 +9,7 @@ from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
 
 try:
-    from aiohttp import BasicAuth
+    from aiohttp import BasicAuth, WSServerHandshakeError
 except ImportError:  # pragma: no cover - dependency-free unit tests
     class BasicAuth:
         """Minimal fallback for tests that do not install Home Assistant deps."""
@@ -17,6 +17,12 @@ except ImportError:  # pragma: no cover - dependency-free unit tests
         def __init__(self, login: str, password: str) -> None:
             self.login = login
             self.password = password
+
+    class WSServerHandshakeError(Exception):
+        """Minimal fallback for WebSocket handshake tests."""
+
+        def __init__(self, request_info=None, history=(), *, status=0, message=""):
+            self.status = status
 from homeassistant.components.camera import (
     Camera,
     CameraWebRTCProvider,
@@ -73,10 +79,21 @@ class _ProducerNotReadyError(RuntimeError):
     """The go2rtc stream is not published yet and can be retried."""
 
 
+class _AnswerTimeoutError(TimeoutError):
+    """No WebRTC answer arrived before the negotiation deadline."""
+
+
+class _RetryableHandshakeError(RuntimeError):
+    """go2rtc returned a temporary HTTP handshake status."""
+
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+
 def _retryable_offer_error(error: Exception) -> bool:
-    if isinstance(error, (_ProducerNotReadyError, asyncio.TimeoutError)):
-        return True
-    return getattr(error, "status", None) in (404, 503)
+    return isinstance(
+        error, (_ProducerNotReadyError, _AnswerTimeoutError, _RetryableHandshakeError)
+    )
 
 
 class DoorfastWebRTCProvider(CameraWebRTCProvider):
@@ -179,14 +196,19 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     raise HomeAssistantError("Doorfast monitor viewer lease is no longer owned")
                 state = None
                 try:
-                    websocket = await self._session.ws_connect(
-                        self.websocket_url(station.stream_name),
-                        **(
-                            {"auth": self._go2rtc_auth}
-                            if self._go2rtc_auth is not None
-                            else {}
-                        ),
-                    )
+                    try:
+                        websocket = await self._session.ws_connect(
+                            self.websocket_url(station.stream_name),
+                            **(
+                                {"auth": self._go2rtc_auth}
+                                if self._go2rtc_auth is not None
+                                else {}
+                            ),
+                        )
+                    except WSServerHandshakeError as error:
+                        if error.status in (404, 503):
+                            raise _RetryableHandshakeError(error.status) from error
+                        raise
                     loop = asyncio.get_running_loop()
                     state = _Session(
                         websocket=websocket,
@@ -204,9 +226,14 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     await websocket.send_json(
                         {"type": "webrtc/offer", "value": offer_sdp}
                     )
-                    await asyncio.wait_for(
-                        asyncio.shield(state.answer), _OFFER_TIMEOUT
-                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(state.answer), _OFFER_TIMEOUT
+                        )
+                    except asyncio.TimeoutError as error:
+                        if state.answer.done():
+                            raise
+                        raise _AnswerTimeoutError from error
                     state.negotiating = False
                     return
                 except asyncio.CancelledError:
@@ -232,7 +259,12 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     ):
                         viewer_released = True
                     raw_status = getattr(error, "status", None)
-                    status = raw_status if type(raw_status) is int else None
+                    status = (
+                        raw_status
+                        if isinstance(error, (WSServerHandshakeError, _RetryableHandshakeError))
+                        and type(raw_status) is int
+                        else None
+                    )
                     owned = coordinator.lease_owned(lease)
                     if not owned or not _retryable_offer_error(error):
                         _LOGGER.warning(
@@ -277,7 +309,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             ):
                 await coordinator.async_release_viewer(lease)
             raise
-        except Exception:
+        except Exception as error:
             if (
                 lease is not None
                 and not viewer_released
@@ -288,7 +320,11 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             ):
                 # Covers failures before a WebSocket session is created.
                 await coordinator.async_release_viewer(lease)
-            raise
+            if isinstance(error, HomeAssistantError):
+                raise
+            raise HomeAssistantError(
+                f"Doorfast WebRTC setup failed: {type(error).__name__}"
+            ) from error
         finally:
             if self._negotiations.get(session_id) is current_task:
                 self._negotiations.pop(session_id, None)
@@ -298,6 +334,8 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             while True:
                 message = await state.websocket.receive_json()
                 if message is None:
+                    if state.negotiating:
+                        raise HomeAssistantError("go2rtc WebSocket closed before answer")
                     break
                 if not isinstance(message, dict):
                     raise HomeAssistantError("invalid go2rtc WebSocket message")
