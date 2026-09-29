@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.15
+
+- Preserve the Home Assistant WebRTC preview while Doorfast temporarily has no source frames.
+
 ## 0.3.11
 
 - Use the aggregate Doorfast monitor revision when older daemon builds report a stale per-session revision.
