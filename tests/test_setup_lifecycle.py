@@ -134,6 +134,45 @@ MODULE = load_module()
 
 
 class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_status_sync_retains_answer_then_reports_terminal_publication(self):
+        from tests.test_webrtc import (
+            DoorfastWebRTCProvider, FakeRegistry as WebRTCRegistry,
+            FakeHass as WebRTCHass, FakeSession, FakeWebSocket,
+            FakeCamera, WebRTCError, source,
+        )
+
+        registry = WebRTCRegistry()
+        registry.station_ids = tuple(registry.monitors)
+        websocket = FakeWebSocket()
+        provider = DoorfastWebRTCProvider(
+            WebRTCHass(), "entry-1", registry, "http://127.0.0.1:1984",
+            FakeSession(websocket),
+        )
+        messages = []
+        await websocket.incoming.put({"type": "webrtc/answer", "value": "answer"})
+        await provider.async_handle_async_webrtc_offer(
+            FakeCamera(source("gate_main")), "offer", "main", messages.append
+        )
+        status = {"station_id": "gate_main", "generation": 9,
+                  "state": "requesting", "ready": False, "encoder_running": True}
+
+        async def monitor_status():
+            return {"runtime_id": "runtime-a", "sessions": [status]}
+
+        client = types.SimpleNamespace(
+            status={"runtime_id": "runtime-a"}, monitor_status=monitor_status
+        )
+        await MODULE.sync_monitor_state(client, registry, provider, station_id="gate_main")
+        self.assertFalse(websocket.closed)
+        self.assertEqual(0, registry.monitors["gate_main"].released)
+        status["encoder_running"] = False
+        await MODULE.sync_monitor_state(client, registry, provider, station_id="gate_main")
+        await provider.async_close_entry()
+        self.assertTrue(websocket.closed)
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+        self.assertEqual(["doorfast_publisher_ended"],
+                         [m.value for m in messages if isinstance(m, WebRTCError)])
+
     async def test_poll_does_not_clear_monitor_start_in_flight(self):
         registry = FakeStationRegistry()
         provider = FakeProvider()

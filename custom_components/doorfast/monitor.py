@@ -53,12 +53,16 @@ class MonitorCoordinator:
         self._grace_seconds = grace_seconds
         self._lock = asyncio.Lock()
         self._lifecycle_lock = asyncio.Lock()
+        self._acquire_admission_lock = asyncio.Lock()
         self._stop_task: asyncio.Task[None] | None = None
         self._generation: int | None = None
         self._recoverable_generation: int | None = None
         self._start_inflight = False
+        self._pending_acquires: set[tuple[int, asyncio.Task[Any]]] = set()
+        self._pending_owned_generation: tuple[int, int] | None = None
         self._state = "idle"
         self._ready = False
+        self._publisher_running: bool | None = None
         self._next_lease_id = 0
         self._leases: dict[int, MonitorLease] = {}
         self._terminal_epoch = 0
@@ -77,6 +81,10 @@ class MonitorCoordinator:
     @property
     def ready(self) -> bool:
         return self._ready
+
+    @property
+    def publisher_running(self) -> bool | None:
+        return self._publisher_running
 
     @property
     def viewer_count(self) -> int:
@@ -129,7 +137,11 @@ class MonitorCoordinator:
             raise ValueError("monitor status revision must be a non-negative integer")
         self._generation = generation
         self._state = state
-        self._ready = response.get("ready") is True or state in _READY_STATES
+        ready = response.get("ready")
+        self._ready = ready if isinstance(ready, bool) else state in _READY_STATES
+        publisher_running = response.get("encoder_running")
+        if isinstance(publisher_running, bool):
+            self._publisher_running = publisher_running
         self._status_revision = revision
         if state == "stopping":
             self._recoverable_generation = generation
@@ -164,10 +176,10 @@ class MonitorCoordinator:
         return await self._start_generation(request_epoch, old_generation)
 
     async def async_wait_ready(
-        self, generation: int, timeout: float = MONITOR_READY_TIMEOUT
+        self, generation: int, timeout: float | None = MONITOR_READY_TIMEOUT
     ) -> None:
         """Wait until the exact generation is publishing/viewing."""
-        if self._generation == generation and self._ready:
+        if self._generation == generation and self._ready and self._state != "stopping":
             return
         await asyncio.wait_for(self._wait_ready(generation), timeout)
 
@@ -177,11 +189,16 @@ class MonitorCoordinator:
                 if (
                     self._generation != generation
                     or self._state
-                    in {"failed", "idle", "stopped", "stopping", "unavailable"}
+                    in {"failed", "idle", "stopped", "unavailable"}
+                    or (
+                        self._state == "stopping"
+                        and self._publisher_running is not True
+                        and self.viewer_count == 0
+                    )
                     or self._unloaded
                 ):
                     raise RuntimeError("monitor generation is no longer ready")
-                if self._ready:
+                if self._ready and self._state != "stopping":
                     return
                 self._status_event.clear()
             await self._status_event.wait()
@@ -206,7 +223,9 @@ class MonitorCoordinator:
             raise ValueError("Doorfast monitor start returned a non-object")
         return response
 
-    async def _start_generation(self, request_epoch: int, old_generation: int) -> int:
+    async def _start_generation(
+        self, request_epoch: int, old_generation: int, *, pending_acquire: bool = False
+    ) -> int:
         """Start one generation while serializing remote lifecycle calls."""
         async with self._lifecycle_lock:
             async with self._lock:
@@ -250,11 +269,19 @@ class MonitorCoordinator:
                             current_generation == accepted_generation
                             and self._state == "stopping"
                         ):
+                            if pending_acquire:
+                                self._pending_owned_generation = (
+                                    request_epoch, accepted_generation
+                                )
                             return current_generation
                         if (
                             current_generation is None
                             and self._recoverable_generation == accepted_generation
                         ):
+                            if pending_acquire:
+                                self._pending_owned_generation = (
+                                    request_epoch, accepted_generation
+                                )
                             return accepted_generation
                         response_revision = response.get("status_revision", 0)
                         if (
@@ -264,10 +291,18 @@ class MonitorCoordinator:
                             and not isinstance(response_revision, bool)
                             and response_revision <= self._status_revision
                         ):
+                            if pending_acquire:
+                                self._pending_owned_generation = (
+                                    request_epoch, accepted_generation
+                                )
                             return current_generation
                         self._set_response_locked(
                             response, allow_generation_change=True
                         )
+                        if pending_acquire:
+                            self._pending_owned_generation = (
+                                request_epoch, accepted_generation
+                            )
                         return accepted_generation
                     if not terminated and current_generation is not None:
                         return current_generation
@@ -297,13 +332,18 @@ class MonitorCoordinator:
         return response
 
     async def _recover_generation(
-        self, request_epoch: int, old_generation: int
+        self, request_epoch: int, old_generation: int, *, pending_acquire: bool = False
     ) -> int:
         """Finish a recoverable stop, then share one newly started generation."""
         async with self._lifecycle_lock:
             async with self._lock:
                 if self._unloaded or request_epoch != self._terminal_epoch:
                     raise RuntimeError("monitor request was terminated")
+                # Source retries must not restart an established shared publication.
+                if self._generation is not None and (
+                    self._publisher_running is True or self.viewer_count != 0
+                ):
+                    return self._generation
                 follow_generation = (
                     self._generation
                     if self._generation is not None
@@ -331,6 +371,7 @@ class MonitorCoordinator:
                         self._generation = None
                         self._state = "idle"
                         self._ready = False
+                        self._publisher_running = None
                         self._leases.clear()
                         self._status_event.set()
 
@@ -376,10 +417,18 @@ class MonitorCoordinator:
                             and not isinstance(response_revision, bool)
                             and response_revision <= self._status_revision
                         ):
+                            if pending_acquire:
+                                self._pending_owned_generation = (
+                                    request_epoch, accepted_generation
+                                )
                             return current_generation
                         self._set_response_locked(
                             response, allow_generation_change=True
                         )
+                        if pending_acquire:
+                            self._pending_owned_generation = (
+                                request_epoch, accepted_generation
+                            )
                         return accepted_generation
                     if not terminated and current_generation is not None:
                         return current_generation
@@ -394,11 +443,15 @@ class MonitorCoordinator:
 
     async def async_acquire_viewer(self) -> MonitorLease:
         """Register one HA viewer and return its generation lease."""
-        async with self._lock:
-            request_epoch = self._terminal_epoch
-            old_generation = self._generation or self._recoverable_generation or 0
+        request_epoch = self._terminal_epoch
+        async with self._acquire_admission_lock:
+            async with self._lock:
+                if self._unloaded or request_epoch != self._terminal_epoch:
+                    raise RuntimeError("monitor request was terminated")
+                old_generation = self._generation or self._recoverable_generation or 0
+                pending = (request_epoch, asyncio.current_task())
+                self._pending_acquires.add(pending)
 
-        started_here = False
         generation: int | None = None
         try:
             while True:
@@ -409,19 +462,17 @@ class MonitorCoordinator:
                     state = self._state
                     recoverable = self._recoverable_generation
                 if generation is None or state in _IDLE_STATES:
-                    started_here = True
                     if recoverable is not None:
                         generation = await self._recover_generation(
-                            request_epoch, old_generation
+                            request_epoch, old_generation, pending_acquire=True
                         )
                     else:
                         generation = await self._start_generation(
-                            request_epoch, old_generation
+                            request_epoch, old_generation, pending_acquire=True
                         )
                 elif state == "stopping":
-                    started_here = True
                     generation = await self._recover_generation(
-                        request_epoch, old_generation
+                        request_epoch, old_generation, pending_acquire=True
                     )
 
                 try:
@@ -450,32 +501,54 @@ class MonitorCoordinator:
                 except _RetryAcquire:
                     old_generation = max(old_generation, generation)
                     continue
-        except asyncio.CancelledError:
-            if started_here and generation is not None:
+        except (asyncio.CancelledError, Exception):
+            async with self._lock:
+                self._pending_acquires.discard(pending)
+                cleanup = (
+                    generation is not None
+                    and self._pending_owned_generation == (request_epoch, generation)
+                    and not any(epoch == request_epoch for epoch, _ in self._pending_acquires)
+                )
+            if cleanup:
                 await asyncio.shield(
                     self._cleanup_cancelled_acquire(generation, request_epoch)
                 )
             raise
+        finally:
+            async with self._lock:
+                self._pending_acquires.discard(pending)
 
     async def _cleanup_cancelled_acquire(
         self, generation: int, request_epoch: int
     ) -> None:
         async with self._lifecycle_lock:
-            async with self._lock:
-                if (
-                    self._generation != generation
-                    or request_epoch != self._terminal_epoch
-                    or self.viewer_count != 0
-                ):
-                    return
-            await self._stop_remote(generation)
-            async with self._lock:
-                if self._generation == generation and self.viewer_count == 0:
-                    self._generation = None
-                    self._state = "idle"
-                    self._ready = False
-                    self._recoverable_generation = None
-                    self._status_event.set()
+            async with self._acquire_admission_lock:
+                async with self._lock:
+                    if (
+                        self._generation != generation
+                        or request_epoch != self._terminal_epoch
+                        or self._pending_owned_generation != (request_epoch, generation)
+                        or any(
+                            epoch == request_epoch
+                            for epoch, _ in self._pending_acquires
+                        )
+                        or self.viewer_count != 0
+                    ):
+                        return
+                await self._stop_remote(generation)
+                async with self._lock:
+                    if (
+                        self._generation == generation
+                        and request_epoch == self._terminal_epoch
+                        and self.viewer_count == 0
+                    ):
+                        self._generation = None
+                        self._state = "idle"
+                        self._ready = False
+                        self._publisher_running = None
+                        self._recoverable_generation = None
+                        self._pending_owned_generation = None
+                        self._status_event.set()
 
     async def _register_lease(
         self, generation: int, request_epoch: int
@@ -511,6 +584,7 @@ class MonitorCoordinator:
                                 self._generation = None
                                 self._state = "idle"
                                 self._ready = False
+                                self._publisher_running = None
                                 self._recoverable_generation = None
                                 self._leases.clear()
                                 self._status_event.set()
@@ -532,6 +606,7 @@ class MonitorCoordinator:
                                 self._generation = None
                                 self._state = "idle"
                                 self._ready = False
+                                self._publisher_running = None
                                 self._leases.clear()
                                 self._status_event.set()
                     raise
@@ -576,6 +651,8 @@ class MonitorCoordinator:
                         generation, self._next_lease_id, self._terminal_epoch
                     )
                     self._leases[lease.lease_id] = lease
+                    if self._pending_owned_generation == (request_epoch, generation):
+                        self._pending_owned_generation = None
                     return lease
             except asyncio.CancelledError:
                 if enable_viewer:
@@ -629,6 +706,7 @@ class MonitorCoordinator:
                 if active_generation is None:
                     self._state = "idle"
                     self._ready = False
+                    self._publisher_running = None
                     self._leases.clear()
                     self._status_event.set()
                     return
@@ -653,6 +731,7 @@ class MonitorCoordinator:
                         self._generation = None
                         self._state = "idle"
                         self._ready = False
+                        self._publisher_running = None
                         self._leases.clear()
                         self._status_event.set()
 
@@ -683,17 +762,21 @@ class MonitorCoordinator:
         generation = self._generation or self._recoverable_generation
         self._terminal_epoch += 1
         self._recoverable_generation = None
+        self._publisher_running = None
         if unload:
             self._unloaded = True
         return generation
 
-    def lease_active(self, lease: MonitorLease) -> bool:
+    def lease_owned(self, lease: MonitorLease) -> bool:
         return (
-            self._leases.get(lease.lease_id) == lease
+            not self._unloaded
+            and self._leases.get(lease.lease_id) == lease
             and self._generation == lease.generation
             and lease.epoch == self._terminal_epoch
-            and self._ready
         )
+
+    def lease_active(self, lease: MonitorLease) -> bool:
+        return self.lease_owned(lease) and self._ready
 
     async def async_apply_status(self, payload: dict[str, Any]) -> None:
         """Apply a validated monitor status or relay event snapshot."""
@@ -777,6 +860,7 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "idle"
                 self._ready = False
+                self._publisher_running = None
                 self._leases.clear()
                 if event == "monitor_stopped" and current_generation is not None:
                     self._recoverable_generation = current_generation
@@ -790,6 +874,7 @@ class MonitorCoordinator:
                 self._generation = None
                 self._state = "failed"
                 self._ready = False
+                self._publisher_running = None
                 self._leases.clear()
                 self._recoverable_generation = None
                 self._status_revision = revision
@@ -802,6 +887,7 @@ class MonitorCoordinator:
                     state if state in {"failed", "unavailable"} else "idle"
                 )
                 self._ready = False
+                self._publisher_running = None
                 self._leases.clear()
                 if state == "stopped" and current_generation is not None:
                     self._recoverable_generation = current_generation
