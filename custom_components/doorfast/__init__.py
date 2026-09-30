@@ -150,7 +150,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         )
 
     async def unlock(call):
-        await service_client(hass, call).unlock(call.data.get("generation"))
+        station_id = call.data.get("station_id")
+        if not isinstance(station_id, str):
+            raise HomeAssistantError("station_id is required")
+        await service_client(hass, call).unlock_station(station_id)
 
     async def call_elevator(call):
         await service_client(hass, call).call_elevator(

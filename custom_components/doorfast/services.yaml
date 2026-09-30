@@ -5,9 +5,9 @@ unlock:
     config_entry_id:
       description: Required only when multiple Doorfast entries are loaded.
       selector: {text: {}}
-    generation:
-      description: Defaults to the generation of the current call.
-      selector: {number: {min: 1}}
+    station_id:
+      required: true
+      selector: {text: {}}
 call_elevator:
   name: Call elevator
   description: Request an elevator in the selected direction.

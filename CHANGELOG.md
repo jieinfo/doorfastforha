@@ -5,6 +5,11 @@
 
 # Changelog
 
+## Unreleased
+
+- Add independent station lock entities and station-scoped unlock requests.
+- Remove `runtime_id` and call `generation` from unlock requests.
+
 ## 0.3.17
 
 - Keep station call controls available when preview or secondary status polling temporarily fails.

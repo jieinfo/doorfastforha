@@ -9,9 +9,9 @@ concurrency.
 
 The integration talks to the Doorfast HTTP bridge at `http://<host>/cgi-bin/doorfast`. The bridge maps requests to the local `ubus` object and exposes `GET /api/v1/status`, `POST /api/v1/unlock`, `/api/v1/answer`, `/api/v1/hangup` and `/api/v1/call_elevator`. Enter the host URL in the setup form; the CGI path is added automatically.
 
-Doorfast status is authoritative for command acceptance, while physical door/elevator confirmation remains a separate status field and is shown as returned by the bridge. The client reads the current 16-character `runtime_id` from status and includes it in answer, hangup, unlock and elevator requests together with the applicable call generation. A daemon restart changes `runtime_id`; cached media state and call-event high-water marks are then discarded so a delayed command or event cannot collide with a reused generation.
+Doorfast status is authoritative for command acceptance, while physical door/elevator confirmation remains a separate status field and is shown as returned by the bridge. Answer and hangup remain bound to the current call generation and runtime. Unlock requests instead carry only the configured `station_id`, so each discovered station has its own lock entity and can be unlocked without an active call. A daemon restart still changes `runtime_id`; cached media state and call-event high-water marks are then discarded so a delayed media or call operation cannot collide with a reused generation.
 
-The lock entity sends a momentary unlock command and remains shown as locked because Doorfast does not yet receive a physical door-position signal. Its attributes expose the protocol state, generation, raw reply status and `physical_result_confirmed` value reported by the bridge.
+Each station lock entity sends a momentary unlock command and remains shown as locked because Doorfast does not yet receive a physical door-position signal. The legacy controller-level lock is retained only for an active incoming call and is unavailable when no station is ringing. Its attributes expose the protocol state, generation, raw reply status and `physical_result_confirmed` value reported by the bridge.
 
 The camera requests snapshots for the current call generation and reuses a
 cached frame only when the Doorfast bridge returns `304 Not Modified` or a
