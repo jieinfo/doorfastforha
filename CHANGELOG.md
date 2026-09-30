@@ -1,3 +1,8 @@
+## 0.3.16
+
+- Add station-scoped active call controls and generation-bound full-duplex audio lifecycle.
+- Improve WebRTC retry, capture cleanup, and station entity lifecycle handling.
+
 # Changelog
 
 ## 0.3.15
