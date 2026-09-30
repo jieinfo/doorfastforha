@@ -125,11 +125,15 @@ class PcmWebSocketManager:
                 self._captures[capture_id] = capture
                 self._by_entry[entry_id] = capture
                 self._attach_cleanup(capture)
-                connection.send_result(msg["id"], {
-                    "capture_id": capture_id,
-                    "state": producer.state.value,
-                    "sequence": producer.sequence,
-                })
+                try:
+                    connection.send_result(msg["id"], {
+                        "capture_id": capture_id,
+                        "state": producer.state.value,
+                        "sequence": producer.sequence,
+                    })
+                except BaseException:
+                    await self.release(capture_id)
+                    raise
             finally:
                 self._starting.discard(entry_id)
         except (ValueError, PcmProducerError) as err:
@@ -145,6 +149,12 @@ class PcmWebSocketManager:
             or msg.get("config_entry_id") != capture.entry_id
         ):
             self._send_error(connection, msg, "not_found", "Unknown capture")
+            return
+        if (
+            ("station_id" in msg and msg.get("station_id") != capture.station_id)
+            or ("generation" in msg and msg.get("generation") != capture.producer.generation)
+        ):
+            self._send_error(connection, msg, "identity_mismatch", "Capture identity does not match active call")
             return
         encoded = msg.get("pcm")
         if not isinstance(encoded, str):
@@ -218,7 +228,7 @@ class PcmWebSocketManager:
         if (
             generation != capture.producer.generation
             or (capture.station_id is not None and station_id != capture.station_id)
-            or (session is not None and session != "talking")
+            or session != "talking"
         ):
             await self.release(capture.capture_id)
 
@@ -233,7 +243,7 @@ async def _start(hass: Any, connection: Any, msg: dict[str, Any]) -> None:
     await manager.start(connection, msg)
 
 
-@websocket_command(({vol.Required("type"): "doorfast/audio/submit", vol.Required("config_entry_id"): str, vol.Required("capture_id"): str, vol.Required("pcm"): str} if vol else {"type": "doorfast/audio/submit"}))
+@websocket_command(({vol.Required("type"): "doorfast/audio/submit", vol.Required("config_entry_id"): str, vol.Required("capture_id"): str, vol.Required("pcm"): str, vol.Optional("station_id"): str, vol.Optional("generation"): int} if vol else {"type": "doorfast/audio/submit"}))
 @async_response
 async def _submit(hass: Any, connection: Any, msg: dict[str, Any]) -> None:
     manager = hass.data.get(f"{DOMAIN}_pcm_ws")

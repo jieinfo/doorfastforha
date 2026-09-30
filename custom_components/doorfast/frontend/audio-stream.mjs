@@ -77,6 +77,7 @@ export class PcmAudioPlayback {
     this.playChunk = options.playChunk ?? (async () => {});
     this.intervalMs = options.intervalMs ?? 250;
     this.isCurrent = options.isCurrent ?? (() => true);
+    this.onError = options.onError ?? (() => {});
     this.timer = null;
     this.epoch = 0;
   }
@@ -86,9 +87,24 @@ export class PcmAudioPlayback {
     const epoch = ++this.epoch;
     const poll = async () => {
       if (epoch !== this.epoch) return;
-      const chunk = await this.fetchChunk(identity);
+      let chunk;
+      try {
+        chunk = await this.fetchChunk(identity);
+      } catch (error) {
+        if (epoch === this.epoch) this.onError(error);
+        this.stop();
+        return;
+      }
       if (epoch !== this.epoch) return;
-      if (chunk && this.isCurrent(identity)) await this.playChunk(chunk, identity);
+      if (chunk && this.isCurrent(identity)) {
+        try {
+          await this.playChunk(chunk, identity);
+        } catch (error) {
+          if (epoch === this.epoch) this.onError(error);
+          this.stop();
+          return;
+        }
+      }
       this.timer = setTimeout(poll, this.intervalMs);
     };
     this.timer = setTimeout(poll, 0);

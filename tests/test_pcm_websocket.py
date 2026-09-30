@@ -87,6 +87,23 @@ class WebsocketOwnershipTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("front", capture.station_id)
         await m.reconcile("one",{"call":{"session":"talking","generation":7,"station_id":"back"}})
         self.assertEqual(1, capture.producer.stopped)
+
+    async def test_submit_rejects_explicit_identity_mismatch(self):
+        import base64
+        m=self.manager(); c=Connection()
+        await m.start(c,{"id":1,"config_entry_id":"one","station_id":"front","generation":7})
+        cid=c.results[0][1]["capture_id"]
+        await m.submit(c,{"id":2,"config_entry_id":"one","capture_id":cid,
+                          "station_id":"back","generation":7,
+                          "pcm":base64.b64encode(FRAME).decode()})
+        self.assertEqual("identity_mismatch", c.errors[-1][1])
+
+    async def test_reconcile_missing_call_releases_capture(self):
+        m=self.manager(); c=Connection()
+        await m.start(c,{"id":1,"config_entry_id":"one"})
+        capture=m._by_entry["one"]
+        await m.reconcile("one",{})
+        self.assertEqual(1, capture.producer.stopped)
     async def test_global_registration_is_idempotent(self):
         calls=[]
         original=ws.async_register_command

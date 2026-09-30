@@ -39,6 +39,13 @@ export class DoorfastPttCard extends HTMLElement {
 
   getCardSize() { return 2; }
 
+  /** Attach an application-owned decoder/output; no browser audio is fabricated here. */
+  setAudioPlayback(playback) {
+    this._audioPlayback?.stop?.();
+    this._audioPlayback = playback ?? null;
+    return this._audioPlayback;
+  }
+
   connectedCallback() {
     document.addEventListener("visibilitychange", this._onVisibility);
     window.addEventListener("blur", this._onBlur);
@@ -140,6 +147,7 @@ export class DoorfastPttCard extends HTMLElement {
       };
       source.connect(node);
       this._setStatus("active");
+      this._audioPlayback?.start?.({ station_id: this._config.station_id, generation: this._config.generation });
     } catch (error) {
       if (captureId) await this._bestEffortStop(captureId, entryId);
       stream?.getTracks().forEach((track) => track.stop());
@@ -156,6 +164,7 @@ export class DoorfastPttCard extends HTMLElement {
 
   async _stop(finalStatus = "idle") {
     const stopEpoch = ++this._epoch;
+    this._audioPlayback?.stop?.();
     const captureId = this._captureId;
     const entryId = this._sessionEntryId;
     this._captureId = null;
