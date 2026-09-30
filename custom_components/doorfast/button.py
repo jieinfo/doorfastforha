@@ -9,10 +9,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
  entities = {}
  def add_station(station_id):
   entities[station_id] = (StationCallButton(c, entry.entry_id, registry.station(station_id), registry.monitor(station_id)), StationHangupButton(c, entry.entry_id, registry.station(station_id), registry.monitor(station_id)))
+  unsubscribe = registry.monitor(station_id).add_listener(lambda _m: [e.async_write_ha_state() for e in entities.get(station_id, ())])
+  for entity in entities[station_id]: entity._unsubscribe_monitor = unsubscribe
   async_add_entities(list(entities[station_id]))
  def remove_station(station_id):
   pair = entities.pop(station_id, ())
-  for entity in pair:
+ for entity in pair:
+   if getattr(entity, "_unsubscribe_monitor", None): entity._unsubscribe_monitor()
    entity.mark_removed()
    entity_id = er.async_get(hass).async_get_entity_id("button", DOMAIN, entity.unique_id)
    if entity_id is not None: er.async_get(hass).async_remove(entity_id)
@@ -53,6 +56,7 @@ class StationButton(ButtonEntity, DoorfastStationEntity):
  def __init__(self,c,entry_id,station,monitor):
   ButtonEntity.__init__(self); DoorfastStationEntity.__init__(self,entry_id,station)
   self.client, self.monitor, self._active = c, monitor, True
+  self._unsubscribe_monitor = None
  @property
  def available(self): return self._active and self.station.enabled and self.client.online
  @property

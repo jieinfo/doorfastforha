@@ -175,6 +175,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         station_id = call.data.get("station_id")
         if not isinstance(station_id, str):
             raise HomeAssistantError("station_id is required")
+        registry = _service_resource(hass, STATIONS_KEY, call)
+        if station_id not in registry.station_ids:
+            raise HomeAssistantError("unknown Doorfast station")
         await service_client(hass, call).call_station(
             station_id,
             call.data.get("primary_media_port", DEFAULT_VIDEO_PORT),
@@ -186,6 +189,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         station_id = call.data.get("station_id")
         if not isinstance(station_id, str):
             raise HomeAssistantError("station_id is required")
+        registry = _service_resource(hass, STATIONS_KEY, call)
+        if station_id not in registry.station_ids:
+            raise HomeAssistantError("unknown Doorfast station")
         await service_client(hass, call).hangup_station(
             station_id, call.data.get("reason", "ha")
         )
