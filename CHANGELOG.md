@@ -5,7 +5,7 @@
 
 # Changelog
 
-## Unreleased
+## 0.3.18
 
 - Add independent station lock entities and station-scoped unlock requests.
 - Remove `runtime_id` and call `generation` from unlock requests.
