@@ -1,13 +1,17 @@
 {
   "domain": "doorfast",
   "name": "Doorfast",
-  "version": "0.3.15",
+  "version": "0.3.16",
   "documentation": "https://github.com/jieinfo/doorfastforha",
   "issue_tracker": "https://github.com/jieinfo/doorfastforha/issues",
   "config_flow": true,
   "iot_class": "local_polling",
   "translation_key": true,
   "requirements": [],
-  "dependencies": ["frontend"],
-  "codeowners": ["@jieinfo"]
+  "dependencies": [
+    "frontend"
+  ],
+  "codeowners": [
+    "@jieinfo"
+  ]
 }
