@@ -51,6 +51,36 @@ hangup:
     reason:
       default: ha
       selector: {text: {}}
+call_station:
+  name: Call station
+  description: Start a call to one configured Doorfast station.
+  fields:
+    config_entry_id:
+      selector: {text: {}}
+    station_id:
+      required: true
+      selector: {text: {}}
+    primary_media_port:
+      default: 8303
+      selector: {number: {min: 1, max: 65535}}
+    secondary_media_port:
+      default: 8302
+      selector: {number: {min: 1, max: 65535}}
+    duration_seconds:
+      default: 120
+      selector: {number: {min: 1, max: 255}}
+hangup_station:
+  name: Hang up station
+  description: Hang up one configured Doorfast station.
+  fields:
+    config_entry_id:
+      selector: {text: {}}
+    station_id:
+      required: true
+      selector: {text: {}}
+    reason:
+      default: ha
+      selector: {text: {}}
 start_monitor:
   name: Start station monitor
   description: Start the selected Doorfast station preview.

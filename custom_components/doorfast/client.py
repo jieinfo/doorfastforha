@@ -124,6 +124,30 @@ class DoorfastClient:
     async def hangup(self, generation=None, reason="ha"):
         generation = resolve_generation(self.status, generation)
         return await self._request("POST", "/api/v1/hangup", {"runtime_id": self._control_runtime_id(), "generation": generation, "reason": reason})
+    async def call_station(self, station_id: str, primary_media_port=DEFAULT_VIDEO_PORT,
+                           secondary_media_port=DEFAULT_AUDIO_PORT,
+                           duration_seconds=DEFAULT_CALL_DURATION):
+        station_id = require_station_id(station_id)
+        for value, name in ((primary_media_port, "primary_media_port"),
+                            (secondary_media_port, "secondary_media_port"),
+                            (duration_seconds, "duration_seconds")):
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        return await self._request("POST", "/api/v1/call", {
+            "runtime_id": self._control_runtime_id(), "station_id": station_id,
+            "primary_media_port": primary_media_port,
+            "secondary_media_port": secondary_media_port,
+            "duration_seconds": duration_seconds,
+        })
+
+    async def hangup_station(self, station_id: str, reason="ha"):
+        station_id = require_station_id(station_id)
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be non-empty text")
+        return await self._request("POST", "/api/v1/hangup", {
+            "runtime_id": self._control_runtime_id(), "station_id": station_id,
+            "reason": reason,
+        })
     async def call_elevator(self, direction="up"):
         if direction not in {"up", "down"}: raise ValueError("direction must be up or down")
         return await self._request("POST", "/api/v1/call_elevator", {"runtime_id": self._control_runtime_id(), "direction": direction})
