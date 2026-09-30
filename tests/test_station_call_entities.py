@@ -22,7 +22,14 @@ ha_entity.Entity = object
 sys.modules.setdefault("homeassistant.helpers", types.ModuleType("homeassistant.helpers"))
 sys.modules["homeassistant.helpers.entity"] = ha_entity
 entity_registry = types.ModuleType("homeassistant.helpers.entity_registry")
-entity_registry.async_get = lambda hass: types.SimpleNamespace()
+class _EntityRegistry:
+    def async_get_entity_id(self, _domain, _platform, _unique_id):
+        return None
+
+    def async_remove(self, _entity_id):
+        return None
+
+entity_registry.async_get = lambda hass: _EntityRegistry()
 sys.modules["homeassistant.helpers.entity_registry"] = entity_registry
 sys.modules["homeassistant.helpers"].entity_registry = entity_registry
 package = types.ModuleType("custom_components.doorfast")

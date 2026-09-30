@@ -94,6 +94,10 @@ const_module = load_component("const")
 load_component("generation")
 load_component("station_entity")
 binary_sensor = load_component("binary_sensor")
+# Other isolated test modules install their own fake entity-registry module
+# during collection; bind this module to the registry owned by this test so
+# full-suite import order cannot change the assertion target.
+binary_sensor.er = entity_registry_module
 
 DoorfastStation = client_types.DoorfastStation
 DoorfastStationReachability = binary_sensor.DoorfastStationReachability
