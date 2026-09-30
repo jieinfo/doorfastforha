@@ -112,11 +112,15 @@ class DoorfastClient:
             raise ValueError("Doorfast status has no valid runtime_id")
         return runtime_id
 
-    async def unlock(self, generation=None):
-        generation = resolve_generation(self.status, generation)
+    async def unlock(self, station_id: str | None = None):
+        if station_id is None:
+            call = self.status.get("call")
+            station_id = call.get("station_id") if isinstance(call, dict) else None
+        return await self.unlock_station(station_id)
+
+    async def unlock_station(self, station_id: str):
         return await self._request("POST", "/api/v1/unlock", {
-            "runtime_id": self._control_runtime_id(),
-            "generation": generation,
+            "station_id": require_station_id(station_id),
         })
     async def answer(self, generation=None, primary_media_port=DEFAULT_VIDEO_PORT, secondary_media_port=DEFAULT_AUDIO_PORT, duration_seconds=DEFAULT_CALL_DURATION):
         generation = resolve_generation(self.status, generation)

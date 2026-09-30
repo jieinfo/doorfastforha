@@ -179,7 +179,7 @@ class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
         client = DoorfastClient.__new__(DoorfastClient)
         client.status = {
             "runtime_id": "0123456789abcdef",
-            "call": {"generation": 7},
+            "call": {"generation": 7, "station_id": "gate_main"},
         }
         client._request = AsyncMock(return_value={"queued": True})
 
@@ -213,7 +213,7 @@ class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
                 call(
                     "POST",
                     "/api/v1/unlock",
-                    {"runtime_id": "0123456789abcdef", "generation": 7},
+                    {"station_id": "gate_main"},
                 ),
                 call(
                     "POST",
@@ -239,12 +239,18 @@ class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(ValueError):
                     await client.hangup()
                 with self.assertRaises(ValueError):
-                    await client.unlock()
-                with self.assertRaises(ValueError):
                     await client.call_elevator()
-
         client._request.assert_not_awaited()
 
+    async def test_station_unlock_does_not_require_runtime_id_or_generation(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.status = {}
+        client._request = AsyncMock(return_value={"submitted": True})
+
+        self.assertEqual({"submitted": True}, await client.unlock_station("gate_main"))
+        client._request.assert_awaited_once_with(
+            "POST", "/api/v1/unlock", {"station_id": "gate_main"}
+        )
 
 class MonitorPayloadTest(unittest.IsolatedAsyncioTestCase):
     async def test_uses_exact_monitor_endpoints_and_payloads(self):
