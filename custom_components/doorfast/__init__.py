@@ -46,6 +46,8 @@ SERVICE_NAMES = (
     "call_elevator",
     "answer",
     "hangup",
+    "call_station",
+    "hangup_station",
     "start_monitor",
     "stop_monitor",
 )
@@ -169,6 +171,31 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             call.data.get("generation"), call.data.get("reason", "ha")
         )
 
+    async def call_station(call):
+        station_id = call.data.get("station_id")
+        if not isinstance(station_id, str):
+            raise HomeAssistantError("station_id is required")
+        registry = _service_resource(hass, STATIONS_KEY, call)
+        if station_id not in registry.station_ids:
+            raise HomeAssistantError("unknown Doorfast station")
+        await service_client(hass, call).call_station(
+            station_id,
+            call.data.get("primary_media_port", DEFAULT_VIDEO_PORT),
+            call.data.get("secondary_media_port", DEFAULT_AUDIO_PORT),
+            call.data.get("duration_seconds", DEFAULT_CALL_DURATION),
+        )
+
+    async def hangup_station(call):
+        station_id = call.data.get("station_id")
+        if not isinstance(station_id, str):
+            raise HomeAssistantError("station_id is required")
+        registry = _service_resource(hass, STATIONS_KEY, call)
+        if station_id not in registry.station_ids:
+            raise HomeAssistantError("unknown Doorfast station")
+        await service_client(hass, call).hangup_station(
+            station_id, call.data.get("reason", "ha")
+        )
+
     async def start_monitor(call):
         registry = _service_resource(hass, STATIONS_KEY, call)
         station_id = call.data.get("station_id")
@@ -219,6 +246,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             ("call_elevator", call_elevator),
             ("answer", answer),
             ("hangup", hangup),
+            ("call_station", call_station),
+            ("hangup_station", hangup_station),
             ("start_monitor", start_monitor),
             ("stop_monitor", stop_monitor),
         )

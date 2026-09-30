@@ -61,6 +61,8 @@ class MonitorCoordinator:
         self._pending_acquires: set[tuple[int, asyncio.Task[Any]]] = set()
         self._pending_owned_generation: tuple[int, int] | None = None
         self._state = "idle"
+        self._call_state = "idle"
+        self._call_error: str | None = None
         self._ready = False
         self._publisher_running: bool | None = None
         self._next_lease_id = 0
@@ -69,6 +71,15 @@ class MonitorCoordinator:
         self._status_revision = 0
         self._unloaded = False
         self._status_event = asyncio.Event()
+        self._listeners: set[Any] = set()
+
+    def add_listener(self, listener):
+        self._listeners.add(listener)
+        return lambda: self._listeners.discard(listener)
+
+    def _notify(self):
+        for listener in tuple(self._listeners):
+            listener(self)
 
     @property
     def generation(self) -> int | None:
@@ -77,6 +88,14 @@ class MonitorCoordinator:
     @property
     def state(self) -> str:
         return self._state
+
+    @property
+    def call_state(self) -> str:
+        return self._call_state
+
+    @property
+    def call_error(self) -> str | None:
+        return self._call_error
 
     @property
     def ready(self) -> bool:
@@ -106,7 +125,36 @@ class MonitorCoordinator:
             "ready": self._ready,
             "viewer_count": self.viewer_count,
             "status_revision": self._status_revision,
+            "call_state": self._call_state,
+            "call_error": self._call_error,
         }
+
+    async def async_call(self) -> dict[str, Any]:
+        self._call_state, self._call_error = "calling", None
+        self._notify()
+        try:
+            response = await self._client.call_station(self.station_id)
+            if not isinstance(response, dict):
+                raise ValueError("Doorfast station call returned a non-object")
+            state = response.get("state", response.get("session", "calling"))
+            self._call_state = state if isinstance(state, str) else "calling"
+            self._notify()
+            return response
+        except Exception as error:
+            self._call_state, self._call_error = "failed", str(error)
+            self._notify()
+            raise
+
+    async def async_hangup(self) -> dict[str, Any]:
+        try:
+            response = await self._client.hangup_station(self.station_id)
+            self._call_state, self._call_error = "idle", None
+            self._notify()
+            return response
+        except Exception as error:
+            self._call_state, self._call_error = "failed", str(error)
+            self._notify()
+            raise
 
     @staticmethod
     def _response_generation(response: dict[str, Any]) -> int:
@@ -818,6 +866,16 @@ class MonitorCoordinator:
             and generation not in (None, 0, current_generation)
         ):
             raise ValueError("monitor status generation does not match coordinator")
+        call = merged.get("call")
+        if isinstance(call, dict):
+            call_state = call.get("session", call.get("state"))
+            if isinstance(call_state, str): self._call_state = call_state
+            call_error = call.get("error")
+            self._call_error = call_error if isinstance(call_error, str) else None
+        elif isinstance(merged.get("call_state"), str):
+            self._call_state = merged["call_state"]
+            self._call_error = merged.get("call_error") if isinstance(merged.get("call_error"), str) else None
+        self._notify()
 
         terminal_event = event in {"monitor_preempted", "monitor_failed"}
         if state == "failed":

@@ -125,6 +125,56 @@ def audio_client(*responses):
 
 
 class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_station_call_and_form_hangup_bind_runtime_and_station(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.status = {"runtime_id": "0123456789abcdef", "call": {"generation": 7}}
+        client._request = AsyncMock(side_effect=[{"state": "calling"}, {"state": "idle"}])
+
+        self.assertEqual(
+            {"state": "calling"},
+            await client.call_station("gate_main", duration_seconds=45),
+        )
+        self.assertEqual(
+            {"state": "idle"}, await client.hangup_station("gate_main", reason="ha")
+        )
+        self.assertEqual(
+            [
+                call(
+                    "POST",
+                    "/api/v1/call",
+                    {
+                        "runtime_id": "0123456789abcdef",
+                        "station_id": "gate_main",
+                        "primary_media_port": 8303,
+                        "secondary_media_port": 8302,
+                        "duration_seconds": 45,
+                    },
+                ),
+                call(
+                    "POST",
+                    "/api/v1/hangup",
+                    {
+                        "runtime_id": "0123456789abcdef",
+                        "station_id": "gate_main",
+                        "reason": "ha",
+                    },
+                ),
+            ],
+            client._request.await_args_list,
+        )
+
+    async def test_station_controls_reject_invalid_station_and_duration(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.status = {"runtime_id": "0123456789abcdef"}
+        client._request = AsyncMock()
+        for station_id in ("Gate-main", "", None):
+            with self.assertRaises(ValueError):
+                await client.call_station(station_id)
+            with self.assertRaises(ValueError):
+                await client.hangup_station(station_id)
+        with self.assertRaises(ValueError):
+            await client.call_station("gate_main", duration_seconds=0)
+        client._request.assert_not_awaited()
     async def test_binds_all_controls_to_current_runtime(self):
         client = DoorfastClient.__new__(DoorfastClient)
         client.status = {

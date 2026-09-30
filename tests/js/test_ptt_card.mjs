@@ -35,3 +35,11 @@ test("configuration changes stop an old capture with its stored entry identity",
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.deepEqual(calls, [{ type: "doorfast/audio/stop", config_entry_id: "old", capture_id: "opaque" }]);
 });
+
+test("audio playback is an explicit lifecycle hook", async () => {
+  const card = new DoorfastPttCard();
+  let stopped = 0;
+  card.setAudioPlayback({ start: () => {}, stop: () => { stopped += 1; } });
+  card.setAudioPlayback(null);
+  assert.equal(stopped, 1);
+});
