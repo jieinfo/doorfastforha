@@ -39,6 +39,7 @@ from .setup_lifecycle import rollback_entry_setup, sync_monitor_state
 from .stations import StationRegistryCoordinator
 from .webrtc import DoorfastWebRTCProvider
 from .websocket import PcmWebSocketManager
+from .polling import async_poll
 
 
 SERVICE_NAMES = (
@@ -139,13 +140,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         await pcm_ws.reconcile(entry.entry_id, client.status)
 
     async def poll(_now=None):
-        try:
-            await client.refresh()
-            await station_registry.async_refresh()
-            await sync_current_monitor()
-            await dispatch_status()
-        except Exception:
-            client.online = False
+        await async_poll(
+            client,
+            client.refresh,
+            station_registry.async_refresh,
+            sync_current_monitor,
+            dispatch_status,
+            _LOGGER,
+        )
 
     async def unlock(call):
         await service_client(hass, call).unlock(call.data.get("generation"))
