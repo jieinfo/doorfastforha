@@ -17,8 +17,13 @@ export class DoorfastPttCard extends HTMLElement {
     if (!config?.config_entry_id || typeof config.config_entry_id !== "string") {
       throw new Error("Doorfast PTT requires config_entry_id");
     }
-    const next = { config_entry_id: config.config_entry_id, name: config.name ?? "Doorfast Push to Talk" };
-    if (this._config?.config_entry_id === next.config_entry_id && this._config?.name === next.name) return;
+    const next = {
+      config_entry_id: config.config_entry_id,
+      station_id: config.station_id,
+      generation: config.generation,
+      name: config.name ?? "Doorfast Push to Talk",
+    };
+    if (this._config?.config_entry_id === next.config_entry_id && this._config?.station_id === next.station_id && this._config?.generation === next.generation && this._config?.name === next.name) return;
     if (this._config) this._stop();
     this._config = next;
     this._render();
@@ -109,7 +114,10 @@ export class DoorfastPttCard extends HTMLElement {
       if (epoch !== this._epoch) { stream.getTracks().forEach((track) => track.stop()); return; }
       this._stream = stream;
       for (const track of stream.getTracks()) track.addEventListener("ended", () => this._stop(), { once: true });
-      const opened = await this._hass.callWS({ type: "doorfast/audio/start", config_entry_id: entryId });
+      const startMessage = { type: "doorfast/audio/start", config_entry_id: entryId };
+      if (this._config.station_id) startMessage.station_id = this._config.station_id;
+      if (this._config.generation) startMessage.generation = this._config.generation;
+      const opened = await this._hass.callWS(startMessage);
       captureId = opened.capture_id;
       if (epoch !== this._epoch) {
         await this._bestEffortStop(captureId, entryId); return;
@@ -121,6 +129,8 @@ export class DoorfastPttCard extends HTMLElement {
       this._source = source; this._worklet = node;
       this._sender = new PcmBatchSender(this._hass.callWS.bind(this._hass), entryId, captureId, {
         maxQueuedFrames: 5,
+        stationId: this._config.station_id,
+        generation: this._config.generation,
         onError: () => this._stop("error: audio connection lost"),
       });
       node.port.onmessage = ({ data }) => {

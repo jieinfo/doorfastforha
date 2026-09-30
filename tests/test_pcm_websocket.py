@@ -79,6 +79,14 @@ class WebsocketOwnershipTest(unittest.IsolatedAsyncioTestCase):
         await c.disconnect(); self.assertEqual(1,prod.stopped); self.assertNotIn("one",m._by_entry)
         await m.start(c,{"id":2,"config_entry_id":"one"}); prod=m._by_entry["one"].producer
         await m.reconcile("one",{"call":{"generation":8}}); self.assertEqual(1,prod.stopped)
+
+    async def test_station_start_and_hangup_reconcile_release_capture(self):
+        m=self.manager(); c=Connection()
+        await m.start(c,{"id":1,"config_entry_id":"one","station_id":"front","generation":7})
+        capture=m._by_entry["one"]
+        self.assertEqual("front", capture.station_id)
+        await m.reconcile("one",{"call":{"session":"talking","generation":7,"station_id":"back"}})
+        self.assertEqual(1, capture.producer.stopped)
     async def test_global_registration_is_idempotent(self):
         calls=[]
         original=ws.async_register_command

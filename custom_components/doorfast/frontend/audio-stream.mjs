@@ -13,6 +13,8 @@ export class PcmBatchSender {
     this.callWS = callWS;
     this.configEntryId = configEntryId;
     this.captureId = captureId;
+    this.stationId = options.stationId ?? null;
+    this.generation = options.generation ?? null;
     this.maxQueuedFrames = options.maxQueuedFrames ?? 5;
     this.onError = options.onError ?? (() => {});
     this.queue = [];
@@ -45,12 +47,15 @@ export class PcmBatchSender {
   async #pump(epoch) {
     while (epoch === this.epoch && this.queue.length) {
       const frames = this.queue.splice(0, 5);
-      await this.callWS({
+      const message = {
         type: "doorfast/audio/submit",
         config_entry_id: this.configEntryId,
         capture_id: this.captureId,
         pcm: encodeFrames(frames),
-      });
+      };
+      if (this.stationId !== null) message.station_id = this.stationId;
+      if (this.generation !== null) message.generation = this.generation;
+      await this.callWS(message);
     }
   }
 
@@ -62,5 +67,36 @@ export class PcmBatchSender {
   async drain() {
     if (this.pumpPromise) await this.pumpPromise;
     if (this.lastError) throw this.lastError;
+  }
+}
+
+/** Poll existing latest-audio snapshots and discard stale call generations. */
+export class PcmAudioPlayback {
+  constructor(fetchChunk, options = {}) {
+    this.fetchChunk = fetchChunk;
+    this.playChunk = options.playChunk ?? (async () => {});
+    this.intervalMs = options.intervalMs ?? 250;
+    this.isCurrent = options.isCurrent ?? (() => true);
+    this.timer = null;
+    this.epoch = 0;
+  }
+
+  start(identity = {}) {
+    this.stop();
+    const epoch = ++this.epoch;
+    const poll = async () => {
+      if (epoch !== this.epoch) return;
+      const chunk = await this.fetchChunk(identity);
+      if (epoch !== this.epoch) return;
+      if (chunk && this.isCurrent(identity)) await this.playChunk(chunk, identity);
+      this.timer = setTimeout(poll, this.intervalMs);
+    };
+    this.timer = setTimeout(poll, 0);
+  }
+
+  stop() {
+    this.epoch += 1;
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
   }
 }

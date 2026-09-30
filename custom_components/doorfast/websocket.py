@@ -40,6 +40,7 @@ class _Capture:
     connection: Any
     producer: PcmProducer
     capture_id: str
+    station_id: str | None = None
 
 
 class PcmWebSocketManager:
@@ -104,11 +105,23 @@ class PcmWebSocketManager:
             if entry_id in self._by_entry or entry_id in self._starting:
                 raise PcmProducerError("producer_busy")
             self._starting.add(entry_id)
-            producer = self.producer_factory(client)
+            station_id = msg.get("station_id")
+            generation = msg.get("generation")
+            if station_id is not None and (not isinstance(station_id, str) or not station_id):
+                raise ValueError("station_id must be non-empty text")
+            if generation is not None and (
+                isinstance(generation, bool) or not isinstance(generation, int) or generation <= 0
+            ):
+                raise ValueError("generation must be a positive integer")
+            try:
+                producer = self.producer_factory(client, station_id, generation)
+            except TypeError:
+                # Keep compatibility with custom factories used by older HA setups.
+                producer = self.producer_factory(client)
             try:
                 await producer.start()
                 capture_id = secrets.token_urlsafe(24)
-                capture = _Capture(entry_id, connection, producer, capture_id)
+                capture = _Capture(entry_id, connection, producer, capture_id, station_id)
                 self._captures[capture_id] = capture
                 self._by_entry[entry_id] = capture
                 self._attach_cleanup(capture)
@@ -200,11 +213,17 @@ class PcmWebSocketManager:
             return
         call = status.get("call") if isinstance(status, dict) else None
         generation = call.get("generation") if isinstance(call, dict) else None
-        if generation != capture.producer.generation:
+        station_id = call.get("station_id") if isinstance(call, dict) else None
+        session = call.get("session") if isinstance(call, dict) else None
+        if (
+            generation != capture.producer.generation
+            or (capture.station_id is not None and station_id != capture.station_id)
+            or (session is not None and session != "talking")
+        ):
             await self.release(capture.capture_id)
 
 
-@websocket_command(({vol.Required("type"): "doorfast/audio/start", vol.Required("config_entry_id"): str} if vol else {"type": "doorfast/audio/start"}))
+@websocket_command(({vol.Required("type"): "doorfast/audio/start", vol.Required("config_entry_id"): str, vol.Optional("station_id"): str, vol.Optional("generation"): int} if vol else {"type": "doorfast/audio/start"}))
 @async_response
 async def _start(hass: Any, connection: Any, msg: dict[str, Any]) -> None:
     manager = hass.data.get(f"{DOMAIN}_pcm_ws")

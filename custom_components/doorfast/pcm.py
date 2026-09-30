@@ -92,7 +92,7 @@ def _u64(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _UINT64_MAX
 
 
-def _status_identity(value: object) -> tuple[str, int]:
+def _status_identity(value: object, station_id: str | None = None) -> tuple[str, int]:
     if not isinstance(value, dict):
         raise PcmProducerError("status_invalid")
     runtime = value.get("runtime_id")
@@ -106,6 +106,7 @@ def _status_identity(value: object) -> tuple[str, int]:
     ):
         raise PcmProducerError("status_invalid")
     generation = call.get("generation")
+    actual_station = call.get("station_id")
     audio_generation = audio_tx.get("generation")
     if (
         call.get("session") != "talking"
@@ -114,6 +115,7 @@ def _status_identity(value: object) -> tuple[str, int]:
         or audio_tx.get("active") is not True
         or not _u64(audio_generation)
         or audio_generation != generation
+        or (station_id is not None and actual_station != station_id)
     ):
         raise PcmProducerError("status_not_ready")
     return runtime, generation
@@ -141,8 +143,11 @@ def _common_payload(reply: PcmHttpReply) -> tuple[dict[str, Any], str, int, int,
 class PcmProducer:
     """Own one private Doorfast producer lease and never retain PCM bodies."""
 
-    def __init__(self, client: _Client):
+    def __init__(self, client: _Client, station_id: str | None = None,
+                 generation: int | None = None):
         self._client = client
+        self.station_id = station_id
+        self.expected_generation = generation
         self._lock = asyncio.Lock()
         self.state = PcmProducerState.IDLE
         self._runtime: str | None = None
@@ -171,7 +176,10 @@ class PcmProducer:
 
     async def _fresh_identity(self) -> tuple[str, int]:
         status = await self._client.refresh()
-        return _status_identity(status)
+        runtime, generation = _status_identity(status, self.station_id)
+        if self.expected_generation is not None and generation != self.expected_generation:
+            raise PcmProducerError("generation_mismatch")
+        return runtime, generation
 
     def _require_identity(self) -> tuple[str, int, str]:
         if self._runtime is None or self._generation is None or self._token is None:
