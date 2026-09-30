@@ -5,6 +5,10 @@
 
 # Changelog
 
+## 0.3.17
+
+- Keep station call controls available when preview or secondary status polling temporarily fails.
+
 ## 0.3.15
 
 - Preserve the Home Assistant WebRTC preview while Doorfast temporarily has no source frames.
