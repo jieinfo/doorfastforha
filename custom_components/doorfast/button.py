@@ -1,3 +1,5 @@
+import inspect
+
 from homeassistant.components.button import ButtonEntity
 from homeassistant.helpers import entity_registry as er
 from .const import DOMAIN, MANUFACTURER, STATIONS_KEY, SW_VERSION
@@ -9,16 +11,27 @@ async def async_setup_entry(hass, entry, async_add_entities):
  entities = {}
  def add_station(station_id):
   entities[station_id] = (StationCallButton(c, entry.entry_id, registry.station(station_id), registry.monitor(station_id)), StationHangupButton(c, entry.entry_id, registry.station(station_id), registry.monitor(station_id)))
-  unsubscribe = registry.monitor(station_id).add_listener(lambda _m: [e.async_write_ha_state() for e in entities.get(station_id, ())])
+  def update_states(_monitor):
+   for entity in entities.get(station_id, ()):
+    result = entity.async_write_ha_state()
+    if inspect.isawaitable(result):
+     hass.async_create_task(result)
+  unsubscribe = registry.monitor(station_id).add_listener(update_states)
   for entity in entities[station_id]: entity._unsubscribe_monitor = unsubscribe
   async_add_entities(list(entities[station_id]))
  def remove_station(station_id):
   pair = entities.pop(station_id, ())
- for entity in pair:
-   if getattr(entity, "_unsubscribe_monitor", None): entity._unsubscribe_monitor()
+  if not pair:
+   return
+  unsubscribe = getattr(pair[0], "_unsubscribe_monitor", None)
+  if unsubscribe:
+   unsubscribe()
+  entity_registry = er.async_get(hass)
+  for entity in pair:
+   entity._unsubscribe_monitor = None
    entity.mark_removed()
-   entity_id = er.async_get(hass).async_get_entity_id("button", DOMAIN, entity.unique_id)
-   if entity_id is not None: er.async_get(hass).async_remove(entity_id)
+   entity_id = entity_registry.async_get_entity_id("button", DOMAIN, entity.unique_id)
+   if entity_id is not None: entity_registry.async_remove(entity_id)
    hass.async_create_task(entity.async_remove(force_remove=True))
  def listener(event, station_id):
   if event == "added": add_station(station_id)
