@@ -141,6 +141,7 @@ class FakeCoordinator:
         self.leases = list(leases or [MonitorLease(generation, 1, 0)])
         self.released_leases = []
         self._active_leases = set()
+        self.acquire_wait_ready = []
 
     @property
     def released(self):
@@ -150,7 +151,8 @@ class FakeCoordinator:
     def lease(self):
         return self.leases[min(self.acquired - 1, len(self.leases) - 1)]
 
-    async def async_acquire_viewer(self):
+    async def async_acquire_viewer(self, *, wait_ready=True):
+        self.acquire_wait_ready.append(wait_ready)
         self.acquired += 1
         lease = self.leases[min(self.acquired - 1, len(self.leases) - 1)]
         self._active_leases.add(lease)
@@ -219,6 +221,19 @@ def source(station_id, entry_id="entry-1"):
 
 
 class ProviderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_offer_acquires_provisional_lease_before_monitor_ready(self):
+        websocket = FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(websocket))
+        registry.monitors["gate_main"].ready = False
+        await websocket.incoming.put({"type": "webrtc/answer", "value": "answer"})
+
+        await provider.async_handle_async_webrtc_offer(
+            FakeCamera(source("gate_main")), "offer", "provisional", lambda _: None
+        )
+
+        self.assertEqual([False], registry.monitors["gate_main"].acquire_wait_ready)
+        await provider.async_close_entry()
+
     async def test_prefixed_producer_error_retries_without_releasing_viewer(self):
         first, second = FakeWebSocket(), FakeWebSocket()
         provider, registry = self.make_provider(FakeSession(first, second))
@@ -849,25 +864,26 @@ class ProviderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, registry.monitors["gate_main"].acquired)
         self.assertNotIn("removed", provider._negotiations)
 
-    async def test_wait_ready_identity_error_is_visible_and_releases_once(self):
+    async def test_provisional_preview_does_not_require_wait_ready_identity(self):
         class InvalidatedCoordinator(FakeCoordinator):
             async def async_wait_ready(self, generation, timeout=10):
                 raise RuntimeError("monitor generation is no longer ready")
 
         registry = FakeRegistry()
         registry.monitors["gate_main"] = InvalidatedCoordinator(9)
-        session = FakeSession()
+        websocket = FakeWebSocket()
+        session = FakeSession(websocket)
         provider = DoorfastWebRTCProvider(
             FakeHass(), "entry-1", registry, "http://127.0.0.1:1984", session
         )
-        with self.assertRaises(HomeAssistantError) as context:
-            await provider.async_handle_async_webrtc_offer(
-                FakeCamera(source("gate_main")), "offer", "wait-invalid", lambda _: None
-            )
-        self.assertIsInstance(context.exception.__cause__, RuntimeError)
+        await websocket.incoming.put({"type": "webrtc/answer", "value": "answer"})
+        await provider.async_handle_async_webrtc_offer(
+            FakeCamera(source("gate_main")), "offer", "wait-invalid", lambda _: None
+        )
+        self.assertEqual(1, len(session.urls))
+        self.assertEqual(0, registry.monitors["gate_main"].released)
+        await provider.async_close_entry()
         self.assertEqual(1, registry.monitors["gate_main"].released)
-        self.assertEqual([], session.urls)
-        self.assertNotIn("wait-invalid", provider._negotiations)
 
     async def test_close_session_interrupts_long_retry_sleep(self):
         websocket = FakeWebSocket()
