@@ -219,6 +219,62 @@ def source(station_id, entry_id="entry-1"):
 
 
 class ProviderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_prefixed_producer_error_retries_without_releasing_viewer(self):
+        first, second = FakeWebSocket(), FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(first, second))
+        await first.incoming.put({"type": "error", "value": "webrtc/offer: streams: unknown error"})
+        await second.incoming.put({"type": "webrtc/answer", "value": "answer"})
+        try:
+            with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
+                await provider.async_handle_async_webrtc_offer(
+                    FakeCamera(source("gate_main")), "offer", "prefixed", lambda _: None
+                )
+            self.assertEqual(2, len(provider._session.urls))
+            self.assertEqual(0, registry.monitors["gate_main"].released)
+        finally:
+            await provider.async_close_entry()
+
+    async def test_early_candidates_replayed_after_offer_on_each_attempt(self):
+        first, second = FakeWebSocket(), FakeWebSocket()
+        provider, registry = self.make_provider(FakeSession(first, second))
+        ready = asyncio.Event()
+
+        async def wait_ready(generation, timeout=None):
+            await ready.wait()
+
+        registry.monitors["gate_main"].async_wait_ready = wait_ready
+        task = asyncio.create_task(provider.async_handle_async_webrtc_offer(
+            FakeCamera(source("gate_main")), "offer", "early", lambda _: None
+        ))
+        for _ in range(20):
+            if "early" in provider._negotiations:
+                break
+            await asyncio.sleep(0)
+        self.assertIn("early", provider._negotiations)
+        await provider.async_on_webrtc_candidate("early", RTCIceCandidateInit("candidate-a"))
+        await provider.async_on_webrtc_candidate("unknown", RTCIceCandidateInit("unowned"))
+        await first.incoming.put({"type": "error", "value": "not ready"})
+        await second.incoming.put({"type": "webrtc/answer", "value": "answer"})
+        try:
+            with patch.object(webrtc_module, "_NEGOTIATION_RETRY_DELAY", 0):
+                ready.set()
+                await asyncio.wait_for(task, 2)
+            for websocket in (first, second):
+                self.assertEqual([
+                    {"type": "webrtc/offer", "value": "offer"},
+                    {"type": "webrtc/candidate", "value": "candidate-a"},
+            ], websocket.sent)
+            await provider.async_on_webrtc_candidate("early", RTCIceCandidateInit("candidate-b"))
+            self.assertEqual({"type": "webrtc/candidate", "value": "candidate-b"}, second.sent[-1])
+            provider.async_close_session("early")
+            await provider.async_close_entry()
+            await provider.async_on_webrtc_candidate("early", RTCIceCandidateInit("closed"))
+            self.assertNotIn({"type": "webrtc/candidate", "value": "closed"}, second.sent)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await provider.async_close_entry()
+
     async def test_reconcile_retries_eof_release_failure_with_owned_live_lease(self):
         class FlakyClient:
             def __init__(self):
