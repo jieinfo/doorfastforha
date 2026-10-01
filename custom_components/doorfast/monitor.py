@@ -18,6 +18,7 @@ class MonitorLease:
     generation: int
     lease_id: int
     epoch: int
+    viewer_edge_enabled: bool = True
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -489,8 +490,44 @@ class MonitorCoordinator:
             await self._stop_remote(accepted_generation)
             raise RuntimeError("monitor request was terminated")
 
-    async def async_acquire_viewer(self) -> MonitorLease:
-        """Register one HA viewer and return its generation lease."""
+    async def _register_provisional_lease(
+        self, generation: int, request_epoch: int
+    ) -> MonitorLease:
+        """Register a preview lease before the publisher reports ready.
+
+        Preview monitors are persistent on Doorfast, so the remote viewer edge
+        must not be toggled until the generation is ready.  The local lease
+        still protects the generation from cleanup while WebRTC waits for its
+        producer to appear.
+        """
+        async with self._lifecycle_lock:
+            async with self._lock:
+                if (
+                    self._unloaded
+                    or request_epoch != self._terminal_epoch
+                    or self._generation != generation
+                    or self._state in _IDLE_STATES
+                    or self._state == "stopping"
+                ):
+                    raise _RetryAcquire
+                self._next_lease_id += 1
+                lease = MonitorLease(
+                    generation, self._next_lease_id, self._terminal_epoch, False
+                )
+                self._leases[lease.lease_id] = lease
+                if self._pending_owned_generation == (request_epoch, generation):
+                    self._pending_owned_generation = None
+                return lease
+
+    async def async_acquire_viewer(
+        self, *, wait_ready: bool = True
+    ) -> MonitorLease:
+        """Register one HA viewer and return its generation lease.
+
+        WebRTC previews may request a provisional local lease while the station
+        is still starting.  Other callers retain the original ready-gated
+        behavior by default.
+        """
         request_epoch = self._terminal_epoch
         async with self._acquire_admission_lock:
             async with self._lock:
@@ -522,6 +559,18 @@ class MonitorCoordinator:
                     generation = await self._recover_generation(
                         request_epoch, old_generation, pending_acquire=True
                     )
+
+                if not wait_ready:
+                    async with self._lock:
+                        ready = self._ready and self._state not in _IDLE_STATES | {"stopping"}
+                    if not ready:
+                        try:
+                            return await self._register_provisional_lease(
+                                generation, request_epoch
+                            )
+                        except _RetryAcquire:
+                            old_generation = max(old_generation, generation)
+                            continue
 
                 try:
                     await self.async_wait_ready(generation)
@@ -718,16 +767,17 @@ class MonitorCoordinator:
             if self.viewer_count != 0 or generation is None or lease.generation != generation:
                 return
             self._cancel_grace_locked()
-        try:
-            async with self._lifecycle_lock:
-                await self._client.set_monitor_viewer(
-                    self.runtime_id, self.station_id, generation, False
-                )
-        except Exception:
-            async with self._lock:
-                if self._generation == generation:
-                    self._leases[lease.lease_id] = lease
-            raise
+        if lease.viewer_edge_enabled:
+            try:
+                async with self._lifecycle_lock:
+                    await self._client.set_monitor_viewer(
+                        self.runtime_id, self.station_id, generation, False
+                    )
+            except Exception:
+                async with self._lock:
+                    if self._generation == generation:
+                        self._leases[lease.lease_id] = lease
+                raise
         async with self._lock:
             if self._generation != generation or self.viewer_count != 0:
                 return

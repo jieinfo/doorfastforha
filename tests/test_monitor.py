@@ -44,6 +44,25 @@ class FakeClient:
 
 
 class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
+    async def test_provisional_preview_lease_does_not_wait_for_ready(self):
+        client = FakeClient()
+        client.start_result = {"state": "requesting", "generation": 7}
+        coordinator = MonitorCoordinator(client, "runtime-a", "gate_main")
+
+        lease = await coordinator.async_acquire_viewer(wait_ready=False)
+
+        self.assertEqual(7, lease.generation)
+        self.assertTrue(coordinator.lease_owned(lease))
+        self.assertFalse(coordinator.lease_active(lease))
+        self.assertEqual(
+            [("start", "runtime-a", "gate_main")], client.calls
+        )
+        await coordinator.async_release_viewer(lease)
+        self.assertNotIn(
+            ("viewer", "runtime-a", "gate_main", 7, False), client.calls
+        )
+        await coordinator.async_stop()
+
     async def test_shared_stopping_wait_yields_even_with_explicit_ready(self):
         coordinator = MonitorCoordinator(FakeClient(), "runtime-a", "gate_main")
         lease = await coordinator.async_acquire_viewer()

@@ -34,7 +34,7 @@ from homeassistant.components.camera import (
 from webrtc_models import RTCIceCandidateInit
 
 from .config_helpers import normalize_go2rtc_api_url
-from .const import DOMAIN, MONITOR_READY_TIMEOUT
+from .const import DOMAIN
 
 try:
     from homeassistant.exceptions import HomeAssistantError
@@ -193,11 +193,8 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         state: _Session | None = None
         viewer_released = False
         try:
-            lease = await coordinator.async_acquire_viewer()
+            lease = await coordinator.async_acquire_viewer(wait_ready=False)
             generation = lease.generation
-            await coordinator.async_wait_ready(
-                generation, timeout=MONITOR_READY_TIMEOUT
-            )
             while True:
                 if not coordinator.lease_owned(lease):
                     raise HomeAssistantError("Doorfast monitor viewer lease is no longer owned")
