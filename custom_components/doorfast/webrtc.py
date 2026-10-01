@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import logging
+import re
 from typing import Any, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -50,6 +51,7 @@ _OFFER_TIMEOUT = 10.0
 # frontend closes the session when the viewer leaves, which cancels this loop.
 _NEGOTIATION_RETRY_DELAY = 1.0
 _LOGGER = logging.getLogger(__name__)
+_PRODUCER_ERROR_PREFIX = re.compile(r"^webrtc/offer:\s*", re.IGNORECASE)
 
 
 def _consume_answer_exception(future: asyncio.Future[None]) -> None:
@@ -75,6 +77,7 @@ class _Session:
     notify_error: bool = False
     close_requested: bool = False
     terminal_error_sent: bool = False
+    offer_sent: bool = False
 
 
 class _ProducerNotReadyError(RuntimeError):
@@ -127,6 +130,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         self._session = session
         self._sessions: dict[str, _Session] = {}
         self._negotiations: dict[str, asyncio.Task[None]] = {}
+        self._pending_candidates: dict[str, list[RTCIceCandidateInit]] = {}
 
     @property
     def domain(self) -> str:
@@ -184,6 +188,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
             raise HomeAssistantError("Doorfast station is no longer available") from error
         if current_task is not None:
             self._negotiations[session_id] = current_task
+            self._pending_candidates.setdefault(session_id, [])
         lease = None
         state: _Session | None = None
         viewer_released = False
@@ -228,6 +233,23 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                     await websocket.send_json(
                         {"type": "webrtc/offer", "value": offer_sdp}
                     )
+                    # HA may deliver local ICE candidates while the provider is
+                    # still acquiring the viewer lease, or in the small window
+                    # between creating the go2rtc session and sending its offer.
+                    # Drain until stable so no candidate can overtake the offer
+                    # or be lost between retry attempts.
+                    pending = self._pending_candidates.setdefault(session_id, [])
+                    candidate_index = 0
+                    while candidate_index < len(pending):
+                        candidate = pending[candidate_index]
+                        candidate_index += 1
+                        await websocket.send_json(
+                            {
+                                "type": "webrtc/candidate",
+                                "value": candidate.candidate,
+                            }
+                        )
+                    state.offer_sent = True
                     try:
                         await asyncio.wait_for(
                             asyncio.shield(state.answer), _OFFER_TIMEOUT
@@ -330,6 +352,7 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         finally:
             if self._negotiations.get(session_id) is current_task:
                 self._negotiations.pop(session_id, None)
+                self._pending_candidates.pop(session_id, None)
 
     async def _read_loop(self, session_id: str, state: _Session) -> None:
         try:
@@ -357,9 +380,10 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
                 elif message_type == "error":
                     if not isinstance(value, str):
                         raise HomeAssistantError("invalid go2rtc WebSocket error")
+                    normalized_value = _PRODUCER_ERROR_PREFIX.sub("", value).strip()
                     error = (
                         _ProducerNotReadyError("go2rtc WebRTC producer is not ready")
-                        if value.strip().lower() in ("not ready", "streams: unknown error")
+                        if normalized_value.lower() in ("not ready", "streams: unknown error")
                         else HomeAssistantError("go2rtc WebRTC signaling failed")
                     )
                     if state.negotiating and state.notify_error:
@@ -399,11 +423,17 @@ class DoorfastWebRTCProvider(CameraWebRTCProvider):
         self, session_id: str, candidate: RTCIceCandidateInit
     ) -> None:
         state = self._sessions.get(session_id)
-        if state is None or state.released:
+        if state is None or state.released or not state.offer_sent:
+            if session_id in self._negotiations:
+                value = getattr(candidate, "candidate", None)
+                if not isinstance(value, str):
+                    raise HomeAssistantError("invalid HA ICE candidate")
+                self._pending_candidates.setdefault(session_id, []).append(candidate)
             return
         value = getattr(candidate, "candidate", None)
         if not isinstance(value, str):
             raise HomeAssistantError("invalid HA ICE candidate")
+        self._pending_candidates.setdefault(session_id, []).append(candidate)
         await state.websocket.send_json(
             {"type": "webrtc/candidate", "value": value}
         )
