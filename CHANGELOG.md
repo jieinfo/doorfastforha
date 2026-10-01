@@ -5,6 +5,10 @@
 
 # Changelog
 
+## 0.3.19
+
+- Retry transient go2rtc producer errors and preserve HA ICE candidates across WebRTC retries.
+
 ## 0.3.18
 
 - Add independent station lock entities and station-scoped unlock requests.
