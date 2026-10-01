@@ -5,6 +5,10 @@
 
 # Changelog
 
+## 0.3.20
+
+- Start WebRTC preview negotiation while Doorfast is still bringing the station monitor online.
+
 ## 0.3.19
 
 - Retry transient go2rtc producer errors and preserve HA ICE candidates across WebRTC retries.
