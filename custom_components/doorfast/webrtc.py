@@ -27,7 +27,10 @@ except ImportError:  # pragma: no cover - only used by dependency-free tests
 GO2RTC_WS_URL = "ws://127.0.0.1:1984/api/ws?src=doorfast_preview"
 _SOURCE_PREFIX = "doorfast://"
 _SOURCE_SUFFIX = "/preview"
-_OFFER_TIMEOUT = 10.0
+# 1/2-unit stations can legitimately spend over 20 seconds replying to the
+# monitor request before a real source is published. Keep the WebRTC offer
+# alive long enough for that control-plane retry window to complete.
+_OFFER_TIMEOUT = 35.0
 
 
 @dataclass

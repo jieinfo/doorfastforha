@@ -133,9 +133,9 @@ class FakeCoordinator:
         self.acquired.append(self.generation)
         return self.generation
 
-    async def async_wait_ready(self, generation, timeout=10):
+    async def async_wait_ready(self, generation, timeout=35):
         assert generation == self.generation
-        assert timeout == 10
+        assert timeout == 35
 
     async def async_release_viewer(self):
         self.released += 1
