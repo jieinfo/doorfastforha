@@ -5,9 +5,9 @@ unlock:
     config_entry_id:
       description: Required only when multiple Doorfast entries are loaded.
       selector: {text: {}}
-    generation:
-      description: Defaults to the generation of the current call.
-      selector: {number: {min: 1}}
+    station_id:
+      required: true
+      selector: {text: {}}
 call_elevator:
   name: Call elevator
   description: Request an elevator in the selected direction.
@@ -51,17 +51,55 @@ hangup:
     reason:
       default: ha
       selector: {text: {}}
+call_station:
+  name: Call station
+  description: Start a call to one configured Doorfast station.
+  fields:
+    config_entry_id:
+      selector: {text: {}}
+    station_id:
+      required: true
+      selector: {text: {}}
+    primary_media_port:
+      default: 8303
+      selector: {number: {min: 1, max: 65535}}
+    secondary_media_port:
+      default: 8302
+      selector: {number: {min: 1, max: 65535}}
+    duration_seconds:
+      default: 120
+      selector: {number: {min: 1, max: 255}}
+hangup_station:
+  name: Hang up station
+  description: Hang up one configured Doorfast station.
+  fields:
+    config_entry_id:
+      selector: {text: {}}
+    station_id:
+      required: true
+      selector: {text: {}}
+    reason:
+      default: ha
+      selector: {text: {}}
 start_monitor:
-  name: Start monitor
-  description: Start the configured Doorfast active preview.
+  name: Start station monitor
+  description: Start the selected Doorfast station preview.
   fields:
     config_entry_id:
       description: Required only when multiple Doorfast entries are loaded.
       selector: {text: {}}
+    station_id:
+      required: true
+      description: Immutable configured Doorfast station ID.
+      selector: {text: {}}
 stop_monitor:
-  name: Stop monitor
-  description: Stop the current Doorfast active preview generation.
+  name: Stop station monitor
+  description: Stop the selected Doorfast station preview generation.
   fields:
     config_entry_id:
       description: Required only when multiple Doorfast entries are loaded.
+      selector: {text: {}}
+    station_id:
+      required: true
+      description: Immutable configured Doorfast station ID.
       selector: {text: {}}

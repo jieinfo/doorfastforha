@@ -4,6 +4,11 @@ This guide validates the video path after Doorfast host mode and the HA
 integration are installed. It describes the ingress contract only; it does
 not replace an on-site MT8157 call or a packet capture.
 
+For multi-station deployments, configure one `streams` entry per station
+stream name. `max_encoders` limits station source sessions, not browser
+viewers sharing a source. The repository fixture exercises these contracts
+synthetically and is not evidence of concurrent physical door stations.
+
 ## Boundary and configuration
 
 Doorfast publishes the encoded preview to the HA host's go2rtc RTSP ingress.
@@ -21,18 +26,21 @@ streams:
     - rtsp://DOORFAST_RTSP_USER:${DOORFAST_RTSP_PASSWORD}@immortal-wrt.example:8554/doorfast_preview
 ```
 
-The exact RTSP URL and credential values are deployment values. Store the
-password in HA Secrets or the go2rtc add-on's secret mechanism; do not put it
-in the Doorfast camera entity, HA state, browser configuration, or logs.
+The exact RTSP URL and credential values are deployment values. If the go2rtc
+API requires HTTP Basic Auth, enter the API username and password in the
+Doorfast integration's options flow together with the API base URL. The
+password is used only for HA-to-go2rtc WebSocket signaling and is not included
+in the URL, Doorfast camera entity, HA state, browser configuration, or logs.
 Doorfast connects to the HA RTSP ingress on `8554/TCP`. HA and the browser use
 the local go2rtc API on `1984` for WebSocket signaling and the configured
 WebRTC listener on `8555`. Doorfast must not access the go2rtc API or construct
 SDP, ICE, or browser signaling messages.
 
-The HA source remains the opaque value `doorfast://<config_entry_id>/preview`.
-The integration opens `ws://127.0.0.1:1984/api/ws?src=doorfast_preview` only
-from the HA host. A remote HA deployment must expose the API through its own
-local trust boundary rather than adding a Doorfast credential to the camera.
+The HA source remains the opaque value
+`doorfast://<config_entry_id>/station/<station_id>/preview`. The integration
+opens the configured go2rtc API WebSocket from the HA host. A remote HA
+deployment must expose that API through its own trusted network path; do not
+put credentials in the camera source URL.
 
 ## Acceptance sequence
 

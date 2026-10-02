@@ -3,17 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import Any
+
+from .const import MONITOR_READY_TIMEOUT
 
 
 _READY_STATES = frozenset(("publishing", "viewing"))
 _IDLE_STATES = frozenset(("idle", "stopped", "failed", "unavailable"))
 
 
+@dataclass(frozen=True)
+class MonitorLease:
+    generation: int
+    lease_id: int
+    epoch: int
+    viewer_edge_enabled: bool = True
+
+
 def _positive_int(value: Any, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+class _RetryAcquire(RuntimeError):
+    """The generation changed during the first-frame registration window."""
 
 
 class MonitorCoordinator:
@@ -24,20 +39,48 @@ class MonitorCoordinator:
     one start/stop lifecycle and delays the final stop to absorb reconnects.
     """
 
-    def __init__(self, client: Any, grace_seconds: float = 15.0) -> None:
+    def __init__(
+        self,
+        client: Any,
+        runtime_id: str,
+        station_id: str,
+        grace_seconds: float = 15.0,
+    ) -> None:
         if grace_seconds < 0:
             raise ValueError("grace_seconds must not be negative")
         self._client = client
+        self.runtime_id = runtime_id
+        self.station_id = station_id
         self._grace_seconds = grace_seconds
         self._lock = asyncio.Lock()
+        self._lifecycle_lock = asyncio.Lock()
+        self._acquire_admission_lock = asyncio.Lock()
         self._stop_task: asyncio.Task[None] | None = None
         self._generation: int | None = None
+        self._recoverable_generation: int | None = None
+        self._start_inflight = False
+        self._pending_acquires: set[tuple[int, asyncio.Task[Any]]] = set()
+        self._pending_owned_generation: tuple[int, int] | None = None
         self._state = "idle"
+        self._call_state = "idle"
+        self._call_error: str | None = None
         self._ready = False
-        self._viewer_count = 0
+        self._publisher_running: bool | None = None
+        self._next_lease_id = 0
+        self._leases: dict[int, MonitorLease] = {}
+        self._terminal_epoch = 0
         self._status_revision = 0
         self._unloaded = False
         self._status_event = asyncio.Event()
+        self._listeners: set[Any] = set()
+
+    def add_listener(self, listener):
+        self._listeners.add(listener)
+        return lambda: self._listeners.discard(listener)
+
+    def _notify(self):
+        for listener in tuple(self._listeners):
+            listener(self)
 
     @property
     def generation(self) -> int | None:
@@ -48,12 +91,26 @@ class MonitorCoordinator:
         return self._state
 
     @property
+    def call_state(self) -> str:
+        return self._call_state
+
+    @property
+    def call_error(self) -> str | None:
+        return self._call_error
+
+    @property
     def ready(self) -> bool:
         return self._ready
 
     @property
+    def publisher_running(self) -> bool | None:
+        return self._publisher_running
+
+    @property
     def viewer_count(self) -> int:
-        return self._viewer_count
+        if self._generation is None:
+            return 0
+        return sum(lease.generation == self._generation for lease in self._leases.values())
 
     @property
     def status_revision(self) -> int:
@@ -62,12 +119,43 @@ class MonitorCoordinator:
     @property
     def snapshot(self) -> dict[str, Any]:
         return {
+            "runtime_id": self.runtime_id,
+            "station_id": self.station_id,
             "generation": self._generation,
             "state": self._state,
             "ready": self._ready,
-            "viewer_count": self._viewer_count,
+            "viewer_count": self.viewer_count,
             "status_revision": self._status_revision,
+            "call_state": self._call_state,
+            "call_error": self._call_error,
         }
+
+    async def async_call(self) -> dict[str, Any]:
+        self._call_state, self._call_error = "calling", None
+        self._notify()
+        try:
+            response = await self._client.call_station(self.station_id)
+            if not isinstance(response, dict):
+                raise ValueError("Doorfast station call returned a non-object")
+            state = response.get("state", response.get("session", "calling"))
+            self._call_state = state if isinstance(state, str) else "calling"
+            self._notify()
+            return response
+        except Exception as error:
+            self._call_state, self._call_error = "failed", str(error)
+            self._notify()
+            raise
+
+    async def async_hangup(self) -> dict[str, Any]:
+        try:
+            response = await self._client.hangup_station(self.station_id)
+            self._call_state, self._call_error = "idle", None
+            self._notify()
+            return response
+        except Exception as error:
+            self._call_state, self._call_error = "failed", str(error)
+            self._notify()
+            raise
 
     @staticmethod
     def _response_generation(response: dict[str, Any]) -> int:
@@ -87,41 +175,60 @@ class MonitorCoordinator:
         if self._stop_task is not current:
             self._stop_task = None
 
-    def _set_response_locked(self, response: dict[str, Any]) -> None:
+    def _set_response_locked(
+        self, response: dict[str, Any], *, allow_generation_change: bool = False
+    ) -> None:
+        self._validate_identity(response, check_generation=not allow_generation_change)
         generation = self._response_generation(response)
         state = self._response_state(response)
         revision = response.get("status_revision", self._status_revision)
         if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
             raise ValueError("monitor status revision must be a non-negative integer")
-        if self._generation is not None and generation != self._generation:
-            self._viewer_count = 0
-            self._cancel_grace_locked()
         self._generation = generation
         self._state = state
-        self._ready = response.get("ready") is True or state in _READY_STATES
+        ready = response.get("ready")
+        self._ready = ready if isinstance(ready, bool) else state in _READY_STATES
+        publisher_running = response.get("encoder_running")
+        if isinstance(publisher_running, bool):
+            self._publisher_running = publisher_running
         self._status_revision = revision
+        if state == "stopping":
+            self._recoverable_generation = generation
+        else:
+            self._recoverable_generation = None
         self._status_event.set()
 
-    async def _start_locked(self) -> int:
-        if self._unloaded:
-            raise RuntimeError("monitor coordinator is unloaded")
-        self._cancel_grace_locked()
-        response = await self._client.start_monitor()
-        if not isinstance(response, dict):
-            raise ValueError("Doorfast monitor start returned a non-object")
-        self._set_response_locked(response)
-        return self._generation  # type: ignore[return-value]
+    def _validate_identity(
+        self, payload: dict[str, Any], *, check_generation: bool = True
+    ) -> None:
+        runtime_id = payload.get("runtime_id")
+        if runtime_id is not None and runtime_id != self.runtime_id:
+            raise ValueError("monitor status runtime does not match coordinator")
+        station_id = payload.get("station_id")
+        if station_id is not None and station_id != self.station_id:
+            raise ValueError("monitor status station does not match coordinator")
+        generation = payload.get("generation")
+        if check_generation and (
+            self._generation is not None
+            and generation not in (None, 0, self._generation)
+        ):
+            _positive_int(generation, "monitor generation")
+            raise ValueError("monitor status generation does not match coordinator")
 
     async def async_start(self) -> int:
         """Start a generation unless one is already active."""
         async with self._lock:
             if self._generation is not None and self._state not in _IDLE_STATES:
                 return self._generation
-            return await self._start_locked()
+            request_epoch = self._terminal_epoch
+            old_generation = self._generation or 0
+        return await self._start_generation(request_epoch, old_generation)
 
-    async def async_wait_ready(self, generation: int, timeout: float = 10.0) -> None:
+    async def async_wait_ready(
+        self, generation: int, timeout: float | None = MONITOR_READY_TIMEOUT
+    ) -> None:
         """Wait until the exact generation is publishing/viewing."""
-        if self._generation == generation and self._ready:
+        if self._generation == generation and self._ready and self._state != "stopping":
             return
         await asyncio.wait_for(self._wait_ready(generation), timeout)
 
@@ -131,80 +238,549 @@ class MonitorCoordinator:
                 if (
                     self._generation != generation
                     or self._state
-                    in {"failed", "idle", "stopped", "stopping", "unavailable"}
+                    in {"failed", "idle", "stopped", "unavailable"}
+                    or (
+                        self._state == "stopping"
+                        and self._publisher_running is not True
+                        and self.viewer_count == 0
+                    )
                     or self._unloaded
                 ):
                     raise RuntimeError("monitor generation is no longer ready")
-                if self._ready:
+                if self._ready and self._state != "stopping":
                     return
                 self._status_event.clear()
             await self._status_event.wait()
 
-    async def async_acquire_viewer(self) -> int:
-        """Register one HA viewer and return the active Doorfast generation."""
-        async with self._lock:
-            self._cancel_grace_locked()
-            if self._generation is None or self._state in _IDLE_STATES:
-                await self._start_locked()
-            if self._state == "stopping":
-                raise RuntimeError("monitor generation is stopping")
-            generation = self._generation
-            if generation is None:
-                raise RuntimeError("monitor generation was not created")
+    async def _await_start_response(self) -> dict[str, Any]:
+        """Keep an accepted start alive long enough to clean it up on cancel."""
+        start_task = asyncio.Task(
+            self._client.start_monitor(self.runtime_id, self.station_id),
+            loop=asyncio.get_running_loop(),
+            eager_start=True,
+        )
         try:
-            # Doorfast accepts the viewer edge only after the monitor reaches
-            # publishing/viewing. Keep this wait outside the state lock so
-            # relay or poll updates can advance the generation.
-            await self.async_wait_ready(generation)
+            response = await asyncio.shield(start_task)
+        except asyncio.CancelledError:
+            response = await asyncio.shield(start_task)
+            if not isinstance(response, dict):
+                raise ValueError("Doorfast monitor start returned a non-object")
+            generation = self._response_generation(response)
+            await self._stop_remote(generation)
+            raise
+        if not isinstance(response, dict):
+            raise ValueError("Doorfast monitor start returned a non-object")
+        return response
+
+    async def _start_generation(
+        self, request_epoch: int, old_generation: int, *, pending_acquire: bool = False
+    ) -> int:
+        """Start one generation while serializing remote lifecycle calls."""
+        async with self._lifecycle_lock:
             async with self._lock:
+                if self._unloaded or request_epoch != self._terminal_epoch:
+                    raise RuntimeError("monitor request was terminated")
+                follow_generation = (
+                    self._generation
+                    if self._generation is not None
+                    and self._generation > old_generation
+                    else None
+                )
+                if follow_generation is not None:
+                    return follow_generation
+                self._cancel_grace_locked()
+                self._start_inflight = True
+
+            try:
+                response = await self._await_start_response()
+            except BaseException:
+                async with self._lock:
+                    self._start_inflight = False
+                raise
+            accepted_generation = self._response_generation(response)
+
+            try:
+                async with self._lock:
+                    self._start_inflight = False
+                    terminated = (
+                        self._unloaded or request_epoch != self._terminal_epoch
+                    )
+                    current_generation = self._generation
+                    if not terminated and (
+                        (
+                            current_generation is None
+                            and self._recoverable_generation != accepted_generation
+                        )
+                        or current_generation == old_generation
+                        or current_generation == accepted_generation
+                    ):
+                        if (
+                            current_generation == accepted_generation
+                            and self._state == "stopping"
+                        ):
+                            if pending_acquire:
+                                self._pending_owned_generation = (
+                                    request_epoch, accepted_generation
+                                )
+                            return current_generation
+                        if (
+                            current_generation is None
+                            and self._recoverable_generation == accepted_generation
+                        ):
+                            if pending_acquire:
+                                self._pending_owned_generation = (
+                                    request_epoch, accepted_generation
+                                )
+                            return accepted_generation
+                        response_revision = response.get("status_revision", 0)
+                        if (
+                            current_generation == accepted_generation
+                            and self._status_revision > 0
+                            and isinstance(response_revision, int)
+                            and not isinstance(response_revision, bool)
+                            and response_revision <= self._status_revision
+                        ):
+                            if pending_acquire:
+                                self._pending_owned_generation = (
+                                    request_epoch, accepted_generation
+                                )
+                            return current_generation
+                        self._set_response_locked(
+                            response, allow_generation_change=True
+                        )
+                        if pending_acquire:
+                            self._pending_owned_generation = (
+                                request_epoch, accepted_generation
+                            )
+                        return accepted_generation
+                    if not terminated and current_generation is not None:
+                        return current_generation
+            except asyncio.CancelledError:
+                async with self._lock:
+                    self._start_inflight = False
+                await self._stop_remote(accepted_generation)
+                raise
+
+            # The service accepted a generation after a terminal event. Do not
+            # adopt its response; clean up only the generation this request
+            # started while the lifecycle lock still excludes other starts.
+            await self._stop_remote(accepted_generation)
+            raise RuntimeError("monitor request was terminated")
+
+    async def _stop_remote(self, generation: int) -> dict[str, Any] | None:
+        try:
+            response = await self._client.stop_monitor(
+                self.runtime_id, self.station_id, generation
+            )
+        except Exception as error:
+            if getattr(error, "status", None) != 409:
+                raise
+            return None
+        if response is not None and not isinstance(response, dict):
+            raise ValueError("Doorfast monitor stop returned a non-object")
+        return response
+
+    async def _recover_generation(
+        self, request_epoch: int, old_generation: int, *, pending_acquire: bool = False
+    ) -> int:
+        """Finish a recoverable stop, then share one newly started generation."""
+        async with self._lifecycle_lock:
+            async with self._lock:
+                if self._unloaded or request_epoch != self._terminal_epoch:
+                    raise RuntimeError("monitor request was terminated")
+                # Source retries must not restart an established shared publication.
+                if self._generation is not None and (
+                    self._publisher_running is True or self.viewer_count != 0
+                ):
+                    return self._generation
+                follow_generation = (
+                    self._generation
+                    if self._generation is not None
+                    and self._generation > old_generation
+                    else None
+                )
+                stopping_generation = (
+                    self._generation
+                    if self._generation == old_generation
+                    and self._state == "stopping"
+                    else None
+                )
+                if follow_generation is not None:
+                    return follow_generation
+
+            if stopping_generation is not None:
+                await self._stop_remote(stopping_generation)
+                async with self._lock:
+                    if (
+                        self._unloaded
+                        or request_epoch != self._terminal_epoch
+                    ):
+                        raise RuntimeError("monitor request was terminated")
+                    if self._generation == stopping_generation:
+                        self._generation = None
+                        self._state = "idle"
+                        self._ready = False
+                        self._publisher_running = None
+                        self._leases.clear()
+                        self._status_event.set()
+
+            async with self._lock:
+                if self._unloaded or request_epoch != self._terminal_epoch:
+                    raise RuntimeError("monitor request was terminated")
+                follow_generation = (
+                    self._generation
+                    if self._generation is not None
+                    and self._generation > old_generation
+                    else None
+                )
+                if follow_generation is not None:
+                    return follow_generation
+                self._start_inflight = True
+
+            try:
+                response = await self._await_start_response()
+            except BaseException:
+                async with self._lock:
+                    self._start_inflight = False
+                raise
+            accepted_generation = self._response_generation(response)
+            try:
+                async with self._lock:
+                    self._start_inflight = False
+                    terminated = (
+                        self._unloaded or request_epoch != self._terminal_epoch
+                    )
+                    current_generation = self._generation
+                    if not terminated and (
+                        (
+                            current_generation is None
+                            and self._recoverable_generation != accepted_generation
+                        )
+                        or current_generation == old_generation
+                    ):
+                        response_revision = response.get("status_revision", 0)
+                        if (
+                            current_generation == accepted_generation
+                            and self._status_revision > 0
+                            and isinstance(response_revision, int)
+                            and not isinstance(response_revision, bool)
+                            and response_revision <= self._status_revision
+                        ):
+                            if pending_acquire:
+                                self._pending_owned_generation = (
+                                    request_epoch, accepted_generation
+                                )
+                            return current_generation
+                        self._set_response_locked(
+                            response, allow_generation_change=True
+                        )
+                        if pending_acquire:
+                            self._pending_owned_generation = (
+                                request_epoch, accepted_generation
+                            )
+                        return accepted_generation
+                    if not terminated and current_generation is not None:
+                        return current_generation
+            except asyncio.CancelledError:
+                async with self._lock:
+                    self._start_inflight = False
+                await self._stop_remote(accepted_generation)
+                raise
+
+            await self._stop_remote(accepted_generation)
+            raise RuntimeError("monitor request was terminated")
+
+    async def _register_provisional_lease(
+        self, generation: int, request_epoch: int
+    ) -> MonitorLease:
+        """Register a preview lease before the publisher reports ready.
+
+        Preview monitors are persistent on Doorfast, so the remote viewer edge
+        must not be toggled until the generation is ready.  The local lease
+        still protects the generation from cleanup while WebRTC waits for its
+        producer to appear.
+        """
+        async with self._lifecycle_lock:
+            async with self._lock:
+                if (
+                    self._unloaded
+                    or request_epoch != self._terminal_epoch
+                    or self._generation != generation
+                    or self._state in _IDLE_STATES
+                    or self._state == "stopping"
+                ):
+                    raise _RetryAcquire
+                self._next_lease_id += 1
+                lease = MonitorLease(
+                    generation, self._next_lease_id, self._terminal_epoch, False
+                )
+                self._leases[lease.lease_id] = lease
+                if self._pending_owned_generation == (request_epoch, generation):
+                    self._pending_owned_generation = None
+                return lease
+
+    async def async_acquire_viewer(
+        self, *, wait_ready: bool = True
+    ) -> MonitorLease:
+        """Register one HA viewer and return its generation lease.
+
+        WebRTC previews may request a provisional local lease while the station
+        is still starting.  Other callers retain the original ready-gated
+        behavior by default.
+        """
+        request_epoch = self._terminal_epoch
+        async with self._acquire_admission_lock:
+            async with self._lock:
+                if self._unloaded or request_epoch != self._terminal_epoch:
+                    raise RuntimeError("monitor request was terminated")
+                old_generation = self._generation or self._recoverable_generation or 0
+                pending = (request_epoch, asyncio.current_task())
+                self._pending_acquires.add(pending)
+
+        generation: int | None = None
+        try:
+            while True:
+                async with self._lock:
+                    if self._unloaded or request_epoch != self._terminal_epoch:
+                        raise RuntimeError("monitor request was terminated")
+                    generation = self._generation
+                    state = self._state
+                    recoverable = self._recoverable_generation
+                if generation is None or state in _IDLE_STATES:
+                    if recoverable is not None:
+                        generation = await self._recover_generation(
+                            request_epoch, old_generation, pending_acquire=True
+                        )
+                    else:
+                        generation = await self._start_generation(
+                            request_epoch, old_generation, pending_acquire=True
+                        )
+                elif state == "stopping":
+                    generation = await self._recover_generation(
+                        request_epoch, old_generation, pending_acquire=True
+                    )
+
+                if not wait_ready:
+                    async with self._lock:
+                        ready = self._ready and self._state not in _IDLE_STATES | {"stopping"}
+                    if not ready:
+                        try:
+                            return await self._register_provisional_lease(
+                                generation, request_epoch
+                            )
+                        except _RetryAcquire:
+                            old_generation = max(old_generation, generation)
+                            continue
+
+                try:
+                    await self.async_wait_ready(generation)
+                except RuntimeError:
+                    async with self._lock:
+                        if (
+                            self._unloaded
+                            or request_epoch != self._terminal_epoch
+                        ):
+                            raise RuntimeError("monitor request was terminated")
+                        recoverable = self._recoverable_generation
+                        if self._generation is not None and self._generation != generation:
+                            if self._generation > generation:
+                                generation = self._generation
+                                continue
+                        if recoverable not in (None, generation):
+                            raise
+                        if self._state == "stopping" or self._generation is None:
+                            old_generation = max(old_generation, generation)
+                            continue
+                    raise
+
+                try:
+                    return await self._register_lease(generation, request_epoch)
+                except _RetryAcquire:
+                    old_generation = max(old_generation, generation)
+                    continue
+        except (asyncio.CancelledError, Exception):
+            async with self._lock:
+                self._pending_acquires.discard(pending)
+                cleanup = (
+                    generation is not None
+                    and self._pending_owned_generation == (request_epoch, generation)
+                    and not any(epoch == request_epoch for epoch, _ in self._pending_acquires)
+                )
+            if cleanup:
+                await asyncio.shield(
+                    self._cleanup_cancelled_acquire(generation, request_epoch)
+                )
+            raise
+        finally:
+            async with self._lock:
+                self._pending_acquires.discard(pending)
+
+    async def _cleanup_cancelled_acquire(
+        self, generation: int, request_epoch: int
+    ) -> None:
+        async with self._lifecycle_lock:
+            async with self._acquire_admission_lock:
+                async with self._lock:
+                    if (
+                        self._generation != generation
+                        or request_epoch != self._terminal_epoch
+                        or self._pending_owned_generation != (request_epoch, generation)
+                        or any(
+                            epoch == request_epoch
+                            for epoch, _ in self._pending_acquires
+                        )
+                        or self.viewer_count != 0
+                    ):
+                        return
+                await self._stop_remote(generation)
+                async with self._lock:
+                    if (
+                        self._generation == generation
+                        and request_epoch == self._terminal_epoch
+                        and self.viewer_count == 0
+                    ):
+                        self._generation = None
+                        self._state = "idle"
+                        self._ready = False
+                        self._publisher_running = None
+                        self._recoverable_generation = None
+                        self._pending_owned_generation = None
+                        self._status_event.set()
+
+    async def _register_lease(
+        self, generation: int, request_epoch: int
+    ) -> MonitorLease:
+        """Enable the Doorfast viewer edge and register one local lease."""
+        async with self._lifecycle_lock:
+            async with self._lock:
+                if (
+                    self._unloaded
+                    or request_epoch != self._terminal_epoch
+                ):
+                    raise RuntimeError("monitor request was terminated")
                 if (
                     self._generation != generation
                     or not self._ready
                     or self._state in _IDLE_STATES
+                    or self._state == "stopping"
                 ):
-                    raise RuntimeError("monitor generation is no longer ready")
-                if self._viewer_count == 0:
-                    try:
-                        await self._client.set_monitor_viewer(generation, True)
-                    except Exception:
-                        await self._stop_locked(generation)
-                        raise
-                self._viewer_count += 1
-                return generation
-        except asyncio.CancelledError:
-            async with self._lock:
-                if (
-                    self._generation == generation
-                    and self._viewer_count == 0
-                    and self._state not in _IDLE_STATES
-                ):
-                    await self._stop_locked(generation)
-            raise
-        except Exception:
-            async with self._lock:
-                if (
-                    self._generation == generation
-                    and self._viewer_count == 0
-                    and self._state not in _IDLE_STATES
-                ):
-                    await self._stop_locked(generation)
-            raise
+                    raise _RetryAcquire
+                enable_viewer = self.viewer_count == 0
 
-    async def async_release_viewer(self) -> None:
+            async def rollback_viewer_edge() -> None:
+                try:
+                    await self._client.set_monitor_viewer(
+                        self.runtime_id, self.station_id, generation, False
+                    )
+                finally:
+                    try:
+                        await self._stop_remote(generation)
+                    finally:
+                        async with self._lock:
+                            if self._generation == generation:
+                                self._generation = None
+                                self._state = "idle"
+                                self._ready = False
+                                self._publisher_running = None
+                                self._recoverable_generation = None
+                                self._leases.clear()
+                                self._status_event.set()
+
+            if enable_viewer:
+                try:
+                    await self._client.set_monitor_viewer(
+                        self.runtime_id, self.station_id, generation, True
+                    )
+                except asyncio.CancelledError:
+                    await rollback_viewer_edge()
+                    raise
+                except Exception:
+                    try:
+                        await self._stop_remote(generation)
+                    finally:
+                        async with self._lock:
+                            if self._generation == generation:
+                                self._generation = None
+                                self._state = "idle"
+                                self._ready = False
+                                self._publisher_running = None
+                                self._leases.clear()
+                                self._status_event.set()
+                    raise
+                current_task = asyncio.current_task()
+                if current_task is not None and current_task.cancelling():
+                    await rollback_viewer_edge()
+                    raise asyncio.CancelledError
+
+            try:
+                async with self._lock:
+                    valid = (
+                        not self._unloaded
+                        and request_epoch == self._terminal_epoch
+                        and self._generation == generation
+                        and self._ready
+                        and self._state not in _IDLE_STATES
+                        and self._state != "stopping"
+                    )
+                if not valid:
+                    if enable_viewer:
+                        await rollback_viewer_edge()
+                    async with self._lock:
+                        terminated = (
+                            self._unloaded
+                            or request_epoch != self._terminal_epoch
+                        )
+                    if terminated:
+                        raise RuntimeError("monitor request was terminated")
+                    raise _RetryAcquire
+                async with self._lock:
+                    if (
+                        self._unloaded
+                        or request_epoch != self._terminal_epoch
+                        or self._generation != generation
+                        or not self._ready
+                        or self._state in _IDLE_STATES
+                        or self._state == "stopping"
+                    ):
+                        raise _RetryAcquire
+                    self._next_lease_id += 1
+                    lease = MonitorLease(
+                        generation, self._next_lease_id, self._terminal_epoch
+                    )
+                    self._leases[lease.lease_id] = lease
+                    if self._pending_owned_generation == (request_epoch, generation):
+                        self._pending_owned_generation = None
+                    return lease
+            except asyncio.CancelledError:
+                if enable_viewer:
+                    await rollback_viewer_edge()
+                raise
+
+    async def async_release_viewer(self, lease: MonitorLease) -> None:
         """Release one viewer and schedule a delayed stop at the last edge."""
         async with self._lock:
-            if self._viewer_count == 0:
+            current = self._leases.get(lease.lease_id)
+            if current != lease:
                 return
-            self._viewer_count -= 1
+            del self._leases[lease.lease_id]
             generation = self._generation
-            if self._viewer_count != 0 or generation is None:
+            if self.viewer_count != 0 or generation is None or lease.generation != generation:
                 return
-            try:
-                await self._client.set_monitor_viewer(generation, False)
-            except Exception:
-                self._viewer_count = 1
-                raise
             self._cancel_grace_locked()
+        if lease.viewer_edge_enabled:
+            try:
+                async with self._lifecycle_lock:
+                    await self._client.set_monitor_viewer(
+                        self.runtime_id, self.station_id, generation, False
+                    )
+            except Exception:
+                async with self._lock:
+                    if self._generation == generation:
+                        self._leases[lease.lease_id] = lease
+                raise
+        async with self._lock:
+            if self._generation != generation or self.viewer_count != 0:
+                return
             self._stop_task = asyncio.create_task(
                 self._stop_after_grace(generation)
             )
@@ -212,57 +788,93 @@ class MonitorCoordinator:
     async def _stop_after_grace(self, generation: int) -> None:
         try:
             await asyncio.sleep(self._grace_seconds)
-            async with self._lock:
-                if self._generation == generation and self._viewer_count == 0:
-                    await self._stop_locked(generation)
+            await self._stop_generation(generation)
         except asyncio.CancelledError:
             return
         finally:
             if self._stop_task is asyncio.current_task():
                 self._stop_task = None
 
-    async def _stop_locked(self, generation: int | None = None) -> None:
-        if self._generation is None:
-            self._state = "idle"
-            self._ready = False
-            self._viewer_count = 0
-            self._status_event.set()
-            return
-        active_generation = self._generation
-        if generation is not None and generation != active_generation:
-            return
-        self._cancel_grace_locked()
-        try:
-            response = await self._client.stop_monitor(active_generation)
-            if isinstance(response, dict):
-                self._set_response_locked(response)
-        finally:
-            self._generation = None
-            self._state = "idle"
-            self._ready = False
-            self._viewer_count = 0
-            self._status_event.set()
+    async def _stop_generation(
+        self, generation: int | None = None, *, terminal: bool = False
+    ) -> None:
+        async with self._lifecycle_lock:
+            async with self._lock:
+                active_generation = self._generation
+                if active_generation is None:
+                    self._state = "idle"
+                    self._ready = False
+                    self._publisher_running = None
+                    self._leases.clear()
+                    self._status_event.set()
+                    return
+                if generation is not None and generation != active_generation:
+                    return
+                self._cancel_grace_locked()
+                stop_epoch = self._terminal_epoch
+            response = None
+            try:
+                response = await self._stop_remote(active_generation)
+            finally:
+                async with self._lock:
+                    if self._generation == active_generation:
+                        if (
+                            not terminal
+                            and stop_epoch == self._terminal_epoch
+                            and isinstance(response, dict)
+                        ):
+                            self._set_response_locked(
+                                response, allow_generation_change=True
+                            )
+                        self._generation = None
+                        self._state = "idle"
+                        self._ready = False
+                        self._publisher_running = None
+                        self._leases.clear()
+                        self._status_event.set()
 
     async def async_stop(self) -> None:
         """Stop the current generation immediately and clear local state."""
-        async with self._lock:
-            await self._stop_locked()
+        generation = self._begin_terminal()
+        await self._stop_generation(generation, terminal=True)
 
     async def async_preempt(self) -> None:
         """Stop preview immediately when a call or a newer generation wins."""
-        await self.async_stop()
+        generation = self._begin_terminal()
+        await self._stop_generation(generation, terminal=True)
 
     async def async_unload(self) -> None:
         """Stop once during config-entry unload; subsequent calls are no-ops."""
-        async with self._lock:
-            if self._unloaded:
-                return
-            self._unloaded = True
-            await self._stop_locked()
+        generation = self._begin_terminal(unload=True)
+        if generation is not None:
+            await self._stop_generation(generation, terminal=True)
 
     async def async_close(self) -> None:
         """Compatibility name used by config-entry cleanup."""
         await self.async_unload()
+
+    def _begin_terminal(self, *, unload: bool = False) -> int | None:
+        """Mark termination synchronously before waiting for lifecycle state."""
+        if unload and self._unloaded:
+            return None
+        generation = self._generation or self._recoverable_generation
+        self._terminal_epoch += 1
+        self._recoverable_generation = None
+        self._publisher_running = None
+        if unload:
+            self._unloaded = True
+        return generation
+
+    def lease_owned(self, lease: MonitorLease) -> bool:
+        return (
+            not self._unloaded
+            and self._leases.get(lease.lease_id) == lease
+            and self._generation == lease.generation
+            and lease.epoch == self._terminal_epoch
+        )
+
+    def lease_active(self, lease: MonitorLease) -> bool:
+        return self.lease_owned(lease) and self._ready
 
     async def async_apply_status(self, payload: dict[str, Any]) -> None:
         """Apply a validated monitor status or relay event snapshot."""
@@ -277,44 +889,121 @@ class MonitorCoordinator:
                 merged["status_revision"] = payload["status_revision"]
         else:
             merged = dict(payload)
+        for field in ("runtime_id", "station_id"):
+            if field in payload:
+                merged[field] = payload[field]
         event = payload.get("event")
-        if event in {"monitor_preempted", "monitor_stopped"}:
-            async with self._lock:
+        state = merged.get("state")
+        self._validate_identity(merged, check_generation=False)
+        generation = merged.get("generation")
+        if generation not in (None, 0):
+            _positive_int(generation, "monitor generation")
+        has_revision = "status_revision" in merged
+        revision = merged.get("status_revision", self._status_revision)
+        if (
+            isinstance(revision, bool)
+            or not isinstance(revision, int)
+            or revision < 0
+        ):
+            raise ValueError(
+                "monitor status revision must be a non-negative integer"
+            )
+        if has_revision and revision <= self._status_revision:
+            return
+        current_generation = self._generation or self._recoverable_generation
+        if (
+            current_generation is not None
+            and generation not in (None, 0, current_generation)
+        ):
+            raise ValueError("monitor status generation does not match coordinator")
+        call = merged.get("call")
+        if isinstance(call, dict):
+            call_state = call.get("session", call.get("state"))
+            if isinstance(call_state, str): self._call_state = call_state
+            call_error = call.get("error")
+            self._call_error = call_error if isinstance(call_error, str) else None
+        elif isinstance(merged.get("call_state"), str):
+            self._call_state = merged["call_state"]
+            self._call_error = merged.get("call_error") if isinstance(merged.get("call_error"), str) else None
+        self._notify()
+
+        terminal_event = event in {"monitor_preempted", "monitor_failed"}
+        if state == "failed":
+            terminal_event = True
+        if (
+            terminal_event
+            and current_generation is None
+            and self._start_inflight
+            and generation not in (None, 0)
+        ):
+            # The remote start may already have accepted this generation even
+            # though its HTTP response has not returned locally yet.
+            current_generation = generation
+        terminal_target = (
+            current_generation
+            if terminal_event
+            and current_generation is not None
+            and generation in (None, 0, current_generation)
+            else None
+        )
+        if terminal_target is not None:
+            # This mutation intentionally happens before the first await. A
+            # recovery request that is waiting on a lifecycle HTTP call must
+            # observe the terminal epoch and stop before starting a new one.
+            if not has_revision or revision > self._status_revision:
+                self._terminal_epoch += 1
+                self._recoverable_generation = None
+
+        async with self._lock:
+            if has_revision and revision <= self._status_revision:
+                return
+            current_generation = self._generation or self._recoverable_generation
+            if (
+                current_generation is not None
+                and generation not in (None, 0, current_generation)
+            ):
+                raise ValueError("monitor status generation does not match coordinator")
+            if event in {"monitor_preempted", "monitor_stopped"}:
                 self._cancel_grace_locked()
                 self._generation = None
                 self._state = "idle"
                 self._ready = False
-                self._viewer_count = 0
+                self._publisher_running = None
+                self._leases.clear()
+                if event == "monitor_stopped" and current_generation is not None:
+                    self._recoverable_generation = current_generation
+                else:
+                    self._recoverable_generation = None
+                self._status_revision = revision
                 self._status_event.set()
-            return
-        if event == "monitor_failed":
-            async with self._lock:
+                return
+            if event == "monitor_failed":
                 self._cancel_grace_locked()
                 self._generation = None
                 self._state = "failed"
                 self._ready = False
-                self._viewer_count = 0
+                self._publisher_running = None
+                self._leases.clear()
+                self._recoverable_generation = None
+                self._status_revision = revision
                 self._status_event.set()
-            return
-        state = merged.get("state")
-        if state in _IDLE_STATES:
-            async with self._lock:
-                generation = merged.get("generation")
-                if generation not in (None, 0):
-                    _positive_int(generation, "monitor generation")
+                return
+            if state in _IDLE_STATES:
                 self._cancel_grace_locked()
                 self._generation = None
                 self._state = (
                     state if state in {"failed", "unavailable"} else "idle"
                 )
                 self._ready = False
-                self._viewer_count = 0
-                revision = merged.get("status_revision", self._status_revision)
-                if isinstance(revision, int) and not isinstance(revision, bool):
-                    self._status_revision = revision
+                self._publisher_running = None
+                self._leases.clear()
+                if state == "stopped" and current_generation is not None:
+                    self._recoverable_generation = current_generation
+                else:
+                    self._recoverable_generation = None
+                self._status_revision = revision
                 self._status_event.set()
-            return
-        async with self._lock:
+                return
             self._set_response_locked(merged)
 
 

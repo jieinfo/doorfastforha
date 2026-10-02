@@ -36,10 +36,13 @@ TOKEN = "a" * 32
 FRAME = bytes(320)
 
 
-def status(generation=7, runtime=RUNTIME):
+def status(generation=7, runtime=RUNTIME, station_id=None):
+    call = {"session": "talking", "generation": generation}
+    if station_id is not None:
+        call["station_id"] = station_id
     return {
         "runtime_id": runtime,
-        "call": {"session": "talking", "generation": generation},
+        "call": call,
         "audio_tx": {"active": True, "generation": generation},
     }
 
@@ -126,6 +129,24 @@ async def started(client):
 
 
 class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_station_and_generation_are_bound_before_open(self):
+        client = FakeClient([success(audio_session=TOKEN)])
+        client.status = status(station_id="front")
+        producer = PcmProducer(client, "front", 7)
+        await producer.start()
+        self.assertEqual(7, producer.generation)
+        await producer.stop()
+
+    async def test_stale_station_or_generation_is_rejected(self):
+        for station, generation in (("back", 7), ("front", 8)):
+            with self.subTest(station=station, generation=generation):
+                client = FakeClient([success(audio_session=TOKEN)])
+                client.status = status(station_id="front")
+                producer = PcmProducer(client, station, generation)
+                with self.assertRaises(PcmProducerError) as caught:
+                    await producer.start()
+                self.assertIn(caught.exception.code, {"status_not_ready", "generation_mismatch"})
+
     async def test_success_opens_submits_bounded_batch_and_stops(self):
         client = FakeClient([
             success(audio_session=TOKEN, next_sequence=9),

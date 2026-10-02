@@ -74,12 +74,37 @@ class FakeProvider:
         self.reconciled += 1
 
 
+class FakeRegistry:
+    def __init__(self):
+        self.closed = 0
+
+    async def async_close(self):
+        self.closed += 1
+
+
 class FakeStatusMonitor:
     def __init__(self):
         self.applied = []
+        self.generation = None
+        self.status_revision = 0
 
     async def async_apply_status(self, status):
         self.applied.append(status)
+
+
+class FakeStationRegistry:
+    def __init__(self):
+        self.monitors = {
+            "gate_main": FakeStatusMonitor(),
+            "gate_side": FakeStatusMonitor(),
+        }
+
+    @property
+    def station_ids(self):
+        return tuple(self.monitors)
+
+    def monitor(self, station_id):
+        return self.monitors[station_id]
 
 
 def load_module():
@@ -109,6 +134,222 @@ MODULE = load_module()
 
 
 class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_status_sync_retains_answer_then_reports_terminal_publication(self):
+        from tests.test_webrtc import (
+            DoorfastWebRTCProvider, FakeRegistry as WebRTCRegistry,
+            FakeHass as WebRTCHass, FakeSession, FakeWebSocket,
+            FakeCamera, WebRTCError, source,
+        )
+
+        registry = WebRTCRegistry()
+        registry.station_ids = tuple(registry.monitors)
+        websocket = FakeWebSocket()
+        provider = DoorfastWebRTCProvider(
+            WebRTCHass(), "entry-1", registry, "http://127.0.0.1:1984",
+            FakeSession(websocket),
+        )
+        messages = []
+        await websocket.incoming.put({"type": "webrtc/answer", "value": "answer"})
+        await provider.async_handle_async_webrtc_offer(
+            FakeCamera(source("gate_main")), "offer", "main", messages.append
+        )
+        status = {"station_id": "gate_main", "generation": 9,
+                  "state": "requesting", "ready": False, "encoder_running": True}
+
+        async def monitor_status():
+            return {"runtime_id": "runtime-a", "sessions": [status]}
+
+        client = types.SimpleNamespace(
+            status={"runtime_id": "runtime-a"}, monitor_status=monitor_status
+        )
+        await MODULE.sync_monitor_state(client, registry, provider, station_id="gate_main")
+        self.assertFalse(websocket.closed)
+        self.assertEqual(0, registry.monitors["gate_main"].released)
+        status["encoder_running"] = False
+        await MODULE.sync_monitor_state(client, registry, provider, station_id="gate_main")
+        await provider.async_close_entry()
+        self.assertTrue(websocket.closed)
+        self.assertEqual(1, registry.monitors["gate_main"].released)
+        self.assertEqual(["doorfast_publisher_ended"],
+                         [m.value for m in messages if isinstance(m, WebRTCError)])
+
+    async def test_poll_does_not_clear_monitor_start_in_flight(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+
+        async def monitor_status():
+            registry.monitors["gate_main"].generation = 7
+            registry.monitors["gate_main"].status_revision = 1
+            return {"runtime_id": "runtime-a", "status_revision": 9, "sessions": []}
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(client, registry, provider)
+
+        self.assertEqual([], registry.monitors["gate_main"].applied)
+        self.assertEqual(
+            ["idle"],
+            [item.get("state") for item in registry.monitors["gate_side"].applied],
+        )
+
+    async def test_poll_clears_generation_missing_before_and_after_request(self):
+        registry = FakeStationRegistry()
+        registry.monitors["gate_main"].generation = 7
+        registry.monitors["gate_main"].status_revision = 3
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+
+        async def monitor_status():
+            return {"runtime_id": "runtime-a", "status_revision": 9, "sessions": []}
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(
+            client, registry, provider, station_id="gate_main"
+        )
+
+        self.assertEqual(
+            ["idle"],
+            [item.get("state") for item in registry.monitors["gate_main"].applied],
+        )
+
+    async def test_polls_authoritative_sessions_by_station_only(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(
+            status={"runtime_id": "runtime-a"},
+            monitor_status=lambda: None,
+        )
+
+        async def monitor_status():
+            return {
+                "runtime_id": "runtime-a",
+                "sessions": [
+                    {"station_id": "gate_main", "generation": 7,
+                     "state": "publishing", "status_revision": 4},
+                    {"station_id": "gate_side", "generation": 7,
+                     "state": "viewing", "status_revision": 5},
+                    {"station_id": "unknown", "generation": 9,
+                     "state": "publishing", "status_revision": 6},
+                ],
+            }
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(client, registry, provider)
+
+        self.assertEqual(
+            [
+                {"runtime_id": "runtime-a", "station_id": "gate_main",
+                 "generation": 7, "state": "publishing", "status_revision": 4}
+            ],
+            registry.monitors["gate_main"].applied,
+        )
+        self.assertEqual(
+            [
+                {"runtime_id": "runtime-a", "station_id": "gate_side",
+                 "generation": 7, "state": "viewing", "status_revision": 5}
+            ],
+            registry.monitors["gate_side"].applied,
+        )
+        self.assertEqual(1, provider.reconciled)
+
+    async def test_session_uses_global_revision_when_it_is_newer(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+
+        async def monitor_status():
+            return {
+                "runtime_id": "runtime-a",
+                "status_revision": 143,
+                "sessions": [
+                    {
+                        "station_id": "gate_main",
+                        "generation": 7,
+                        "state": "publishing",
+                        "status_revision": 110,
+                    }
+                ],
+            }
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(client, registry, provider)
+
+        self.assertEqual(143, registry.monitors["gate_main"].applied[0]["status_revision"])
+
+    async def test_later_poll_replaces_a_relay_accelerated_station_state(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+        replies = iter((
+            {
+                "runtime_id": "runtime-a",
+                "sessions": [
+                    {"station_id": "gate_main", "generation": 7,
+                     "state": "publishing", "status_revision": 4},
+                    {"station_id": "gate_side", "generation": 7,
+                     "state": "viewing", "status_revision": 5},
+                ],
+            },
+            {
+                "runtime_id": "runtime-a",
+                "sessions": [
+                    {"station_id": "gate_main", "generation": 7,
+                     "state": "idle", "status_revision": 5},
+                    {"station_id": "gate_side", "generation": 7,
+                     "state": "viewing", "status_revision": 5},
+                ],
+            },
+        ))
+
+        async def monitor_status():
+            return next(replies)
+
+        client.monitor_status = monitor_status
+        await MODULE.sync_monitor_state(client, registry, provider)
+        await MODULE.sync_monitor_state(client, registry, provider)
+
+        self.assertEqual("idle", registry.monitors["gate_main"].applied[-1]["state"])
+        self.assertEqual("viewing", registry.monitors["gate_side"].applied[-1]["state"])
+
+    async def test_relay_sync_updates_only_the_matching_station(self):
+        registry = FakeStationRegistry()
+        provider = FakeProvider()
+        client = types.SimpleNamespace(status={"runtime_id": "runtime-a"})
+
+        async def monitor_status():
+            return {
+                "runtime_id": "runtime-a",
+                "sessions": [
+                    {"station_id": "gate_main", "generation": 7,
+                     "state": "publishing", "status_revision": 4},
+                    {"station_id": "gate_side", "generation": 7,
+                     "state": "viewing", "status_revision": 5},
+                ],
+            }
+
+        client.monitor_status = monitor_status
+        relay_event = {
+            "runtime_id": "runtime-a",
+            "station_id": "gate_main",
+            "event": "monitor_preempted",
+            "generation": 7,
+            "status_revision": 5,
+        }
+        await MODULE.sync_monitor_state(
+            client,
+            registry,
+            provider,
+            station_id="gate_main",
+            relay_event=relay_event,
+        )
+
+        self.assertEqual(
+            ["publishing", "monitor_preempted"],
+            [item.get("state", item.get("event"))
+             for item in registry.monitors["gate_main"].applied],
+        )
+        self.assertEqual([], registry.monitors["gate_side"].applied)
+
     async def test_syncs_polled_media_then_reconciles_provider(self):
         monitor = FakeStatusMonitor()
         provider = FakeProvider()
@@ -153,9 +394,11 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
         hass.data["doorfast_webrtc_unsubscribers"] = {
             FakeEntry.entry_id: object()
         }
+        hass.data["doorfast_stations"] = {FakeEntry.entry_id: object()}
         pcm = FakePcm()
         monitor = FakeMonitor()
         provider = FakeProvider()
+        registry = FakeRegistry()
         provider_unregistered = []
         unregistered = []
 
@@ -173,6 +416,7 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
             service_names=("unlock", "call_elevator", "answer", "hangup"),
             monitor=monitor,
             provider=provider,
+            station_registry=registry,
             unregister_webrtc=lambda: provider_unregistered.append(True),
         )
 
@@ -183,8 +427,10 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("doorfast_monitors", hass.data)
         self.assertNotIn("doorfast_webrtc_providers", hass.data)
         self.assertNotIn("doorfast_webrtc_unsubscribers", hass.data)
+        self.assertNotIn("doorfast_stations", hass.data)
         self.assertEqual(1, monitor.closed)
         self.assertEqual(1, provider.closed)
+        self.assertEqual(1, registry.closed)
         self.assertEqual([True], provider_unregistered)
         self.assertEqual(
             hass.services.removed,
@@ -195,7 +441,9 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
         hass = FakeHass(("unlock", "call_elevator", "answer", "hangup"))
         hass.data["doorfast"] = {FakeEntry.entry_id: object(), "entry-2": object()}
         hass.data["doorfast_event_views"] = {FakeEntry.entry_id: object(), "entry-2": object()}
+        hass.data["doorfast_stations"] = {FakeEntry.entry_id: object(), "entry-2": object()}
         pcm = FakePcm()
+        registry = FakeRegistry()
 
         async def unregister_frontend(_hass, _entry_id):
             raise AssertionError("frontend was not registered for this failed entry")
@@ -210,11 +458,14 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
             frontend_registered=False,
             view_created=True,
             service_names=("unlock", "call_elevator", "answer", "hangup"),
+            station_registry=registry,
         )
 
         self.assertEqual(pcm.released, [FakeEntry.entry_id])
         self.assertEqual(set(hass.data["doorfast"]), {"entry-2"})
         self.assertEqual(set(hass.data["doorfast_event_views"]), {"entry-2"})
+        self.assertEqual(set(hass.data["doorfast_stations"]), {"entry-2"})
+        self.assertEqual(1, registry.closed)
         self.assertEqual(hass.services.removed, [])
 
 

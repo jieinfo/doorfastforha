@@ -5,7 +5,7 @@ import {
   FloatToPcm16Resampler,
   PcmFrameAssembler,
 } from "../../custom_components/doorfast/frontend/pcm-dsp.mjs";
-import { PcmBatchSender } from "../../custom_components/doorfast/frontend/audio-stream.mjs";
+import { PcmBatchSender, PcmAudioPlayback } from "../../custom_components/doorfast/frontend/audio-stream.mjs";
 
 function sine(rate, frequency, seconds, amplitude = 0.5) {
   return Float32Array.from(
@@ -135,4 +135,15 @@ test("closing while a request is pending prevents late completion from sending q
   await sender.drain();
   assert.equal(calls.length, 1);
   assert.equal(sender.queuedFrames, 0);
+});
+
+test("playback polling stops safely on fetch rejection", async () => {
+  let errors = 0;
+  const playback = new PcmAudioPlayback(async () => { throw new Error("gone"); }, {
+    onError: () => { errors += 1; }, intervalMs: 1,
+  });
+  playback.start({ station_id: "front", generation: 7 });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(errors, 1);
+  assert.equal(playback.timer, null);
 });
