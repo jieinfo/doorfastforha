@@ -52,8 +52,8 @@ hangup:
       default: ha
       selector: {text: {}}
 call_station:
-  name: Call indoor unit
-  description: Start a call to one configured Doorfast station's indoor unit.
+  name: Call outdoor station
+  description: Start a call from Home Assistant to one configured outdoor station.
   fields:
     config_entry_id:
       selector: {text: {}}
