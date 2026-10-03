@@ -304,6 +304,7 @@ class StationRegistryTest(unittest.IsolatedAsyncioTestCase):
             },
             entity.device_info,
         )
+        self.assertTrue(entity._attr_has_entity_name)
 
 
 if __name__ == "__main__":

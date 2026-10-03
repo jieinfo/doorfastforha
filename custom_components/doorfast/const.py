@@ -1,5 +1,6 @@
 DOMAIN = "doorfast"
 MANUFACTURER = "Doorfast"
+CONTROLLER_NAME = "Doorfast Bridge"
 SW_VERSION = "0.1.0"
 CONF_SERVER_ADDRESS = "server_address"
 CONF_FILEPATH = "filepath"
