@@ -10,7 +10,7 @@ from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from .const import DOMAIN, MANUFACTURER, RING_STATUS, STATIONS_KEY, SW_VERSION
+from .const import CONTROLLER_NAME, DOMAIN, MANUFACTURER, RING_STATUS, STATIONS_KEY, SW_VERSION
 from .generation import is_ringing
 from .station_entity import DoorfastStationEntity
 
@@ -56,6 +56,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
 
 class IncomingCall(BinarySensorEntity):
+    _attr_has_entity_name = True
     _attr_translation_key = RING_STATUS
     _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
     _attr_should_poll = False
@@ -73,7 +74,7 @@ class IncomingCall(BinarySensorEntity):
     def device_info(self):
         return {
             "identifiers": {(DOMAIN, self.e.entry_id)},
-            "name": "Doorfast Controller",
+            "name": CONTROLLER_NAME,
             "manufacturer": MANUFACTURER,
             "sw_version": SW_VERSION,
         }

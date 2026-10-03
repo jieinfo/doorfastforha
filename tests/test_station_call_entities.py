@@ -114,6 +114,23 @@ class Hass:
 
 
 class StationButtonTest(unittest.IsolatedAsyncioTestCase):
+    def test_station_entities_use_device_scoped_names(self):
+        entity = button.StationCallButton(
+            types.SimpleNamespace(online=True), "entry-1", Station(), Monitor()
+        )
+
+        self.assertTrue(entity._attr_has_entity_name)
+        self.assertEqual("call", entity._attr_translation_key)
+        self.assertEqual("Main Gate", entity.device_info["name"])
+
+    def test_controller_entities_use_bridge_device_name(self):
+        entity = button.ElevatorButton(
+            types.SimpleNamespace(), "entry-1", "up"
+        )
+
+        self.assertTrue(entity._attr_has_entity_name)
+        self.assertEqual("Doorfast Bridge", entity.device_info["name"])
+
     async def test_call_and_hangup_buttons_are_station_scoped(self):
         client = types.SimpleNamespace(
             call_station=AsyncMock(return_value={"state": "calling"}),

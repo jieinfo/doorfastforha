@@ -1,12 +1,13 @@
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from .const import DOMAIN, LATEST_EVENT, MANUFACTURER, SW_VERSION
+from .const import CONTROLLER_NAME, DOMAIN, LATEST_EVENT, MANUFACTURER, SW_VERSION
 
 async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities([DoorfastStatus(hass, entry)])
 
 class DoorfastStatus(SensorEntity):
+    _attr_has_entity_name = True
     _attr_translation_key = LATEST_EVENT
     _attr_should_poll = False
     def __init__(self, hass, entry):
@@ -16,7 +17,7 @@ class DoorfastStatus(SensorEntity):
     @property
     def unique_id(self): return f"{DOMAIN}_{self.entry.entry_id}_{LATEST_EVENT}"
     @property
-    def device_info(self): return {"identifiers": {(DOMAIN,self.entry.entry_id)},"name":"Doorfast Controller","manufacturer":MANUFACTURER,"sw_version":SW_VERSION}
+    def device_info(self): return {"identifiers": {(DOMAIN,self.entry.entry_id)},"name":CONTROLLER_NAME,"manufacturer":MANUFACTURER,"sw_version":SW_VERSION}
     @property
     def native_value(self): return self._state
     @property

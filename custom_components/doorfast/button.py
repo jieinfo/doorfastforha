@@ -2,7 +2,7 @@ import inspect
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.helpers import entity_registry as er
-from .const import DOMAIN, MANUFACTURER, STATIONS_KEY, SW_VERSION
+from .const import CONTROLLER_NAME, DOMAIN, MANUFACTURER, STATIONS_KEY, SW_VERSION
 from .station_entity import DoorfastStationEntity
 async def async_setup_entry(hass, entry, async_add_entities):
  c=hass.data[DOMAIN][entry.entry_id]; async_add_entities([ElevatorButton(c,entry.entry_id,"up"),ElevatorButton(c,entry.entry_id,"down"),AnswerButton(c,entry.entry_id),HangupButton(hass,c,entry.entry_id)])
@@ -42,9 +42,10 @@ async def async_setup_entry(hass, entry, async_add_entities):
  for station_id in registry.station_ids: add_station(station_id)
  entry.async_on_unload(registry.add_listener(listener))
 class Base(ButtonEntity):
+ _attr_has_entity_name = True
  def __init__(self,c,entry_id): self.client=c; self.entry_id=entry_id
  @property
- def device_info(self): return {"identifiers": {(DOMAIN,self.entry_id)},"name":"Doorfast Controller","manufacturer":MANUFACTURER,"sw_version":SW_VERSION}
+ def device_info(self): return {"identifiers": {(DOMAIN,self.entry_id)},"name":CONTROLLER_NAME,"manufacturer":MANUFACTURER,"sw_version":SW_VERSION}
 class ElevatorButton(Base):
  def __init__(self,c,entry_id,d): super().__init__(c,entry_id); self.direction=d; self._attr_translation_key=f"elevator_{d}"
  @property

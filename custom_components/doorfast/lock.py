@@ -4,7 +4,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers import entity_registry as er
 
 from .access_status import access_attributes
-from .const import DOMAIN, MANUFACTURER, SW_VERSION
+from .const import CONTROLLER_NAME, DOMAIN, MANUFACTURER, SW_VERSION
 from .station_entity import DoorfastStationEntity
 
 
@@ -51,6 +51,7 @@ class DoorfastLock(LockEntity):
     _attr_translation_key = "unlock"
     _attr_assumed_state = True
     _attr_should_poll = False
+    _attr_has_entity_name = True
 
     def __init__(self, hass, entry):
         self.hass = hass
@@ -66,7 +67,7 @@ class DoorfastLock(LockEntity):
     def device_info(self):
         return {
             "identifiers": {(DOMAIN, self.entry.entry_id)},
-            "name": "Doorfast Controller",
+            "name": CONTROLLER_NAME,
             "manufacturer": MANUFACTURER,
             "sw_version": SW_VERSION,
         }

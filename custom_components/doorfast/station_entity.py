@@ -11,6 +11,8 @@ from .const import DOMAIN, MANUFACTURER
 class DoorfastStationEntity(Entity):
     """Expose stable child-device identity for one configured station."""
 
+    _attr_has_entity_name = True
+
     def __init__(self, entry_id: str, station: DoorfastStation) -> None:
         self.entry_id = entry_id
         self.station = station

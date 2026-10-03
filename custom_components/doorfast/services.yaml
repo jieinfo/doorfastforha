@@ -1,5 +1,5 @@
 unlock:
-  name: Unlock door
+  name: Unlock entrance
   description: Submit a Doorfast unlock command.
   fields:
     config_entry_id:
@@ -52,8 +52,8 @@ hangup:
       default: ha
       selector: {text: {}}
 call_station:
-  name: Call station
-  description: Start a call to one configured Doorfast station.
+  name: Call indoor unit
+  description: Start a call to one configured Doorfast station's indoor unit.
   fields:
     config_entry_id:
       selector: {text: {}}
@@ -70,8 +70,8 @@ call_station:
       default: 120
       selector: {number: {min: 1, max: 255}}
 hangup_station:
-  name: Hang up station
-  description: Hang up one configured Doorfast station.
+  name: Hang up station call
+  description: Hang up a call to one configured Doorfast station.
   fields:
     config_entry_id:
       selector: {text: {}}
