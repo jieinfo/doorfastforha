@@ -494,7 +494,9 @@ class DoorfastClient:
     async def _bounded_audio_body(response) -> bytes:
         body = bytearray()
         while True:
-            part = await response.content.read(min(1024, 4097 - len(body)))
+            if len(body) == 4096:
+                raise AudioStreamError("audio_invalid_response")
+            part = await response.content.read(min(1024, 4096 - len(body)))
             if not isinstance(part, (bytes, bytearray)):
                 raise AudioStreamError("audio_invalid_response")
             if not part:
@@ -557,13 +559,16 @@ class DoorfastClient:
                 return AudioReadReply("empty")
 
             body = await self._bounded_audio_body(response)
+            if response.status == 400:
+                code = self._audio_error_code(body)
+                if code == "invalid_request":
+                    raise AudioStreamError(code)
+                raise AudioStreamError("audio_invalid_response")
             if response.status == 404:
                 self._audio_response_identity(response.headers, identity)
                 code = self._audio_error_code(body)
                 if code == "audio_unavailable":
                     return AudioReadReply("empty")
-                if code == "audio_identity_mismatch":
-                    raise AudioStreamError(code)
                 raise AudioStreamError("audio_invalid_response")
             if response.status == 409:
                 code = self._audio_error_code(body)
@@ -576,8 +581,6 @@ class DoorfastClient:
                 code = self._audio_error_code(body)
                 if code == "audio_temporarily_unavailable":
                     return AudioReadReply("retry")
-                if code == "audio_identity_mismatch":
-                    raise AudioStreamError(code)
                 raise AudioStreamError("audio_invalid_response")
             if response.status != 200:
                 raise AudioStreamError("audio_invalid_response")
@@ -594,23 +597,23 @@ class DoorfastClient:
             ):
                 raise AudioStreamError("audio_invalid_response")
             dropped_samples = self._audio_response_u64(
-                response.headers, "X-Doorfast-Dropped-Bytes"
+                response.headers, "X-Doorfast-Audio-Dropped-Bytes"
             )
-            discontinuity_raw = response.headers.get("X-Doorfast-Discontinuity")
+            discontinuity_raw = response.headers.get("X-Doorfast-Audio-Discontinuity")
             if discontinuity_raw not in {"0", "1"}:
                 raise AudioStreamError("audio_invalid_response")
             timestamp_ms = self._audio_response_u64(
-                response.headers, "X-Doorfast-Timestamp-Ms"
+                response.headers, "X-Doorfast-Audio-Timestamp-Ms"
             )
             latest_timestamp_ms = self._audio_response_u64(
-                response.headers, "X-Doorfast-Latest-Timestamp-Ms"
+                response.headers, "X-Doorfast-Audio-Latest-Timestamp-Ms"
             )
             if timestamp_ms > latest_timestamp_ms:
                 raise AudioStreamError("audio_invalid_response")
             if (
-                response.headers.get("X-Doorfast-Format") != "s16le"
-                or response.headers.get("X-Doorfast-Sample-Rate") != "8000"
-                or response.headers.get("X-Doorfast-Channels") != "1"
+                response.headers.get("X-Doorfast-Audio-Format") != "s16le"
+                or response.headers.get("X-Doorfast-Audio-Sample-Rate") != "8000"
+                or response.headers.get("X-Doorfast-Audio-Channels") != "1"
             ):
                 raise AudioStreamError("audio_invalid_response")
             pcm = decode_pcm_wav(body)
