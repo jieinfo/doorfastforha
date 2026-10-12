@@ -5,6 +5,13 @@
 
 # Changelog
 
+## 0.3.25
+
+- Register the existing Controller device before parallel station platform setup.
+- Link stations with their own config entry's actual controller device ID on current Home Assistant, avoiding deprecated device registration and lookup interfaces.
+- Keep the supported identifier-based link on older Home Assistant versions.
+- Preserve existing device identifiers, entity unique IDs, names, and preview/call/unlock behavior.
+
 ## 0.3.24
 
 - Use native WebRTC camera hooks so Home Assistant no longer offers an invalid HLS fallback for opaque Doorfast sources.
