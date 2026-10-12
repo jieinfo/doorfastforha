@@ -300,7 +300,6 @@ class StationRegistryTest(unittest.IsolatedAsyncioTestCase):
                 "identifiers": {("doorfast", "entry-1_station_gate_main")},
                 "name": "Gate Main",
                 "manufacturer": "Doorfast",
-                "via_device": ("doorfast", "entry-1"),
             },
             entity.device_info,
         )
