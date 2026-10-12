@@ -4,6 +4,7 @@ import base64
 import unittest
 from unittest.mock import patch
 
+from test_audio_client import DoorfastClient
 from test_pcm_websocket import Connection, Hass, ws
 
 from custom_components.doorfast.client_types import AudioChunk, AudioIdentity, AudioReadReply, AudioStreamError, PcmHttpReply
@@ -71,6 +72,20 @@ class Timer:
     def cancel(self): self.cancelled=True
     def fire(self):
         if not self.cancelled: self.callback(*self.args)
+
+
+class GatedRefreshClient(DoorfastClient):
+    """Real refresh sequence/cache semantics with only HTTP requests replaced."""
+    def __init__(self, responses):
+        super().__init__(None, "http://synthetic.invalid")
+        self.status=status()
+        self.responses=list(responses)
+
+    async def _request(self, method, path, payload=None):
+        response, entered, resume=self.responses.pop(0)
+        entered.set()
+        await resume.wait()
+        return response
 
 
 class AudioWebsocketTest(unittest.IsolatedAsyncioTestCase):
@@ -352,3 +367,125 @@ class AudioWebsocketTest(unittest.IsolatedAsyncioTestCase):
             await self.manager.start(self.connection,{"id":1,"config_entry_id":entry_id})
             self.assertEqual("invalid_request",self.connection.errors[-1][1])
         self.assertFalse(self.manager._starting)
+
+    async def test_reconcile_revokes_first_pending_refresh_without_hub(self):
+        self.client.refresh_wait=asyncio.Event()
+        task=asyncio.create_task(self.manager.listen_start(self.connection,
+            {"id":1,"config_entry_id":"one","station_id":"gate_main"}))
+        await asyncio.sleep(0)
+        await self.manager.reconcile("one",status(runtime="fedcba9876543210",generation=8))
+        try:
+            self.assertEqual({},self.connection.subscriptions)
+            self.assertFalse(self.manager._pending_cleanups)
+        finally:
+            self.client.refresh_wait.set(); await task
+        self.assertEqual([],self.connection.results)
+        self.assertEqual("not_found",self.connection.errors[-1][1])
+        self.assertFalse(self.manager._listeners)
+
+    async def test_reconcile_revokes_pending_callbacks_before_blocked_mic_end(self):
+        lid=await self.listen(); await self.mic(lid)
+        self.client.refresh_wait=asyncio.Event(); self.client.end_wait=asyncio.Event()
+        pending_connection=SubConnection()
+        pending=asyncio.create_task(self.manager.listen_start(pending_connection,
+            {"id":4,"config_entry_id":"one","station_id":"gate_main"}))
+        await asyncio.sleep(0)
+        reconcile=asyncio.create_task(self.manager.reconcile("one",status(generation=8)))
+        await asyncio.sleep(0)
+        try:
+            self.assertEqual({},pending_connection.subscriptions)
+            self.assertEqual({},self.connection.subscriptions)
+            self.assertFalse(self.manager._pending_cleanups)
+            self.assertFalse(self.manager._listeners)
+        finally:
+            self.client.end_wait.set(); self.client.refresh_wait.set()
+            await asyncio.gather(pending,reconcile)
+        self.assertEqual([],pending_connection.results)
+
+    async def test_same_identity_reconcile_preserves_pending_refresh(self):
+        for existing_hub in (False,True):
+            self.connection=SubConnection()
+            if existing_hub: await self.listen()
+            self.client.refresh_wait=asyncio.Event()
+            c=SubConnection()
+            task=asyncio.create_task(self.manager.listen_start(c,
+                {"id":1,"config_entry_id":"one","station_id":"gate_main"}))
+            await asyncio.sleep(0)
+            await self.manager.reconcile("one",status())
+            self.client.refresh_wait.set(); await task
+            self.assertFalse(c.errors); self.assertEqual(7,c.results[-1][1]["generation"])
+            self.client.refresh_wait=None
+            await self.manager.release_entry("one")
+
+    async def test_real_refresh_out_of_order_never_replaces_new_hub_with_stale(self):
+        entered_a=asyncio.Event(); entered_b=asyncio.Event()
+        resume_a=asyncio.Event(); resume_b=asyncio.Event()
+        new_status=status(runtime="fedcba9876543210",generation=8)
+        client=GatedRefreshClient([(status(),entered_a,resume_a),(new_status,entered_b,resume_b)])
+        self.hass.data["doorfast"]["one"]=client
+        a=SubConnection(); b=SubConnection()
+        msg={"id":1,"config_entry_id":"one","station_id":"gate_main"}
+        task_a=asyncio.create_task(self.manager.listen_start(a,msg)); await entered_a.wait()
+        task_b=asyncio.create_task(self.manager.listen_start(b,msg)); await entered_b.wait()
+        resume_b.set(); await task_b
+        listener_b=b.results[-1][1]["listener_id"]
+        hub_b=self.manager._listeners[listener_b].hub
+        resume_a.set(); await task_a
+        self.assertEqual(8,client.status["call"]["generation"])
+        self.assertEqual([],a.results)
+        self.assertEqual("audio_identity_mismatch",a.errors[-1][1])
+        self.assertIs(hub_b,self.manager._hubs["one"])
+        self.assertFalse(hub_b.closed); self.assertIn(listener_b,self.manager._listeners)
+        self.assertEqual({},a.subscriptions)
+
+    async def test_revoked_admin_cannot_read_or_stop_but_internal_cleanup_works(self):
+        lid=await self.listen(); await self.mic(lid)
+        self.connection.user.is_admin=False
+        for method in (self.manager.listen_read,self.manager.listen_stop):
+            before=len(self.connection.results)
+            await method(self.connection,{"id":5,"config_entry_id":"one","listener_id":lid})
+            self.assertTrue(self.connection.errors,"Revoked administrator must receive unauthorized")
+            self.assertEqual("unauthorized",self.connection.errors[-1][1])
+            self.assertEqual(before,len(self.connection.results))
+        self.assertEqual([],self.client.ends)
+        await self.connection.disconnect()
+        self.assertEqual([(RUNTIME,7)],self.client.ends)
+        self.assertEqual({},self.connection.subscriptions)
+
+    async def test_unknown_cached_identity_reconcile_revokes_pending_refresh(self):
+        entered=asyncio.Event(); resume=asyncio.Event()
+        client=GatedRefreshClient([(status(),entered,resume)]); client.status={}
+        self.hass.data["doorfast"]["one"]=client
+        task=asyncio.create_task(self.manager.listen_start(self.connection,
+            {"id":1,"config_entry_id":"one","station_id":"gate_main"}))
+        await entered.wait(); await self.manager.reconcile("one",status())
+        try:
+            self.assertEqual({},self.connection.subscriptions)
+            self.assertFalse(self.manager._pending_cleanups)
+        finally:
+            resume.set(); await task
+        self.assertEqual([],self.connection.results)
+        self.assertEqual("not_found",self.connection.errors[-1][1])
+
+    async def test_revoked_admin_stop_denied_without_stopping_linked_mic(self):
+        lid=await self.listen(); await self.mic(lid)
+        self.connection.user.is_admin=False
+        await self.manager.listen_stop(self.connection,
+            {"id":5,"config_entry_id":"one","listener_id":lid})
+        self.assertTrue(self.connection.errors,"Revoked administrator must receive unauthorized")
+        self.assertEqual("unauthorized",self.connection.errors[-1][1])
+        self.assertEqual([],self.client.ends)
+        self.timers[-1].fire(); await asyncio.sleep(0); await asyncio.sleep(0)
+        self.assertEqual([(RUNTIME,7)],self.client.ends)
+        self.assertEqual({},self.connection.subscriptions)
+
+    async def test_pending_current_call_survives_reconcile_of_previous_hub(self):
+        old=await self.listen(); old_hub=self.manager._listeners[old].hub
+        self.client.status=status(generation=8); self.client.refresh_wait=asyncio.Event()
+        c=SubConnection()
+        task=asyncio.create_task(self.manager.listen_start(c,
+            {"id":1,"config_entry_id":"one","station_id":"gate_main"}))
+        await asyncio.sleep(0); await self.manager.reconcile("one",status(generation=8))
+        self.client.refresh_wait.set(); await task
+        self.assertFalse(c.errors); self.assertEqual(8,c.results[-1][1]["generation"])
+        self.assertTrue(old_hub.closed); self.assertNotIn(old,self.manager._listeners)

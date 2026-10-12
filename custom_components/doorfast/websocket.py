@@ -66,6 +66,15 @@ class _Listener:
     cleanup: Callable[[], None] = field(default=lambda: None)
 
 
+@dataclass
+class _PendingStart:
+    entry_id: str
+    listener_id: str | None
+    revoke: Callable[[], None]
+    station_id: str | None = None
+    identity: AudioIdentity | None = None
+
+
 class PcmWebSocketManager:
     """Bind listeners and one private producer to authenticated connections."""
 
@@ -78,7 +87,7 @@ class PcmWebSocketManager:
         self._listeners: dict[str, _Listener] = {}
         self._hubs: dict[str, AudioListenerHub] = {}
         self._epochs: dict[str, int] = {}
-        self._pending_cleanups: dict[str, tuple[str, str | None, Callable[[], None]]] = {}
+        self._pending_cleanups: dict[str, _PendingStart] = {}
         self._registered = False
 
     def register(self) -> None:
@@ -129,23 +138,31 @@ class PcmWebSocketManager:
         return lambda: None
 
     def _attach_pending(self, entry_id: str, connection: Any,
-                        callback: Callable[[], None], listener_id: str | None = None) -> Callable[[], None]:
+                        callback: Callable[[], None], listener_id: str | None = None,
+                        *, station_id: str | None = None, identity: AudioIdentity | None = None) -> Callable[[], None]:
         key = secrets.token_urlsafe(24)
         def revoke() -> None:
             self._pending_cleanups.pop(key, None)
             cleanup()
             callback()
         cleanup = self._attach_cleanup(connection, key, revoke)
-        self._pending_cleanups[key] = (entry_id, listener_id, revoke)
+        self._pending_cleanups[key] = _PendingStart(entry_id, listener_id, revoke, station_id, identity)
         def detach() -> None:
             self._pending_cleanups.pop(key, None)
             cleanup()
         return detach
 
     def _revoke_pending(self, entry_id: str, listener_id: str | None = None) -> None:
-        for pending_entry, pending_listener, revoke in list(self._pending_cleanups.values()):
-            if pending_entry == entry_id and (listener_id is None or pending_listener == listener_id):
-                revoke()
+        for pending in list(self._pending_cleanups.values()):
+            if pending.entry_id == entry_id and (listener_id is None or pending.listener_id == listener_id):
+                pending.revoke()
+
+    @staticmethod
+    def _listener_identity(status: Any, station_id: str) -> AudioIdentity | None:
+        try:
+            return AudioIdentity.from_status(status, station_id)
+        except AudioStreamError:
+            return None
 
     def _owned_listener(self, connection: Any, msg: dict[str, Any]) -> _Listener:
         listener_id = msg.get("listener_id")
@@ -222,7 +239,8 @@ class PcmWebSocketManager:
             ):
                 raise ValueError("Invalid listener identity")
             epoch = self._epochs.get(entry_id, 0)
-            cleanup = self._attach_pending(entry_id, connection, lambda: pending.__setitem__(0, False))
+            cleanup = self._attach_pending(entry_id, connection, lambda: pending.__setitem__(0, False),
+                station_id=station_id, identity=self._listener_identity(client.status, station_id))
             status = await client.refresh()
             if not pending[0] or self._epochs.get(entry_id, 0) != epoch:
                 raise AudioStreamError("not_found")
@@ -230,6 +248,10 @@ class PcmWebSocketManager:
             if not isinstance(audio, dict) or type(audio.get("pcm_stream_version")) is not int or audio.get("pcm_stream_version") != 1:
                 raise AudioStreamError("unsupported_audio_stream")
             identity = AudioIdentity.from_status(status, station_id, expected_generation=generation)
+            # Older concurrent refreshes return their own response but cannot
+            # overwrite the client's latest authoritative status cache.
+            if identity != self._listener_identity(client.status, station_id):
+                raise AudioStreamError("audio_identity_mismatch")
             if not _safe_int(identity.generation, 1):
                 raise ValueError("Invalid generation")
             hub = self._hubs.get(entry_id)
@@ -266,6 +288,9 @@ class PcmWebSocketManager:
             cleanup()
 
     async def listen_read(self, connection: Any, msg: dict[str, Any]) -> None:
+        if not self._is_admin(connection):
+            self._send_error(connection, msg, "unauthorized", "Administrator permission required")
+            return
         listener = None
         acquired = False
         try:
@@ -308,6 +333,9 @@ class PcmWebSocketManager:
                 listener.reading = False
 
     async def listen_stop(self, connection: Any, msg: dict[str, Any]) -> None:
+        if not self._is_admin(connection):
+            self._send_error(connection, msg, "unauthorized", "Administrator permission required")
+            return
         try:
             listener = self._owned_listener(connection, msg)
         except AudioStreamError as err:
@@ -477,6 +505,13 @@ class PcmWebSocketManager:
 
     async def reconcile(self, entry_id: str, status: dict[str, Any]) -> None:
         producers = []
+        for pending in list(self._pending_cleanups.values()):
+            if pending.entry_id == entry_id and pending.station_id is not None:
+                fresh = self._listener_identity(status, pending.station_id)
+                # Unknown cached identity is unbound; conservatively revoke it
+                # on a status observation, while preserving same-call polls.
+                if pending.identity is None or fresh != pending.identity:
+                    pending.revoke()
         hub = self._hubs.get(entry_id)
         if hub is not None:
             try:
@@ -484,8 +519,6 @@ class PcmWebSocketManager:
             except AudioStreamError:
                 fresh = None
             if fresh != hub.identity:
-                self._epochs[entry_id] = self._epochs.get(entry_id, 0) + 1
-                self._starting.pop(entry_id, None)
                 producers.extend(self._invalidate_hub(entry_id, hub))
         capture = self._by_entry.get(entry_id)
         if capture is None:
