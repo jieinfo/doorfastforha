@@ -112,7 +112,15 @@ class AudioListenerHub:
                 + self._latest_timestamp_ms - chunk.timestamp_ms > 300
             ):
                 listener.discontinuity = True
-                continue
+                # Once this listener falls behind, discard its intermediate
+                # backlog and resume at the newest unconsumed cache entry.
+                chunk, acquired_at = self._cache[-1]
+                listener.cursor = chunk.revision
+                if (
+                    (now - acquired_at) * 1000
+                    + self._latest_timestamp_ms - chunk.timestamp_ms > 300
+                ):
+                    return None
             discontinuity = (
                 listener.discontinuity or chunk.discontinuity
                 or (previous is not None and chunk.previous_revision != previous)
@@ -155,11 +163,12 @@ class AudioListenerHub:
                 try:
                     reply = await self._client.read_audio_chunk(self._identity, after=self._after)
                 except AudioStreamError as error:
+                    self._check_open(epoch)
+                    if error.code != "audio_invalid_response":
+                        self.close()
+                        raise
                     self._check_listener(listener_id, listener, epoch)
-                    if error.code == "audio_invalid_response":
-                        return self._retry(request_started_at)
-                    self.close()
-                    raise
+                    return self._retry(request_started_at)
                 except Exception:
                     # The client boundary can raise transport-specific exceptions.
                     # Cancellation (a BaseException) intentionally propagates.

@@ -230,6 +230,47 @@ class AudioListenerTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(slow.chunk.discontinuity)
         self.assertEqual(2, client.read_count)
 
+    async def test_backlogged_listener_jumps_latest_among_multiple_fresh_chunks(self):
+        hub, client = self.hub([
+            chunk_reply(0, 1, timestamp=1000),
+            chunk_reply(1, 2, timestamp=1100),
+            chunk_reply(2, 3, timestamp=1200),
+            chunk_reply(3, 4, timestamp=1301),
+            AudioReadReply("empty"),
+        ], "fast", "slow", "other")
+        await hub.read("fast")
+        await hub.read("other")
+        for _ in range(3):
+            await hub.read("fast")
+        slow = await hub.read("slow")
+        self.assertEqual(4, slow.chunk.revision)
+        self.assertTrue(slow.chunk.discontinuity)
+        other = await hub.read("other")
+        self.assertEqual(2, other.chunk.revision)
+        self.assertFalse(other.chunk.discontinuity)
+        self.assertEqual(4, client.read_count)
+        self.assertEqual("empty", (await hub.read("fast")).state)
+        self.assertEqual(4, client.requests[-1][1])
+
+    async def test_backlogged_listener_does_not_play_latest_if_it_is_also_stale(self):
+        hub, client = self.hub([
+            chunk_reply(0, 1, timestamp=1000),
+            chunk_reply(1, 2, timestamp=1100),
+            chunk_reply(2, 3, timestamp=1200),
+            chunk_reply(3, 4, timestamp=1301),
+            AudioReadReply("empty"),
+            chunk_reply(4, 5, timestamp=1400),
+        ], "fast", "slow")
+        for _ in range(4):
+            await hub.read("fast")
+        self.now = 0.301
+        self.assertEqual(AudioReadReply("empty"), await hub.read("slow"))
+        self.assertEqual(5, client.read_count)
+        self.now = 0.352
+        latest = await hub.read("slow")
+        self.assertEqual(5, latest.chunk.revision)
+        self.assertTrue(latest.chunk.discontinuity)
+
     async def test_resync_preserves_dedup_high_water_and_next_chunk_discontinuity(self):
         hub, client = self.hub([
             chunk_reply(0, 1), AudioReadReply("resync"), chunk_reply(0, 1),
@@ -319,6 +360,48 @@ class AudioListenerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("invalid_request", caught.exception.code)
         self.assertTrue(hub.closed)
         self.assertEqual(1, client.read_count)
+
+    async def test_identity_exception_closes_hub_after_fetch_listener_is_reused(self):
+        hub, client = self.hub([
+            chunk_reply(0, 1), AudioStreamError("audio_identity_mismatch"),
+        ], "a", "b")
+        await hub.read("a")
+        client.started.clear()
+        gate = asyncio.Event()
+        client.gate = gate
+        pending = asyncio.create_task(hub.read("a"))
+        await client.started.wait()
+        hub.remove("a")
+        hub.add("a")
+        gate.set()
+        with self.assertRaises(AudioStreamError) as caught:
+            await pending
+        self.assertEqual("audio_identity_mismatch", caught.exception.code)
+        self.assertTrue(hub.closed)
+        self.assertEqual(0, len(hub._cache))
+        self.assertEqual(0, len(hub._listeners))
+        with self.assertRaises(AudioStreamError) as other:
+            await hub.read("b")
+        self.assertEqual("audio_listener_closed", other.exception.code)
+        self.assertEqual(2, client.read_count)
+
+    async def test_late_identity_error_from_closed_epoch_cannot_affect_replacement(self):
+        gate = asyncio.Event()
+        old, old_client = self.hub([AudioStreamError("audio_identity_mismatch")], "a", gate=gate)
+        pending = asyncio.create_task(old.read("a"))
+        await old_client.started.wait()
+        old.close()
+        replacement, new_client = self.hub([chunk_reply(0, 1)], "a", "b")
+        await replacement.read("a")
+        gate.set()
+        with self.assertRaises(AudioStreamError) as caught:
+            await pending
+        self.assertEqual("audio_listener_closed", caught.exception.code)
+        self.assertEqual(0, len(old._cache))
+        self.assertFalse(replacement.closed)
+        self.assertEqual(1, (await replacement.read("b")).chunk.revision)
+        self.assertEqual(1, old_client.read_count)
+        self.assertEqual(1, new_client.read_count)
 
     async def test_cancelled_fetch_does_not_poison_shared_lock(self):
         gate = asyncio.Event()
