@@ -5,6 +5,13 @@
 
 # Changelog
 
+## 0.3.24
+
+- Use native WebRTC camera hooks so Home Assistant no longer offers an invalid HLS fallback for opaque Doorfast sources.
+- Block generic stream creation, including preloading, so `doorfast://` sources never reach the ordinary FFmpeg worker.
+- Preserve station-scoped negotiation, retry, and cleanup through the original entry-bound provider.
+- Restart Home Assistant after upgrading to stop ordinary stream workers created by earlier versions.
+
 ## 0.3.20
 
 - Start WebRTC preview negotiation while Doorfast is still bringing the station monitor online.
