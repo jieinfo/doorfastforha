@@ -20,6 +20,7 @@ class Camera:
         self.hass = None
         self.entity_id = None
         self.removed = []
+        self.writes = 0
 
     @property
     def supported_features(self):
@@ -28,8 +29,11 @@ class Camera:
     async def async_remove(self, force_remove=False):
         self.removed.append(force_remove)
 
-    def async_write_ha_state(self):
+    async def async_added_to_hass(self):
         pass
+
+    def async_write_ha_state(self):
+        self.writes += 1
 
     def async_on_remove(self, callback):
         self._remove_callback = callback
@@ -46,6 +50,19 @@ entity_module = types.ModuleType("homeassistant.helpers.entity")
 entity_module.Entity = object
 sys.modules.setdefault("homeassistant.helpers", types.ModuleType("homeassistant.helpers"))
 sys.modules["homeassistant.helpers.entity"] = entity_module
+core_module = types.ModuleType("homeassistant.core")
+core_module.callback = lambda function: function
+sys.modules["homeassistant.core"] = core_module
+dispatcher_module = types.ModuleType("homeassistant.helpers.dispatcher")
+
+
+def connect(hass, signal, listener):
+    hass.listeners.setdefault(signal, []).append(listener)
+    return lambda: hass.listeners[signal].remove(listener)
+
+
+dispatcher_module.async_dispatcher_connect = connect
+sys.modules["homeassistant.helpers.dispatcher"] = dispatcher_module
 
 
 class FakeEntityRegistry:
@@ -89,6 +106,7 @@ load_component("monitor")
 load_component("stations")
 load_component("station_entity")
 camera_integration = load_component("camera")
+camera_integration.async_dispatcher_connect = connect
 
 DoorfastStation = client_types.DoorfastStation
 DoorfastStationCamera = camera_integration.DoorfastStationCamera
@@ -159,6 +177,7 @@ class FakeHass:
     def __init__(self, registry):
         self.data = {const_module.STATIONS_KEY: {"entry-1": registry}}
         self.tasks = []
+        self.listeners = {}
 
     def async_create_task(self, awaitable):
         task = asyncio.create_task(awaitable)
@@ -228,6 +247,73 @@ class DoorfastCameraTest(unittest.IsolatedAsyncioTestCase):
             ENTITY_REGISTRY.removed,
         )
         self.assertEqual(1, len(entry.unloads))
+
+    async def test_distinguishes_frozen_publisher_from_live_station_source(self):
+        client = FakeClient()
+        client.status = {"media": {"sessions": [{
+            "station_id": "gate_main", "state": "publishing", "ready": True,
+            "source_live": False, "started_ms": 100, "first_frame_ms": 160,
+            "control_requests": 4, "busy_replies": 2, "last_error": 3,
+            "password": "must not leak",
+        }, {"station_id": "gate_side", "state": "viewing", "ready": True,
+            "source_live": True}]}}
+        camera = DoorfastStationCamera(
+            client, "entry-1", station("gate_main"), FakeMonitor()
+        )
+        attrs = camera.extra_state_attributes
+        self.assertEqual("reconnecting", attrs.get("monitor_phase"))
+        self.assertIs(attrs.get("monitor_source_live"), False)
+        self.assertEqual(60, attrs.get("monitor_first_frame_latency_ms"))
+        self.assertEqual(4, attrs.get("monitor_control_requests"))
+        self.assertEqual(2, attrs.get("monitor_busy_replies"))
+        self.assertNotIn("password", str(attrs))
+        client.status["media"]["sessions"][0]["source_live"] = True
+        self.assertEqual("live", camera.extra_state_attributes.get("monitor_phase"))
+
+    async def test_legacy_and_other_station_cannot_claim_live_source(self):
+        client = FakeClient()
+        camera = DoorfastStationCamera(
+            client, "entry-1", station("gate_main"), FakeMonitor()
+        )
+        for session in (
+            {"station_id": "gate_main", "state": "publishing", "ready": True},
+            {"station_id": "gate_main", "state": "publishing", "ready": True,
+             "source_live": "true"},
+            {"station_id": "gate_side", "state": "viewing", "ready": True,
+             "source_live": True},
+        ):
+            with self.subTest(session=session):
+                client.status = {"media": {"sessions": [session]}}
+                attrs = camera.extra_state_attributes
+                self.assertNotEqual("live", attrs.get("monitor_phase"))
+                self.assertIsNone(attrs.get("monitor_source_live"))
+
+    async def test_terminal_state_overrides_stale_live_flags(self):
+        client = FakeClient()
+        client.status = {"media": {"sessions": [{
+            "station_id": "gate_main", "state": "failed", "ready": True,
+            "source_live": True,
+        }]}}
+        camera = DoorfastStationCamera(
+            client, "entry-1", station("gate_main"), FakeMonitor()
+        )
+        self.assertEqual("failed", camera.extra_state_attributes.get("monitor_phase"))
+
+    async def test_status_dispatch_updates_camera_without_requesting_media(self):
+        registry = FakeRegistry()
+        hass = FakeHass(registry)
+        camera = DoorfastStationCamera(
+            registry.client, "entry-1", station("gate_main"), FakeMonitor()
+        )
+        camera.hass = hass
+        camera.entity_id = "camera.gate_main"
+        await camera.async_added_to_hass()
+        self.assertEqual(1, len(hass.listeners.get("doorfast_entry-1_STATUS", [])))
+        writes = camera.writes
+        registry.client.online = False
+        hass.listeners["doorfast_entry-1_STATUS"][0](registry.client.status)
+        self.assertGreater(camera.writes, writes)
+        self.assertIsNone(camera.extra_state_attributes["monitor_source_live"])
 
 
 if __name__ == "__main__":

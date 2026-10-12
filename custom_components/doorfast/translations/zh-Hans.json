@@ -11,7 +11,19 @@
   "entity": {
     "lock": {"unlock": {"name": "门禁解锁"}},
     "button": {"elevator_up": {"name": "召梯上行"}, "elevator_down": {"name": "召梯下行"}, "answer": {"name": "接听通话"}, "hangup": {"name": "挂断通话"}, "call": {"name": "呼叫室外机"}},
-    "sensor": {"latest_event": {"name": "Doorfast 状态"}},
+    "sensor": {
+      "latest_event": {"name": "Doorfast 状态"},
+      "preview_status": {"name": "预览状态", "state": {
+        "idle": "空闲", "requesting": "请求预览中", "awaiting_video": "等待首帧",
+        "live": "实时画面在线", "reconnecting": "重连中（保留最后画面）", "in_call": "通话中",
+        "stopping": "停止中", "preempted": "被通话抢占", "failed": "预览失败"
+      }},
+      "unlock_status": {"name": "解锁进度／最近回复", "state": {
+        "idle": "空闲", "waiting_media": "正在建立解锁所需预览", "waiting_reply": "等待门口机回复",
+        "protocol_completed": "门口机已确认（未验证门状态）", "protocol_rejected": "门口机拒绝解锁",
+        "expired": "回复超时", "cancelled": "已取消", "send_failed": "发送失败"
+      }}
+    },
     "binary_sensor": {"ring_status": {"name": "来电"}, "station_reachable": {"name": "门口机在线"}},
     "camera": {"video": {"name": "视频预览"}, "station_monitor": {"name": "门口机监控"}}
   }

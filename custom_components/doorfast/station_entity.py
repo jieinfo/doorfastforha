@@ -17,6 +17,11 @@ class DoorfastStationEntity(Entity):
         self.entry_id = entry_id
         self.station = station
 
+    def async_write_station_state(self) -> None:
+        """Disabled/aborted entities remain tracked but are not attached to HA."""
+        if getattr(self, "hass", None) is not None and getattr(self, "entity_id", None) is not None:
+            self.async_write_ha_state()
+
     @property
     def device_info(self) -> dict:
         return {

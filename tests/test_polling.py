@@ -44,6 +44,7 @@ class PollingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_bridge_refresh_failure_marks_client_offline(self):
         client = types.SimpleNamespace(online=True)
+        notifications = []
 
         async def refresh():
             raise TimeoutError("bridge timeout")
@@ -51,8 +52,24 @@ class PollingTest(unittest.IsolatedAsyncioTestCase):
         async def unexpected():
             raise AssertionError("must not run after bridge failure")
 
-        await polling.async_poll(client, refresh, unexpected, unexpected, unexpected)
+        async def dispatch():
+            notifications.append(client.online)
 
+        await polling.async_poll(client, refresh, unexpected, unexpected, dispatch)
+
+        self.assertFalse(client.online)
+        self.assertEqual([False], notifications)
+
+    async def test_offline_notification_failure_does_not_restore_online(self):
+        client = types.SimpleNamespace(online=True)
+
+        async def refresh():
+            raise TimeoutError("bridge timeout")
+
+        async def failed_dispatch():
+            raise RuntimeError("listener failure")
+
+        await polling.async_poll(client, refresh, failed_dispatch, failed_dispatch, failed_dispatch)
         self.assertFalse(client.online)
 
 

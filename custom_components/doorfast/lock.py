@@ -25,11 +25,13 @@ async def async_setup_entry(hass, entry, async_add_entities):
         if entity is None:
             return
         entity._active = False
-        entity.async_write_ha_state()
+        entity.async_write_station_state()
         entity_registry = er.async_get(hass)
         entity_id = entity_registry.async_get_entity_id("lock", DOMAIN, entity.unique_id)
         if entity_id is not None:
             entity_registry.async_remove(entity_id)
+        if entity.hass is not None and entity.entity_id is not None:
+            hass.async_create_task(entity.async_remove(force_remove=True))
 
     def listener(event, station_id):
         if event == "added":
@@ -38,7 +40,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
             remove_station(station_id)
         elif event == "updated" and station_id in entities:
             entities[station_id].station = registry.station(station_id)
-            entities[station_id].async_write_ha_state()
+            entities[station_id].async_write_station_state()
 
     for station_id in registry.station_ids:
         add_station(station_id)
@@ -137,6 +139,15 @@ class DoorfastStationLock(LockEntity, DoorfastStationEntity):
     @property
     def is_locked(self):
         return True
+
+    async def async_added_to_hass(self):
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, f"{DOMAIN}_{self.entry_id}_STATUS", self._handle_status,
+        ))
+
+    @callback
+    def _handle_status(self, _data):
+        self.async_write_station_state()
 
     async def async_lock(self, **kwargs):
         self.async_write_ha_state()

@@ -25,6 +25,13 @@ async def async_poll(
         await refresh_client()
     except Exception:
         client.online = False
+        # Push availability changes as well as successful status refreshes;
+        # otherwise HA can keep showing an old live frame/status indefinitely.
+        try:
+            await dispatch_status()
+        except Exception:
+            if logger is not None:
+                logger.debug("Doorfast offline notification failed", exc_info=True)
         return
 
     for operation in (refresh_stations, sync_monitor, dispatch_status):
