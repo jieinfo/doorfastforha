@@ -16,15 +16,46 @@ class CameraEntityFeature(IntFlag):
 
 
 class Camera:
+    """Narrow HA 2026.9.3 camera contracts used by this platform."""
+
     def __init__(self):
         self.hass = None
         self.entity_id = None
         self.removed = []
         self.writes = 0
+        self.stream = None
+        self.stream_sources = []
+        self._supports_native_async_webrtc = (
+            type(self).async_handle_async_webrtc_offer
+            != Camera.async_handle_async_webrtc_offer
+        )
 
     @property
     def supported_features(self):
         return self._attr_supported_features
+
+    @property
+    def camera_capabilities(self):
+        # HA advertises HLS for provider-backed cameras, but WebRTC only for
+        # cameras implementing the native signaling hooks.
+        stream_types = set()
+        if CameraEntityFeature.STREAM in self.supported_features:
+            stream_types.add(
+                "web_rtc" if self._supports_native_async_webrtc else "hls"
+            )
+        return types.SimpleNamespace(frontend_stream_types=stream_types)
+
+    async def async_create_stream(self):
+        if self.stream is None:
+            source = await self.stream_source()
+            if not source:
+                return None
+            self.stream_sources.append(source)
+            self.stream = types.SimpleNamespace(source=source)
+        return self.stream
+
+    async def async_handle_async_webrtc_offer(self, offer, session_id, send_message):
+        raise RuntimeError("Camera does not support WebRTC")
 
     async def async_remove(self, force_remove=False):
         self.removed.append(force_remove)
@@ -175,7 +206,10 @@ class FakeRegistry:
 
 class FakeHass:
     def __init__(self, registry):
-        self.data = {const_module.STATIONS_KEY: {"entry-1": registry}}
+        self.data = {
+            const_module.STATIONS_KEY: {"entry-1": registry},
+            const_module.WEBRTC_PROVIDERS_KEY: {"entry-1": object()},
+        }
         self.tasks = []
         self.listeners = {}
 
@@ -201,7 +235,8 @@ class DoorfastCameraTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_exposes_station_source_identity_and_no_jpeg(self):
         camera = DoorfastStationCamera(
-            FakeClient(), "entry-1", station("gate_main"), FakeMonitor()
+            FakeClient(), "entry-1", station("gate_main"), FakeMonitor(),
+            provider=object(),
         )
 
         self.assertIsNone(await camera.async_camera_image())
@@ -213,6 +248,145 @@ class DoorfastCameraTest(unittest.IsolatedAsyncioTestCase):
             "doorfast_entry-1_station_gate_main_camera", camera.unique_id
         )
         self.assertEqual(CameraEntityFeature.STREAM, camera.supported_features)
+
+    async def test_opaque_source_never_creates_a_generic_stream(self):
+        camera = DoorfastStationCamera(
+            FakeClient(), "entry-1", station("gate_main"), FakeMonitor(),
+            provider=object(),
+        )
+        # Preloading and camera/stream requests both enter this public hook.
+        for _ in range(3):
+            self.assertIsNone(await camera.async_create_stream())
+        self.assertIsNone(camera.stream)
+        self.assertEqual([], camera.stream_sources)
+        self.assertEqual(
+            "doorfast://entry-1/station/gate_main/preview",
+            await camera.stream_source(),
+        )
+
+    async def test_frontend_uses_webrtc_without_an_invalid_hls_fallback(self):
+        camera = DoorfastStationCamera(
+            FakeClient(), "entry-1", station("gate_main"), FakeMonitor(),
+            provider=object(),
+        )
+        self.assertEqual(
+            {"web_rtc"}, camera.camera_capabilities.frontend_stream_types
+        )
+        self.assertIn(CameraEntityFeature.STREAM, camera.supported_features)
+
+    async def test_native_signaling_preserves_station_leases_and_bound_provider(self):
+        from tests.test_webrtc import (
+            DoorfastWebRTCProvider, FakeCoordinator, FakeSession, FakeWebSocket,
+            RTCIceCandidateInit, WebRTCAnswer,
+        )
+
+        registry = FakeRegistry()
+        registry.monitors = {
+            "gate_main": FakeCoordinator(9), "gate_side": FakeCoordinator(12),
+        }
+        hass = FakeHass(registry)
+        main_ws, side_ws = FakeWebSocket(), FakeWebSocket()
+        session = FakeSession(main_ws, side_ws)
+        provider = DoorfastWebRTCProvider(
+            hass, "entry-1", registry, "http://127.0.0.1:1984", session=session
+        )
+        hass.data[const_module.WEBRTC_PROVIDERS_KEY] = {
+            "entry-1": provider, "entry-2": object(),
+        }
+        cameras = []
+        await camera_integration.async_setup_entry(hass, FakeEntry(), cameras.extend)
+        main, side = cameras
+        messages = []
+        await main_ws.incoming.put({"type": "webrtc/answer", "value": "main-answer"})
+        await side_ws.incoming.put({"type": "webrtc/answer", "value": "side-answer"})
+        try:
+            await main.async_handle_async_webrtc_offer("main-offer", "main", messages.append)
+            await side.async_handle_async_webrtc_offer("side-offer", "side", messages.append)
+            self.assertEqual(
+                ["main-answer", "side-answer"],
+                [message.value for message in messages if isinstance(message, WebRTCAnswer)],
+            )
+            self.assertEqual([
+                "ws://127.0.0.1:1984/api/ws?src=doorfast_gate_main",
+                "ws://127.0.0.1:1984/api/ws?src=doorfast_gate_side",
+            ], session.urls)
+            self.assertEqual([False], registry.monitors["gate_main"].acquire_wait_ready)
+            self.assertEqual([False], registry.monitors["gate_side"].acquire_wait_ready)
+
+            # A late candidate/close belongs to the old provider after reload.
+            hass.data[const_module.WEBRTC_PROVIDERS_KEY]["entry-1"] = object()
+            await main.async_on_webrtc_candidate("main", RTCIceCandidateInit("main-ice"))
+            self.assertEqual([
+                {"type": "webrtc/offer", "value": "main-offer"},
+                {"type": "webrtc/candidate", "value": "main-ice"},
+            ], main_ws.sent)
+            self.assertEqual([{"type": "webrtc/offer", "value": "side-offer"}], side_ws.sent)
+            main.close_webrtc_session("main")
+            await asyncio.gather(*hass.tasks)
+            self.assertTrue(main_ws.closed)
+            self.assertFalse(side_ws.closed)
+            self.assertEqual(1, registry.monitors["gate_main"].released)
+            self.assertEqual(0, registry.monitors["gate_side"].released)
+            main.close_webrtc_session("main")
+            await asyncio.gather(*hass.tasks)
+            self.assertEqual(1, registry.monitors["gate_main"].released)
+        finally:
+            await provider.async_close_entry()
+        self.assertTrue(side_ws.closed)
+        self.assertEqual(1, registry.monitors["gate_side"].released)
+
+    async def test_native_close_cancels_negotiation_and_releases_viewer(self):
+        from tests.test_webrtc import DoorfastWebRTCProvider, FakeCoordinator, BlockingSession
+
+        registry = FakeRegistry()
+        registry.monitors["gate_main"] = coordinator = FakeCoordinator(9)
+        hass = FakeHass(registry)
+        provider = DoorfastWebRTCProvider(
+            hass, "entry-1", registry, "http://127.0.0.1:1984", session=BlockingSession()
+        )
+        camera = DoorfastStationCamera(
+            registry.client, "entry-1", registry.station("gate_main"), coordinator,
+            provider=provider,
+        )
+        task = asyncio.create_task(camera.async_handle_async_webrtc_offer(
+            "offer", "pending", lambda _: None
+        ))
+        try:
+            for _ in range(20):
+                if coordinator.acquired:
+                    break
+                await asyncio.sleep(0)
+            self.assertEqual(1, coordinator.acquired)
+            camera.close_webrtc_session("pending")
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+            self.assertEqual(1, coordinator.released)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await provider.async_close_entry()
+
+    async def test_native_offer_rejects_removed_station_without_starting_preview(self):
+        from tests.test_webrtc import (
+            DoorfastWebRTCProvider, FakeCoordinator, FakeSession, HomeAssistantError,
+        )
+
+        registry = FakeRegistry()
+        registry.monitors["gate_main"] = coordinator = FakeCoordinator(9)
+        hass = FakeHass(registry)
+        session = FakeSession()
+        provider = DoorfastWebRTCProvider(
+            hass, "entry-1", registry, "http://127.0.0.1:1984", session=session
+        )
+        camera = DoorfastStationCamera(
+            registry.client, "entry-1", registry.station("gate_main"), coordinator,
+            provider=provider,
+        )
+        camera.mark_removed()
+        with self.assertRaisesRegex(HomeAssistantError, "source is not supported"):
+            await camera.async_handle_async_webrtc_offer("offer", "removed", lambda _: None)
+        self.assertEqual(0, coordinator.acquired)
+        self.assertEqual([], session.urls)
 
     async def test_setup_adds_each_station_and_removes_one_dynamically(self):
         registry = FakeRegistry()
@@ -258,7 +432,8 @@ class DoorfastCameraTest(unittest.IsolatedAsyncioTestCase):
         }, {"station_id": "gate_side", "state": "viewing", "ready": True,
             "source_live": True}]}}
         camera = DoorfastStationCamera(
-            client, "entry-1", station("gate_main"), FakeMonitor()
+            client, "entry-1", station("gate_main"), FakeMonitor(),
+            provider=object(),
         )
         attrs = camera.extra_state_attributes
         self.assertEqual("reconnecting", attrs.get("monitor_phase"))
@@ -273,7 +448,8 @@ class DoorfastCameraTest(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_and_other_station_cannot_claim_live_source(self):
         client = FakeClient()
         camera = DoorfastStationCamera(
-            client, "entry-1", station("gate_main"), FakeMonitor()
+            client, "entry-1", station("gate_main"), FakeMonitor(),
+            provider=object(),
         )
         for session in (
             {"station_id": "gate_main", "state": "publishing", "ready": True},
@@ -295,7 +471,8 @@ class DoorfastCameraTest(unittest.IsolatedAsyncioTestCase):
             "source_live": True,
         }]}}
         camera = DoorfastStationCamera(
-            client, "entry-1", station("gate_main"), FakeMonitor()
+            client, "entry-1", station("gate_main"), FakeMonitor(),
+            provider=object(),
         )
         self.assertEqual("failed", camera.extra_state_attributes.get("monitor_phase"))
 
@@ -303,7 +480,8 @@ class DoorfastCameraTest(unittest.IsolatedAsyncioTestCase):
         registry = FakeRegistry()
         hass = FakeHass(registry)
         camera = DoorfastStationCamera(
-            registry.client, "entry-1", station("gate_main"), FakeMonitor()
+            registry.client, "entry-1", station("gate_main"), FakeMonitor(),
+            provider=object(),
         )
         camera.hass = hass
         camera.entity_id = "camera.gate_main"

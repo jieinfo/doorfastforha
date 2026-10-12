@@ -7,7 +7,7 @@ from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
-from .const import DOMAIN, STATIONS_KEY
+from .const import DOMAIN, STATIONS_KEY, WEBRTC_PROVIDERS_KEY
 from .station_entity import DoorfastStationEntity
 from .station_status import preview_attributes
 
@@ -22,6 +22,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
             entry.entry_id,
             registry.station(station_id),
             registry.monitor(station_id),
+            provider=hass.data[WEBRTC_PROVIDERS_KEY][entry.entry_id],
         )
         cameras[station_id] = camera
         async_add_entities([camera])
@@ -63,11 +64,13 @@ class DoorfastStationCamera(Camera, DoorfastStationEntity):
     _attr_content_type = "image/jpeg"
     _attr_supported_features = CameraEntityFeature.STREAM
 
-    def __init__(self, client, entry_id, station, monitor):
+    def __init__(self, client, entry_id, station, monitor, *, provider):
         Camera.__init__(self)
         DoorfastStationEntity.__init__(self, entry_id, station)
         self.client = client
         self.monitor = monitor
+        # Bind the entry's existing provider, not a later reload's replacement.
+        self._preview_provider = provider
         self._active = True
 
     @property
@@ -130,6 +133,23 @@ class DoorfastStationCamera(Camera, DoorfastStationEntity):
 
     async def async_camera_image(self, width=None, height=None):
         return None
+
+    async def async_create_stream(self):
+        """Never pass the opaque signaling source to HA's FFmpeg/HLS worker."""
+        return None
+
+    async def async_handle_async_webrtc_offer(self, offer_sdp, session_id, send_message):
+        """Use native camera signaling so HA advertises WebRTC, not HLS."""
+        await self._preview_provider.async_handle_async_webrtc_offer(
+            self, offer_sdp, session_id, send_message
+        )
+
+    async def async_on_webrtc_candidate(self, session_id, candidate):
+        await self._preview_provider.async_on_webrtc_candidate(session_id, candidate)
+
+    @callback
+    def close_webrtc_session(self, session_id):
+        self._preview_provider.async_close_session(session_id)
 
 
 DoorfastCamera = DoorfastStationCamera

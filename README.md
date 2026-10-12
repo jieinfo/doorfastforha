@@ -37,14 +37,18 @@ player entity.
 ## Active WebRTC preview
 
 When Doorfast reports the media module as installed and available, the camera
-entity exposes an opaque `doorfast://<config_entry_id>/preview` source. HA's
-native `CameraWebRTCProvider` proxies signaling through HA-local go2rtc while
-Doorfast publishes the H.264 preview to the go2rtc RTSP ingress. Use the
+entity exposes an opaque
+`doorfast://<config_entry_id>/station/<station_id>/preview` source. Native camera
+WebRTC hooks delegate signaling to the entry's `CameraWebRTCProvider` through
+HA-local go2rtc while Doorfast publishes the H.264 preview to the go2rtc RTSP
+ingress. Use the
 `doorfast.start_monitor` and `doorfast.stop_monitor` services for explicit
 monitor control; camera viewers also acquire and release a generation
-automatically. The provider keeps the JPEG snapshot path as a fallback and
-does not expose RTSP credentials, SDP, ICE candidates, or the Doorfast bridge
-address in entity state.
+automatically. These cameras support WebRTC only, not HLS, recording, or JPEG
+snapshots. Generic stream requests and preloading cannot send the opaque source
+to FFmpeg. The integration does not expose RTSP credentials, SDP, ICE candidates,
+or the Doorfast bridge address in entity state. After upgrading, restart Home
+Assistant to stop any ordinary stream workers created by an older version.
 
 The go2rtc ingress and field acceptance procedure is documented in
 [`docs/go2rtc-webrtc-acceptance.md`](docs/go2rtc-webrtc-acceptance.md). This
