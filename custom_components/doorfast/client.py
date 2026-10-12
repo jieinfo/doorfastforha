@@ -1,15 +1,23 @@
 from __future__ import annotations
+import json
 from typing import Any
 import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
 from .generation import resolve_generation
 from .client_types import (
+    AudioChunk,
+    AudioIdentity,
+    AudioReadReply,
+    AudioStreamError,
     DoorfastStation,
     DoorfastStationSnapshot,
     PcmHttpReply,
     require_station_id,
 )
+from .audio import decode_pcm_wav
+
+_UINT64_MAX = (1 << 64) - 1
 
 class DoorfastClient:
     """Client for the Doorfast JSON bridge mapped to the local ubus API."""
@@ -458,6 +466,167 @@ class DoorfastClient:
                 response_etag if response_etag == expected_etag else None
             )
             return chunk
+
+    @staticmethod
+    def _audio_response_identity(headers, identity: AudioIdentity) -> None:
+        if (
+            headers.get("X-Doorfast-Runtime-Id") != identity.runtime_id
+            or headers.get("X-Doorfast-Station-Id") != identity.station_id
+            or headers.get("X-Doorfast-Generation") != str(identity.generation)
+        ):
+            raise AudioStreamError("audio_identity_mismatch")
+
+    @staticmethod
+    def _audio_response_u64(headers, name: str) -> int:
+        raw = headers.get(name)
+        if (
+            not isinstance(raw, str)
+            or not raw.isascii()
+            or not raw.isdigit()
+        ):
+            raise AudioStreamError("audio_invalid_response")
+        value = int(raw)
+        if value > _UINT64_MAX:
+            raise AudioStreamError("audio_invalid_response")
+        return value
+
+    @staticmethod
+    async def _bounded_audio_body(response) -> bytes:
+        body = bytearray()
+        while True:
+            part = await response.content.read(min(1024, 4097 - len(body)))
+            if not isinstance(part, (bytes, bytearray)):
+                raise AudioStreamError("audio_invalid_response")
+            if not part:
+                break
+            body.extend(part)
+            if len(body) > 4096:
+                raise AudioStreamError("audio_invalid_response")
+        return bytes(body)
+
+    @staticmethod
+    def _audio_error_code(body: bytes) -> str:
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise AudioStreamError("audio_invalid_response") from error
+        if not isinstance(payload, dict) or not isinstance(payload.get("code"), str):
+            raise AudioStreamError("audio_invalid_response")
+        return payload["code"]
+
+    async def read_audio_chunk(
+        self, identity: AudioIdentity, after: int | None = None
+    ) -> AudioReadReply:
+        """Read one independently-cursor'd station PCM chunk."""
+        if not isinstance(identity, AudioIdentity):
+            raise AudioStreamError("invalid_request")
+        try:
+            require_station_id(identity.station_id)
+        except ValueError as error:
+            raise AudioStreamError("audio_identity_mismatch") from error
+        if (
+            not isinstance(identity.runtime_id, str)
+            or len(identity.runtime_id) != 16
+            or any(character not in "0123456789abcdef" for character in identity.runtime_id)
+            or isinstance(identity.generation, bool)
+            or not isinstance(identity.generation, int)
+            or not 1 <= identity.generation <= _UINT64_MAX
+        ):
+            raise AudioStreamError("audio_identity_mismatch")
+        if after is not None and (
+            isinstance(after, bool)
+            or not isinstance(after, int)
+            or not 0 <= after <= _UINT64_MAX
+        ):
+            raise AudioStreamError("invalid_request")
+        params = {
+            "runtime": identity.runtime_id,
+            "station_id": identity.station_id,
+            "generation": identity.generation,
+        }
+        if after is not None:
+            params["after"] = after
+        async with self.session.get(
+            f"{self.base_url}/api/v1/audio/latest.wav",
+            params=params,
+            headers={},
+            timeout=aiohttp.ClientTimeout(total=2),
+        ) as response:
+            if response.status == 304:
+                self._audio_response_identity(response.headers, identity)
+                return AudioReadReply("empty")
+
+            body = await self._bounded_audio_body(response)
+            if response.status == 404:
+                self._audio_response_identity(response.headers, identity)
+                code = self._audio_error_code(body)
+                if code == "audio_unavailable":
+                    return AudioReadReply("empty")
+                if code == "audio_identity_mismatch":
+                    raise AudioStreamError(code)
+                raise AudioStreamError("audio_invalid_response")
+            if response.status == 409:
+                code = self._audio_error_code(body)
+                if code in {"audio_cursor_expired", "audio_identity_mismatch"}:
+                    if code == "audio_cursor_expired":
+                        return AudioReadReply("resync")
+                    raise AudioStreamError(code)
+                raise AudioStreamError("audio_invalid_response")
+            if response.status == 503:
+                code = self._audio_error_code(body)
+                if code == "audio_temporarily_unavailable":
+                    return AudioReadReply("retry")
+                if code == "audio_identity_mismatch":
+                    raise AudioStreamError(code)
+                raise AudioStreamError("audio_invalid_response")
+            if response.status != 200:
+                raise AudioStreamError("audio_invalid_response")
+
+            self._audio_response_identity(response.headers, identity)
+            previous_revision = self._audio_response_u64(
+                response.headers, "X-Doorfast-Audio-Previous-Revision"
+            )
+            revision = self._audio_response_u64(
+                response.headers, "X-Doorfast-Audio-Revision"
+            )
+            if revision <= previous_revision or (
+                after is not None and previous_revision != after
+            ):
+                raise AudioStreamError("audio_invalid_response")
+            dropped_samples = self._audio_response_u64(
+                response.headers, "X-Doorfast-Dropped-Bytes"
+            )
+            discontinuity_raw = response.headers.get("X-Doorfast-Discontinuity")
+            if discontinuity_raw not in {"0", "1"}:
+                raise AudioStreamError("audio_invalid_response")
+            timestamp_ms = self._audio_response_u64(
+                response.headers, "X-Doorfast-Timestamp-Ms"
+            )
+            latest_timestamp_ms = self._audio_response_u64(
+                response.headers, "X-Doorfast-Latest-Timestamp-Ms"
+            )
+            if timestamp_ms > latest_timestamp_ms:
+                raise AudioStreamError("audio_invalid_response")
+            if (
+                response.headers.get("X-Doorfast-Format") != "s16le"
+                or response.headers.get("X-Doorfast-Sample-Rate") != "8000"
+                or response.headers.get("X-Doorfast-Channels") != "1"
+            ):
+                raise AudioStreamError("audio_invalid_response")
+            pcm = decode_pcm_wav(body)
+            return AudioReadReply(
+                "chunk",
+                AudioChunk(
+                    identity=identity,
+                    previous_revision=previous_revision,
+                    revision=revision,
+                    pcm=pcm,
+                    timestamp_ms=timestamp_ms,
+                    latest_timestamp_ms=latest_timestamp_ms,
+                    dropped_samples=dropped_samples,
+                    discontinuity=discontinuity_raw == "1",
+                ),
+            )
 
     @property
     def latest_audio_url(self) -> str:
