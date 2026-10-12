@@ -35,12 +35,16 @@ export class PcmAudioOutput {
     const now = this.context.currentTime;
     if (discontinuity || (this.nextStart !== null && this.nextStart < now)
         || (this.nextStart !== null && this.nextStart + duration - now > maxBuffer + 1e-9)) {
-      for (const [source, startAt] of this.sources) {
-        if (startAt > now) {
+      let retainedEnd = now;
+      for (const [source, { startAt, endAt }] of this.sources) {
+        // Preserve playing tails only when the newest whole chunk can follow within the cap.
+        if (startAt > now || endAt + duration - now > maxBuffer + 1e-9) {
           this.#release(source, true);
+        } else {
+          retainedEnd = Math.max(retainedEnd, endAt);
         }
       }
-      this.nextStart = null;
+      this.nextStart = Math.max(now + lead, retainedEnd);
     }
     const startAt = this.nextStart ?? now + lead;
     const audioBuffer = this.context.createBuffer(1, samples.length, 8000);
@@ -48,7 +52,7 @@ export class PcmAudioOutput {
     const source = this.context.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(this.context.destination);
-    this.sources.set(source, startAt);
+    this.sources.set(source, { startAt, endAt: startAt + duration });
     source.onended = () => this.#release(source);
     source.start(startAt);
     this.nextStart = startAt + duration;

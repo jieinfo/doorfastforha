@@ -128,6 +128,46 @@ test("discontinuity clears unplayed audio and restarts within the cap", () => {
   near(context.sources[1].startAt + 0.2 - context.currentTime, 0.3);
 });
 
+// Catches mixing the retained 200 ms tail with a whole new 200 ms block.
+for (const reset of ["discontinuity", "overflow"]) {
+  test(`${reset} stops an active long block when nonoverlap cannot fit the cap`, () => {
+    const context = new FakeAudioContext(2);
+    const output = new PcmAudioOutput(context);
+    output.enqueue(new ArrayBuffer(3200));
+    near(context.sources[0].startAt, 2.1);
+    context.currentTime = 2.11;
+    output.enqueue(new ArrayBuffer(3200), { discontinuity: reset === "discontinuity" });
+    const [old, next] = context.sources;
+    assert.equal(old.stopped, 1, "old tail must stop when serial whole blocks exceed the cap");
+    assert.equal(old.disconnected, 1);
+    assert.ok(old.stopped || next.startAt >= 2.3 - 1e-9, "audio blocks must not overlap");
+    near(next.startAt, 2.21);
+    assert.equal(context.buffers[1].length, 1600, "the new PCM block must remain whole");
+    assert.ok(next.startAt + 0.2 - context.currentTime <= 0.3 + 1e-9);
+  });
+}
+
+// Catches losing a retained end when a shorter whole block can follow it within budget.
+for (const reset of ["discontinuity", "overflow"]) {
+  test(`${reset} retains an active block when its tail and new whole block fit`, () => {
+    const context = new FakeAudioContext(2);
+    const output = new PcmAudioOutput(context);
+    output.enqueue(new ArrayBuffer(3200));
+    context.currentTime = 2.11;
+    if (reset === "overflow") output.enqueue(new ArrayBuffer(1600));
+    output.enqueue(new ArrayBuffer(1600), { discontinuity: reset === "discontinuity" });
+    const old = context.sources[0];
+    const next = context.sources.at(-1);
+    assert.equal(old.stopped, 0, "a fitting playing tail must be preserved");
+    assert.equal(old.disconnected, 0);
+    near(next.startAt, 2.3);
+    assert.ok(next.startAt >= 2.3 - 1e-9, "new audio starts after the retained block ends");
+    assert.equal(context.buffers.at(-1).length, 800);
+    assert.ok(next.startAt + 0.1 - context.currentTime <= 0.3 + 1e-9);
+    if (reset === "overflow") assert.equal(context.sources[1].stopped, 1);
+  });
+}
+
 // Catches sources surviving teardown or duplicate stop calls.
 test("PCM output stop releases every node once and permits fresh startup", () => {
   const context = new FakeAudioContext(2);
