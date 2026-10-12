@@ -144,10 +144,11 @@ class PcmProducer:
     """Own one private Doorfast producer lease and never retain PCM bodies."""
 
     def __init__(self, client: _Client, station_id: str | None = None,
-                 generation: int | None = None):
+                 generation: int | None = None, *, expected_runtime_id: str | None = None):
         self._client = client
         self.station_id = station_id
         self.expected_generation = generation
+        self._expected_runtime_id = expected_runtime_id
         self._lock = asyncio.Lock()
         self.state = PcmProducerState.IDLE
         self._runtime: str | None = None
@@ -177,6 +178,8 @@ class PcmProducer:
     async def _fresh_identity(self) -> tuple[str, int]:
         status = await self._client.refresh()
         runtime, generation = _status_identity(status, self.station_id)
+        if self._expected_runtime_id is not None and runtime != self._expected_runtime_id:
+            raise PcmProducerError("runtime_mismatch")
         if self.expected_generation is not None and generation != self.expected_generation:
             raise PcmProducerError("generation_mismatch")
         return runtime, generation

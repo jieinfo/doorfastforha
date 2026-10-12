@@ -143,6 +143,11 @@ async def rollback_entry_setup(
     client, PCM capture owner, frontend reference, or service registrations.
     """
 
+    try:
+        await pcm_ws.release_entry(entry.entry_id)
+    except Exception:
+        pass
+
     if provider is not None:
         try:
             await provider.async_close_entry()
@@ -190,11 +195,6 @@ async def rollback_entry_setup(
             await unregister_frontend(hass, entry.entry_id)
         except Exception:
             pass
-
-    try:
-        await pcm_ws.release_entry(entry.entry_id)
-    except Exception:
-        pass
 
     clients = hass.data.get(DOMAIN)
     if isinstance(clients, dict):

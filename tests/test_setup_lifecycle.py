@@ -437,6 +437,47 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
             [("doorfast", name) for name in ("unlock", "call_elevator", "answer", "hangup")],
         )
 
+    async def test_rollback_invalidates_real_audio_before_provider_wait(self):
+        import asyncio
+        from test_audio_websocket import Client, SubConnection, ws
+        hass = FakeHass()
+        client = Client()
+        hass.data["doorfast"] = {FakeEntry.entry_id: client}
+        hass.async_create_task = asyncio.create_task
+        manager = ws.PcmWebSocketManager(hass)
+        connection = SubConnection()
+        await manager.listen_start(connection, {"id": 1, "config_entry_id": FakeEntry.entry_id,
+                                               "station_id": "gate_main"})
+        listener_id = connection.results[-1][1]["listener_id"]
+        listener = manager._listeners[listener_id]
+        await manager.start(connection, {"id": 2, "config_entry_id": FakeEntry.entry_id,
+                                         "listener_id": listener_id})
+        capture_id = connection.results[-1][1]["capture_id"]
+        entered = asyncio.Event()
+        resume = asyncio.Event()
+
+        class BlockingProvider:
+            async def async_close_entry(self):
+                entered.set()
+                await resume.wait()
+
+        async def unregister(*args): pass
+        task = asyncio.create_task(MODULE.rollback_entry_setup(
+            hass, FakeEntry(), pcm_ws=manager, unregister_frontend=unregister,
+            platforms_forward_attempted=False, frontend_registered=False,
+            view_created=False, service_names=(), provider=BlockingProvider()))
+        await entered.wait()
+        try:
+            self.assertNotIn(listener_id, manager._listeners)
+            self.assertNotIn(capture_id, manager._captures)
+            self.assertTrue(listener.hub.closed)
+            self.assertTrue(listener.lease_timer.cancelled())
+            self.assertEqual({}, connection.subscriptions)
+        finally:
+            resume.set()
+            await task
+            await manager.release_entry(FakeEntry.entry_id)
+
     async def test_preserves_resources_owned_by_another_entry(self):
         hass = FakeHass(("unlock", "call_elevator", "answer", "hangup"))
         hass.data["doorfast"] = {FakeEntry.entry_id: object(), "entry-2": object()}

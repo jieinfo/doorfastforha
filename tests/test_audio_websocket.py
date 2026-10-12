@@ -1,0 +1,354 @@
+"""Synthetic HTTP boundaries exercise real hub/producer/WS lifecycle behavior."""
+import asyncio
+import base64
+import unittest
+from unittest.mock import patch
+
+from test_pcm_websocket import Connection, Hass, ws
+
+from custom_components.doorfast.client_types import AudioChunk, AudioIdentity, AudioReadReply, AudioStreamError, PcmHttpReply
+
+RUNTIME = "0123456789abcdef"
+
+
+def status(runtime=RUNTIME, generation=7):
+    return {"runtime_id": runtime,
+            "call": {"session": "talking", "station_id": "gate_main", "generation": generation},
+            "audio": {"pcm_stream_version": 1},
+            "audio_tx": {"active": True, "generation": generation}}
+
+
+class Client:
+    def __init__(self):
+        self.status = status()
+        self.reads = []
+        self.opens = []
+        self.ends = []
+        self.open_entered = asyncio.Event()
+        self.open_wait = None
+        self.end_wait = None
+        self.read_wait = None
+        self.refresh_wait = None
+
+    async def refresh(self):
+        if self.refresh_wait: await self.refresh_wait.wait()
+        return self.status
+
+    async def read_audio_chunk(self, identity, after=None):
+        if self.read_wait: await self.read_wait.wait()
+        reply = self.reads.pop(0) if self.reads else AudioReadReply("empty")
+        if isinstance(reply, Exception): raise reply
+        return reply
+
+    def pcm_reply(self, runtime, generation, ending=False):
+        return PcmHttpReply(200, {"status": "success", "runtime_id": runtime,
+            "generation": generation, "audio_session": "" if ending else "a" * 32,
+            "accepted_frames": 0, "next_sequence": 0, "lease_ms": 0 if ending else 2000})
+
+    async def pcm_session_open(self, runtime, generation):
+        self.opens.append((runtime, generation)); self.open_entered.set()
+        if self.open_wait: await self.open_wait.wait()
+        return self.pcm_reply(runtime, generation)
+
+    async def pcm_session_end(self, runtime, generation, token):
+        self.ends.append((runtime, generation))
+        if self.end_wait: await self.end_wait.wait()
+        return self.pcm_reply(runtime, generation, True)
+
+
+class SubConnection(Connection):
+    def __init__(self, admin=True):
+        super().__init__(admin); self.subscriptions = {}
+
+    async def disconnect(self):
+        for cb in list(self.subscriptions.values()): cb()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+
+class Timer:
+    def __init__(self, callback, args): self.callback=callback; self.args=args; self.cancelled=False
+    def cancel(self): self.cancelled=True
+    def fire(self):
+        if not self.cancelled: self.callback(*self.args)
+
+
+class AudioWebsocketTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client=Client(); self.hass=Hass()
+        self.hass.data["doorfast"]={"one": self.client, "two": Client()}
+        self.hass.async_create_task=asyncio.create_task
+        self.manager=ws.PcmWebSocketManager(self.hass); self.connection=SubConnection()
+        self.timers=[]
+        loop=asyncio.get_running_loop()
+        def later(delay, callback, *args, **kwargs):
+            self.assertEqual(5.0, delay)
+            timer=Timer(callback,args); self.timers.append(timer); return timer
+        self.timer_patch=patch.object(loop,"call_later",later); self.timer_patch.start()
+
+    async def asyncTearDown(self):
+        self.timer_patch.stop()
+        await self.manager.release_entry("one"); await self.manager.release_entry("two")
+
+    async def listen(self, connection=None, **extra):
+        c=connection or self.connection
+        await self.manager.listen_start(c,{"id":1,"config_entry_id":"one","station_id":"gate_main",**extra})
+        self.assertFalse(c.errors)
+        return c.results[-1][1]["listener_id"]
+
+    async def read(self, lid, connection=None, **extra):
+        c=connection or self.connection
+        await self.manager.listen_read(c,{"id":2,"config_entry_id":"one","listener_id":lid,**extra})
+        return c
+
+    async def mic(self, lid):
+        await self.manager.start(self.connection,{"id":3,"config_entry_id":"one","station_id":"gate_main","listener_id":lid})
+
+    async def test_authenticated_chunk_contract(self):
+        lid=await self.listen(generation=7)
+        self.assertEqual({"listener_id":lid,"station_id":"gate_main","generation":7,
+            "sample_rate":8000,"channels":1,"sample_format":"s16le"},self.connection.results[-1][1])
+        self.client.reads=[AudioReadReply("chunk",AudioChunk(AudioIdentity(RUNTIME,"gate_main",7),0,1,b"\x01\x02",1,1,0,False))]
+        await self.read(lid)
+        self.assertEqual({"state":"chunk","listener_id":lid,"generation":7,"previous_revision":0,"revision":1,
+            "pcm":base64.b64encode(b"\x01\x02").decode(),"discontinuity":False},self.connection.results[-1][1])
+        self.assertFalse(self.client.opens)
+
+    async def test_admin_and_entry_connection_ownership(self):
+        other=SubConnection(False)
+        await self.manager.listen_start(other,{"id":1,"config_entry_id":"one","station_id":"gate_main"})
+        self.assertEqual("unauthorized",other.errors[-1][1])
+        lid=await self.listen()
+        for method in (self.manager.listen_read,self.manager.listen_stop,self.manager.start):
+            other=SubConnection()
+            await method(other,{"id":2,"config_entry_id":"one","listener_id":lid})
+            self.assertEqual("not_found",other.errors[-1][1])
+            await method(self.connection,{"id":2,"config_entry_id":"two","listener_id":lid})
+            self.assertEqual("not_found",self.connection.errors[-1][1]); self.connection.errors.clear()
+        await self.read(lid); self.assertEqual({"state":"empty"},self.connection.results[-1][1])
+
+    async def test_four_listener_limit_and_fresh_hub_after_last_stop(self):
+        ids=[await self.listen() for _ in range(4)]
+        await self.manager.listen_start(self.connection,{"id":5,"config_entry_id":"one","station_id":"gate_main"})
+        self.assertEqual("audio_listener_limit",self.connection.errors[-1][1]); self.connection.errors.clear()
+        for lid in ids: await self.manager.listen_stop(self.connection,{"id":6,"config_entry_id":"one","listener_id":lid})
+        lid=await self.listen(); await self.read(lid)
+        self.assertEqual({"state":"empty"},self.connection.results[-1][1])
+
+    async def test_js_generation_and_mandatory_station(self):
+        for value in (True,1.5,0,9007199254740992):
+            await self.manager.listen_start(self.connection,{"id":1,"config_entry_id":"one","station_id":"gate_main","generation":value})
+            self.assertEqual("invalid_request",self.connection.errors[-1][1])
+        for bad in ({}, {"station_id":""}):
+            await self.manager.listen_start(self.connection,{"id":1,"config_entry_id":"one",**bad})
+            self.assertTrue(self.connection.errors)
+        self.client.status=status(generation=9007199254740992)
+        await self.manager.listen_start(self.connection,{"id":1,"config_entry_id":"one","station_id":"gate_main"})
+        self.assertEqual("invalid_request",self.connection.errors[-1][1])
+
+    async def test_unsupported_capability_and_expected_generation(self):
+        self.client.status["audio"]={}
+        await self.manager.listen_start(self.connection,{"id":1,"config_entry_id":"one","station_id":"gate_main"})
+        self.assertEqual("unsupported_audio_stream",self.connection.errors[-1][1])
+        self.client.status=status()
+        await self.manager.listen_start(self.connection,{"id":1,"config_entry_id":"one","station_id":"gate_main","generation":8})
+        self.assertEqual("audio_identity_mismatch",self.connection.errors[-1][1])
+
+    async def test_mic_bound_to_backend_runtime_and_busy(self):
+        lid=await self.listen(); await self.mic(lid)
+        self.assertEqual([(RUNTIME,7)],self.client.opens)
+        await self.mic(lid); self.assertEqual("producer_busy",self.connection.errors[-1][1])
+        self.connection.errors.clear(); other=await self.listen()
+        await self.mic(other); self.assertEqual("producer_busy",self.connection.errors[-1][1])
+
+    async def test_reused_generation_reboot_does_not_open_mic(self):
+        lid=await self.listen(); self.client.status=status(runtime="fedcba9876543210")
+        await self.mic(lid); self.assertEqual([],self.client.opens)
+        self.assertEqual("runtime_mismatch",self.connection.errors[-1][1])
+
+    async def test_bound_factory_typeerror_never_uses_legacy_fallback(self):
+        lid=await self.listen(); calls=[]
+        def factory(*args,**kwargs):
+            calls.append((args,kwargs)); raise TypeError("private detail")
+        self.manager.producer_factory=factory
+        await self.mic(lid); self.assertEqual(1,len(calls))
+        self.assertNotIn("private detail",str(self.connection.errors))
+
+    async def test_stop_listener_preserves_other_listener(self):
+        lid=await self.listen(); other=await self.listen(); await self.mic(lid)
+        await self.manager.listen_stop(self.connection,{"id":4,"config_entry_id":"one","listener_id":other})
+        self.assertFalse(self.client.ends)
+        await self.read(lid); self.assertFalse(self.connection.errors)
+        await self.manager.listen_stop(self.connection,{"id":4,"config_entry_id":"one","listener_id":lid})
+        self.assertEqual([(RUNTIME,7)],self.client.ends); self.assertEqual({},self.connection.subscriptions)
+
+    async def test_idle_lease_empty_refresh_and_expiry(self):
+        lid=await self.listen(); first=self.timers[-1]; await self.mic(lid)
+        await self.read(lid); self.assertTrue(first.cancelled)
+        first.fire(); await asyncio.sleep(0); self.assertFalse(self.client.ends)
+        self.timers[-1].fire(); await asyncio.sleep(0); await asyncio.sleep(0)
+        await self.read(lid); self.assertEqual("not_found",self.connection.errors[-1][1])
+        self.assertEqual([(RUNTIME,7)],self.client.ends); self.assertEqual({},self.connection.subscriptions)
+
+    async def test_active_read_idle_expiry_discards_late_chunk(self):
+        lid=await self.listen(); self.client.read_wait=asyncio.Event()
+        task=asyncio.create_task(self.read(lid)); await asyncio.sleep(0)
+        self.timers[-1].fire(); await asyncio.sleep(0); self.client.read_wait.set(); await task
+        self.assertEqual("not_found",self.connection.errors[-1][1])
+
+    async def test_downlink_failure_invalidates_shared_hub_and_linked_mic(self):
+        lid=await self.listen(); other=await self.listen(); await self.mic(lid)
+        self.client.reads=[AudioStreamError("audio_identity_mismatch")]
+        await self.read(other); self.assertEqual([(RUNTIME,7)],self.client.ends)
+        await self.read(lid); self.assertEqual("not_found",self.connection.errors[-1][1])
+        self.assertEqual({},self.connection.subscriptions)
+
+    async def test_reconcile_restart_and_new_call_never_migrate_listeners(self):
+        lid=await self.listen(); await self.mic(lid)
+        self.client.status=status(runtime="fedcba9876543210")
+        await self.manager.reconcile("one",self.client.status)
+        await self.read(lid); self.assertEqual("not_found",self.connection.errors[-1][1]); self.connection.errors.clear()
+        new=await self.listen(); self.assertNotEqual(lid,new)
+        await self.read(new); self.assertFalse(self.connection.errors)
+
+    async def test_fresh_start_invalidates_previous_identity(self):
+        lid=await self.listen(); await self.mic(lid); self.client.status=status(generation=8)
+        await self.listen(); await self.read(lid)
+        self.assertEqual("not_found",self.connection.errors[-1][1]); self.assertEqual([(RUNTIME,7)],self.client.ends)
+
+    async def test_release_entry_invalidates_before_blocked_end(self):
+        lid=await self.listen(); await self.mic(lid); self.client.end_wait=asyncio.Event()
+        task=asyncio.create_task(self.manager.release_entry("one")); await asyncio.sleep(0)
+        await self.read(lid); self.assertEqual("not_found",self.connection.errors[-1][1])
+        self.assertEqual({},self.connection.subscriptions)
+        self.client.end_wait.set(); await task
+
+    async def test_late_open_is_closed_after_listener_stop(self):
+        lid=await self.listen(); self.client.open_wait=asyncio.Event()
+        task=asyncio.create_task(self.mic(lid)); await self.client.open_entered.wait()
+        await self.manager.listen_stop(self.connection,{"id":4,"config_entry_id":"one","listener_id":lid})
+        self.client.open_wait.set(); await task
+        self.assertEqual([(RUNTIME,7)],self.client.ends)
+        self.assertFalse(any("capture_id" in r for _,r in self.connection.results))
+
+    async def test_disconnect_releases_and_prevents_late_open(self):
+        lid=await self.listen(); self.client.open_wait=asyncio.Event()
+        task=asyncio.create_task(self.mic(lid)); await self.client.open_entered.wait()
+        await self.connection.disconnect(); self.client.open_wait.set(); await task
+        self.assertEqual([(RUNTIME,7)],self.client.ends); self.assertEqual({},self.connection.subscriptions)
+
+    async def test_fallback_cleanup_removed_on_stop(self):
+        c=Connection(); lid=await self.listen(c)
+        await self.manager.listen_stop(c,{"id":2,"config_entry_id":"one","listener_id":lid})
+        self.assertEqual([],c.cleanup)
+
+    async def test_retry_resync_never_serialize_audio(self):
+        for state in ("retry","resync"):
+            lid=await self.listen(); self.client.reads=[AudioReadReply(state)]
+            await self.read(lid); self.assertEqual({"state":"empty"},self.connection.results[-1][1])
+            await self.manager.listen_stop(self.connection,{"id":3,"config_entry_id":"one","listener_id":lid})
+
+    async def test_invalid_revision_never_reaches_browser(self):
+        for revision in (True,1.5,-1,9007199254740992):
+            lid=await self.listen()
+            self.client.reads=[AudioReadReply("chunk",AudioChunk(AudioIdentity(RUNTIME,"gate_main",7),0,revision,b"\x00\x00",1,1,0,False))]
+            await self.read(lid); self.assertFalse(any(r.get("state")=="chunk" for _,r in self.connection.results))
+            self.connection.errors.clear()
+            await self.manager.release_entry("one")
+
+    async def test_pending_listen_start_revoked_during_refresh(self):
+        for disconnect in (False, True):
+            self.client.refresh_wait=asyncio.Event()
+            c=SubConnection()
+            task=asyncio.create_task(self.manager.listen_start(c,{"id":1,"config_entry_id":"one","station_id":"gate_main"}))
+            await asyncio.sleep(0)
+            if disconnect: await c.disconnect()
+            else: await self.manager.release_entry("one")
+            self.assertEqual({},c.subscriptions)
+            self.client.refresh_wait.set(); await task
+            self.assertEqual([],c.results); self.assertEqual("not_found",c.errors[-1][1])
+            self.assertEqual({},c.subscriptions)
+        self.client.refresh_wait=None
+
+    async def test_failed_factory_does_not_keep_start_reservation(self):
+        lid=await self.listen()
+        original=self.manager.producer_factory
+        def factory(*args,**kwargs): raise TypeError("failure")
+        self.manager.producer_factory=factory
+        await self.mic(lid); self.connection.errors.clear()
+        self.manager.producer_factory=original
+        await self.mic(lid)
+        self.assertFalse(self.connection.errors)
+        self.assertEqual([(RUNTIME,7)],self.client.opens)
+
+    async def test_fallback_disconnect_waits_for_pcm_end_and_cleans_callbacks(self):
+        c=Connection(); lid=await self.listen(c)
+        await self.manager.start(c,{"id":2,"config_entry_id":"one","listener_id":lid})
+        await c.disconnect()
+        self.assertEqual([(RUNTIME,7)],self.client.ends)
+        self.assertEqual([],c.cleanup)
+
+    async def test_concurrent_read_rejected_without_releasing_owner(self):
+        lid=await self.listen(); self.client.read_wait=asyncio.Event()
+        task=asyncio.create_task(self.read(lid)); await asyncio.sleep(0)
+        await self.read(lid); self.assertEqual("audio_read_busy",self.connection.errors[-1][1])
+        await self.read(lid); self.assertEqual("audio_read_busy",self.connection.errors[-1][1])
+        self.client.read_wait.set(); await task
+        self.connection.errors.clear(); await self.read(lid)
+        self.assertFalse(self.connection.errors)
+
+    async def test_late_open_revoked_by_entry_release_or_reconcile(self):
+        for reconcile in (False,True):
+            self.connection=SubConnection()
+            lid=await self.listen(); self.client.open_wait=asyncio.Event(); self.client.open_entered.clear()
+            task=asyncio.create_task(self.mic(lid)); await self.client.open_entered.wait()
+            if reconcile: await self.manager.reconcile("one",status(runtime="fedcba9876543210"))
+            else: await self.manager.release_entry("one")
+            self.assertEqual({},self.connection.subscriptions)
+            self.client.open_wait.set(); await task
+            self.assertFalse(any("capture_id" in result for _,result in self.connection.results))
+        self.assertEqual([(RUNTIME,7),(RUNTIME,7)],self.client.ends)
+
+    async def test_listener_failure_does_not_stop_unlinked_ptt(self):
+        lid=await self.listen()
+        await self.manager.start(self.connection,{"id":2,"config_entry_id":"one","station_id":"gate_main","generation":7})
+        capture_id=self.connection.results[-1][1]["capture_id"]
+        self.client.reads=[AudioStreamError("audio_identity_mismatch")]
+        await self.read(lid); self.assertEqual([],self.client.ends)
+        await self.manager.stop(self.connection,{"id":3,"config_entry_id":"one","capture_id":capture_id})
+        self.assertEqual([(RUNTIME,7)],self.client.ends)
+
+    async def test_continuous_retry_deadline_closes_linked_mic(self):
+        lid=await self.listen(); await self.mic(lid)
+        hub=self.manager._listeners[lid].hub
+        now=[0.0]; hub._clock=lambda: now[0]
+        self.client.reads=[AudioReadReply("retry")]
+        await self.read(lid); self.assertEqual({"state":"empty"},self.connection.results[-1][1])
+        now[0]=5.0; await self.read(lid)
+        self.assertEqual("audio_connection_lost",self.connection.errors[-1][1])
+        self.assertEqual([(RUNTIME,7)],self.client.ends)
+        self.assertEqual({},self.connection.subscriptions)
+
+    async def test_mic_start_cancelled_during_refresh_removes_pending_owner(self):
+        lid=await self.listen(); self.client.refresh_wait=asyncio.Event()
+        task=asyncio.create_task(self.mic(lid)); await asyncio.sleep(0)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError): await task
+        self.client.refresh_wait=None
+        await self.mic(lid)
+        self.assertFalse(self.connection.errors); self.assertEqual([(RUNTIME,7)],self.client.opens)
+
+    async def test_listen_start_cancelled_during_refresh_removes_pending_cleanup(self):
+        self.client.refresh_wait=asyncio.Event()
+        task=asyncio.create_task(self.manager.listen_start(self.connection,
+            {"id":1,"config_entry_id":"one","station_id":"gate_main"}))
+        await asyncio.sleep(0); task.cancel()
+        with self.assertRaises(asyncio.CancelledError): await task
+        self.assertEqual({},self.connection.subscriptions)
+        self.assertFalse(self.manager._pending_cleanups)
+
+    async def test_invalid_entry_is_bounded_without_start_reservation(self):
+        for entry_id in (None,[],{}):
+            await self.manager.start(self.connection,{"id":1,"config_entry_id":entry_id})
+            self.assertEqual("invalid_request",self.connection.errors[-1][1])
+        self.assertFalse(self.manager._starting)

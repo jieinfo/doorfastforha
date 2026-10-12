@@ -22,6 +22,7 @@ def _load(name, path):
 client_types = _load("custom_components.doorfast.client_types", COMPONENT / "client_types.py")
 pcm = _load("custom_components.doorfast.pcm", COMPONENT / "pcm.py")
 const = _load("custom_components.doorfast.const", COMPONENT / "const.py")
+audio = _load("custom_components.doorfast.audio", COMPONENT / "audio.py")
 
 # The module falls back to this decorator and registration is exercised directly.
 ws = _load("custom_components.doorfast.websocket", COMPONENT / "websocket.py")
@@ -35,9 +36,11 @@ class Connection:
         self.user = User(admin); self.results=[]; self.errors=[]; self.cleanup=[]
     def send_result(self, ident, result): self.results.append((ident, result))
     def send_error(self, ident, code, message): self.errors.append((ident, code, message))
-    def async_add_cleanup_callback(self, cb): self.cleanup.append(cb)
+    def async_add_cleanup_callback(self, cb):
+        self.cleanup.append(cb)
+        return lambda: self.cleanup.remove(cb) if cb in self.cleanup else None
     async def disconnect(self):
-        for cb in self.cleanup:
+        for cb in list(self.cleanup):
             result = cb()
             if hasattr(result, "__await__"): await result
 
@@ -52,6 +55,7 @@ class FakeProducer:
 
 class Hass:
     def __init__(self): self.data={"doorfast": {"one": object(), "two": object()}}
+    def async_create_task(self, coro): return asyncio.create_task(coro)
 
 class WebsocketOwnershipTest(unittest.IsolatedAsyncioTestCase):
     def manager(self): return ws.PcmWebSocketManager(Hass(), FakeProducer)
@@ -111,6 +115,6 @@ class WebsocketOwnershipTest(unittest.IsolatedAsyncioTestCase):
         try:
             m=self.manager(); m.register(); m.register()
         finally: ws.async_register_command=original
-        self.assertEqual(3,len(calls))
+        self.assertEqual(6,len(calls))
 
 if __name__ == "__main__": unittest.main()
