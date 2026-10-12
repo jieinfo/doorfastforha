@@ -155,6 +155,7 @@ class PcmProducer:
         self._generation: int | None = None
         self._token: str | None = None
         self._sequence = 0
+        self._call_identity: tuple[str, str | None, int] | None = None
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(state={self.state.value!r})"
@@ -162,6 +163,11 @@ class PcmProducer:
     @property
     def generation(self) -> int | None:
         return self._generation
+
+    @property
+    def call_identity(self) -> tuple[str, str | None, int] | None:
+        """The validated backend call chosen before producer-open awaits."""
+        return self._call_identity
 
     @property
     def sequence(self) -> int:
@@ -173,6 +179,7 @@ class PcmProducer:
         self._generation = None
         self._token = None
         self._sequence = 0
+        self._call_identity = None
         self.state = PcmProducerState.IDLE
 
     async def _fresh_identity(self) -> tuple[str, int]:
@@ -182,6 +189,8 @@ class PcmProducer:
             raise PcmProducerError("runtime_mismatch")
         if self.expected_generation is not None and generation != self.expected_generation:
             raise PcmProducerError("generation_mismatch")
+        station_id = status["call"].get("station_id")
+        self._call_identity = (runtime, station_id if isinstance(station_id, str) else None, generation)
         return runtime, generation
 
     def _require_identity(self) -> tuple[str, int, str]:

@@ -489,3 +489,129 @@ class AudioWebsocketTest(unittest.IsolatedAsyncioTestCase):
         self.client.refresh_wait.set(); await task
         self.assertFalse(c.errors); self.assertEqual(8,c.results[-1][1]["generation"])
         self.assertTrue(old_hub.closed); self.assertNotIn(old,self.manager._listeners)
+
+    async def test_legacy_pending_open_revoked_by_changed_call(self):
+        for extra in ({},{"station_id":"gate_main"}):
+            await self.listen()
+            c=SubConnection(); gate=asyncio.Event()
+            self.client.open_wait=gate; self.client.open_entered.clear()
+            task=asyncio.create_task(self.manager.start(c,{"id":2,"config_entry_id":"one",**extra}))
+            await self.client.open_entered.wait()
+            await self.manager.reconcile("one",status(generation=8))
+            try:
+                self.assertEqual({},c.subscriptions)
+                self.assertFalse(self.manager._starting)
+                self.assertFalse(self.manager._pending_cleanups)
+            finally:
+                gate.set(); await task
+            self.assertEqual([],c.results); self.assertEqual("not_found",c.errors[-1][1])
+            self.assertFalse(self.manager._captures)
+            self.connection=SubConnection()
+        self.assertEqual([(RUNTIME,7),(RUNTIME,7)],self.client.ends)
+
+    async def test_legacy_current_pending_open_survives_old_hub_reconcile(self):
+        old=await self.listen(); old_hub=self.manager._listeners[old].hub
+        self.client.status=status(generation=8); self.client.open_wait=asyncio.Event()
+        c=SubConnection()
+        task=asyncio.create_task(self.manager.start(c,{"id":2,"config_entry_id":"one"}))
+        await self.client.open_entered.wait()
+        await self.manager.reconcile("one",status(generation=8))
+        self.client.open_wait.set(); await task
+        self.assertFalse(c.errors); self.assertEqual("active",c.results[-1][1]["state"])
+        self.assertEqual(8,self.manager._by_entry["one"].producer.generation)
+        self.assertTrue(old_hub.closed); self.assertEqual([],self.client.ends)
+
+    async def test_legacy_same_call_pending_open_survives_without_stream_capability(self):
+        self.client.status["audio"]={}; self.client.open_wait=asyncio.Event()
+        c=SubConnection()
+        task=asyncio.create_task(self.manager.start(c,{"id":2,"config_entry_id":"one"}))
+        await self.client.open_entered.wait()
+        current=status(); current["audio"]={}
+        await self.manager.reconcile("one",current)
+        self.client.open_wait.set(); await task
+        self.assertFalse(c.errors); self.assertEqual("active",c.results[-1][1]["state"])
+        self.assertEqual([],self.client.ends)
+
+    async def test_legacy_pending_refresh_unknown_identity_revoked(self):
+        self.client.refresh_wait=asyncio.Event(); c=SubConnection()
+        task=asyncio.create_task(self.manager.start(c,{"id":2,"config_entry_id":"one"}))
+        await asyncio.sleep(0); await self.manager.reconcile("one",{})
+        try:
+            self.assertEqual({},c.subscriptions)
+            self.assertFalse(self.manager._starting)
+        finally:
+            self.client.refresh_wait.set(); await task
+        self.assertEqual([],c.results); self.assertEqual("not_found",c.errors[-1][1])
+        self.assertEqual([(RUNTIME,7)],self.client.ends)
+
+    async def test_legacy_pending_open_revoked_by_runtime_station_or_terminal(self):
+        changed=[status(runtime="fedcba9876543210"),status(),status()]
+        changed[1]["call"]["station_id"]="other_gate"
+        changed[2]["call"]["session"]="idle"
+        for current in changed:
+            c=SubConnection(); self.client.open_wait=asyncio.Event(); self.client.open_entered.clear()
+            task=asyncio.create_task(self.manager.start(c,{"id":2,"config_entry_id":"one"}))
+            await self.client.open_entered.wait(); await self.manager.reconcile("one",current)
+            try:
+                self.assertEqual({},c.subscriptions)
+                self.assertFalse(self.manager._starting)
+            finally:
+                self.client.open_wait.set(); await task
+            self.assertEqual([],c.results); self.assertEqual("not_found",c.errors[-1][1])
+        self.assertEqual([(RUNTIME,7)]*3,self.client.ends)
+
+    async def test_old_legacy_open_cleanup_cannot_clear_new_reservation(self):
+        c_old=SubConnection(); old_gate=asyncio.Event(); self.client.open_wait=old_gate
+        old=asyncio.create_task(self.manager.start(c_old,{"id":1,"config_entry_id":"one"}))
+        await self.client.open_entered.wait(); await self.manager.reconcile("one",status(generation=8))
+        self.client.status=status(generation=8)
+        c_new=SubConnection(); new_gate=asyncio.Event(); self.client.open_wait=new_gate
+        self.client.open_entered.clear()
+        new=asyncio.create_task(self.manager.start(c_new,{"id":2,"config_entry_id":"one"}))
+        await asyncio.sleep(0)
+        try:
+            self.assertFalse(c_new.errors)
+            self.assertTrue(self.client.open_entered.is_set())
+            old_gate.set(); await old
+            c_third=SubConnection()
+            await self.manager.start(c_third,{"id":3,"config_entry_id":"one"})
+            self.assertEqual("producer_busy",c_third.errors[-1][1])
+        finally:
+            old_gate.set(); new_gate.set(); await asyncio.gather(old,new)
+        self.assertEqual([],c_old.results); self.assertEqual([(RUNTIME,7)],self.client.ends)
+        self.assertFalse(c_new.errors); self.assertEqual(8,self.manager._by_entry["one"].producer.generation)
+
+    async def test_legacy_pending_uses_producer_fresh_binding_not_initial_cache(self):
+        async def refreshed(): return status(generation=8)
+        self.client.refresh=refreshed; self.client.open_wait=asyncio.Event()
+        c=SubConnection()
+        task=asyncio.create_task(self.manager.start(c,{"id":2,"config_entry_id":"one"}))
+        await self.client.open_entered.wait()
+        self.assertEqual(7,self.client.status["call"]["generation"])
+        await self.manager.reconcile("one",status(generation=8))
+        self.client.open_wait.set(); await task
+        self.assertFalse(c.errors); self.assertEqual(8,self.manager._by_entry["one"].producer.generation)
+        self.assertEqual([],self.client.ends)
+
+    async def test_legacy_factory_without_public_binding_is_revoked_conservatively(self):
+        class OldFactory:
+            def __init__(self, client): self.producer=ws.PcmProducer(client)
+            async def start(self): await self.producer.start()
+            async def stop(self): await self.producer.stop()
+            @property
+            def generation(self): return self.producer.generation
+            @property
+            def sequence(self): return self.producer.sequence
+            @property
+            def state(self): return self.producer.state
+        self.manager.producer_factory=OldFactory
+        c=SubConnection(); self.client.open_wait=asyncio.Event()
+        task=asyncio.create_task(self.manager.start(c,{"id":2,"config_entry_id":"one"}))
+        await self.client.open_entered.wait(); await self.manager.reconcile("one",status())
+        try:
+            self.assertEqual({},c.subscriptions)
+            self.assertFalse(self.manager._starting)
+        finally:
+            self.client.open_wait.set(); await task
+        self.assertEqual([],c.results); self.assertEqual("not_found",c.errors[-1][1])
+        self.assertEqual([(RUNTIME,7)],self.client.ends)

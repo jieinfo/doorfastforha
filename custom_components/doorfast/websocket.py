@@ -73,6 +73,7 @@ class _PendingStart:
     revoke: Callable[[], None]
     station_id: str | None = None
     identity: AudioIdentity | None = None
+    producer: PcmProducer | None = None
 
 
 class PcmWebSocketManager:
@@ -139,14 +140,15 @@ class PcmWebSocketManager:
 
     def _attach_pending(self, entry_id: str, connection: Any,
                         callback: Callable[[], None], listener_id: str | None = None,
-                        *, station_id: str | None = None, identity: AudioIdentity | None = None) -> Callable[[], None]:
+                        *, station_id: str | None = None, identity: AudioIdentity | None = None,
+                        producer: PcmProducer | None = None) -> Callable[[], None]:
         key = secrets.token_urlsafe(24)
         def revoke() -> None:
             self._pending_cleanups.pop(key, None)
             cleanup()
             callback()
         cleanup = self._attach_cleanup(connection, key, revoke)
-        self._pending_cleanups[key] = _PendingStart(entry_id, listener_id, revoke, station_id, identity)
+        self._pending_cleanups[key] = _PendingStart(entry_id, listener_id, revoke, station_id, identity, producer)
         def detach() -> None:
             self._pending_cleanups.pop(key, None)
             cleanup()
@@ -362,8 +364,6 @@ class PcmWebSocketManager:
             def cancel_start() -> None:
                 if self._starting.get(entry_id) is reservation:
                     self._starting.pop(entry_id, None)
-            cleanup = self._attach_pending(entry_id, connection, cancel_start,
-                                           listener.listener_id if listener else None)
             station_id = msg.get("station_id")
             generation = msg.get("generation")
             if station_id is not None and (not isinstance(station_id, str) or not station_id):
@@ -386,6 +386,8 @@ class PcmWebSocketManager:
                 except TypeError:
                     # Legacy factories remain supported only for unbound PTT.
                     producer = self.producer_factory(client)
+            cleanup = self._attach_pending(entry_id, connection, cancel_start,
+                listener.listener_id if listener else None, producer=producer)
             try:
                 await producer.start()
                 if (self._starting.get(entry_id) is not reservation or
@@ -506,7 +508,18 @@ class PcmWebSocketManager:
     async def reconcile(self, entry_id: str, status: dict[str, Any]) -> None:
         producers = []
         for pending in list(self._pending_cleanups.values()):
-            if pending.entry_id == entry_id and pending.station_id is not None:
+            if pending.entry_id != entry_id:
+                continue
+            if pending.producer is not None:
+                identity = getattr(pending.producer, "call_identity", None)
+                call = status.get("call") if isinstance(status, dict) else None
+                if (identity is None or not isinstance(call, dict)
+                    or call.get("session") != "talking"
+                    or status.get("runtime_id") != identity[0]
+                    or type(call.get("generation")) is not int or call.get("generation") != identity[2]
+                    or (identity[1] is not None and call.get("station_id") != identity[1])):
+                    pending.revoke()
+            elif pending.station_id is not None:
                 fresh = self._listener_identity(status, pending.station_id)
                 # Unknown cached identity is unbound; conservatively revoke it
                 # on a status observation, while preserving same-call polls.
