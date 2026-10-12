@@ -11,6 +11,8 @@ import sys
 import types
 import unittest
 
+from tests.test_device_registration import DeviceRegistry
+
 
 class SensorEntity:
     def __init__(self):
@@ -48,6 +50,10 @@ core_module = types.ModuleType("homeassistant.core")
 core_module.callback = lambda function: function
 sys.modules["homeassistant.core"] = core_module
 sys.modules.setdefault("homeassistant.helpers", types.ModuleType("homeassistant.helpers"))
+device_registry_module = types.ModuleType("homeassistant.helpers.device_registry")
+device_registry_module.async_get = lambda hass: hass.devices
+sys.modules["homeassistant.helpers.device_registry"] = device_registry_module
+sys.modules["homeassistant.helpers"].device_registry = device_registry_module
 entity_module = types.ModuleType("homeassistant.helpers.entity")
 entity_module.Entity = object
 sys.modules["homeassistant.helpers.entity"] = entity_module
@@ -119,6 +125,11 @@ class FakeRegistry:
 
 class FakeHass:
     def __init__(self, registry):
+        self.devices = DeviceRegistry()
+        self.devices.async_get_or_create(
+            config_entry_id="entry-1", identifiers={("doorfast", "entry-1")},
+            name="Doorfast Bridge", manufacturer="Doorfast",
+        )
         self.data = {
             const.DOMAIN: {"entry-1": registry.client},
             const.STATIONS_KEY: {"entry-1": registry},

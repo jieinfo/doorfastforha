@@ -9,6 +9,7 @@ from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_time_interval
 
@@ -19,15 +20,18 @@ from .const import (
     CONF_GO2RTC_USERNAME,
     CONF_POLL_INTERVAL,
     CONF_SERVER_ADDRESS,
+    CONTROLLER_NAME,
     DEFAULT_AUDIO_PORT,
     DEFAULT_CALL_DURATION,
     DEFAULT_GO2RTC_API_URL,
     DEFAULT_VIDEO_PORT,
     DOMAIN,
     LATEST_EVENT,
+    MANUFACTURER,
     PLATFORMS,
     RING_STATUS,
     STATIONS_KEY,
+    SW_VERSION,
     WEBRTC_PROVIDERS_KEY,
     WEBRTC_UNSUBS_KEY,
 )
@@ -227,6 +231,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     try:
         await poll()
+        # Platforms load in parallel: register the existing controller identity
+        # before any station entity needs its concrete via_device_id.
+        dr.async_get(hass).async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=CONTROLLER_NAME,
+            manufacturer=MANUFACTURER,
+            sw_version=SW_VERSION,
+        )
         platforms_forward_attempted = True
         await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
         unregister_webrtc = async_register_webrtc_provider(hass, provider)

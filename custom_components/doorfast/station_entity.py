@@ -24,11 +24,23 @@ class DoorfastStationEntity(Entity):
 
     @property
     def device_info(self) -> dict:
-        return {
+        info = {
             "identifiers": {
                 (DOMAIN, f"{self.entry_id}_station_{self.station.station_id}")
             },
             "name": self.station.name,
             "manufacturer": MANUFACTURER,
-            "via_device": (DOMAIN, self.entry_id),
         }
+        if (hass := getattr(self, "hass", None)) is not None:
+            from homeassistant.helpers import device_registry as dr
+
+            registry = dr.async_get(hass)
+            identifier = (DOMAIN, self.entry_id)
+            if (lookup := getattr(registry, "async_get_device_by_identifier", None)) is not None:
+                controller = lookup(identifier, self.entry_id)
+                if controller is not None:
+                    info["via_device_id"] = controller.id
+            else:
+                # HA before 2026.8 only accepts the identifier-based link.
+                info["via_device"] = identifier
+        return info
