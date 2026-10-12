@@ -132,6 +132,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         async_dispatcher_send(
             hass, f"{DOMAIN}_{entry.entry_id}_STATUS", client.status
         )
+        if not client.online:
+            # Cached call/media details are not authoritative while offline.
+            # Only notify entities to refresh their availability, not PCM.
+            return
         async_dispatcher_send(
             hass,
             f"{DOMAIN}_{entry.entry_id}_{RING_STATUS}",

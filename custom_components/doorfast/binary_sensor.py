@@ -37,7 +37,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
         )
         if entity_id is not None:
             entity_registry.async_remove(entity_id)
-        hass.async_create_task(entity.async_remove(force_remove=True))
+        if entity.hass is not None and entity.entity_id is not None:
+            hass.async_create_task(entity.async_remove(force_remove=True))
 
     def handle_station(event, station_id):
         if event == "added":
@@ -126,10 +127,19 @@ class DoorfastStationReachability(BinarySensorEntity, DoorfastStationEntity):
     def is_on(self):
         return self.station.reachable
 
+    async def async_added_to_hass(self):
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, f"{DOMAIN}_{self.entry_id}_STATUS", self._handle_status,
+        ))
+
+    @callback
+    def _handle_status(self, _data):
+        self.async_write_station_state()
+
     def update_station(self, station):
         self.station = station
-        self.async_write_ha_state()
+        self.async_write_station_state()
 
     def mark_removed(self):
         self._active = False
-        self.async_write_ha_state()
+        self.async_write_station_state()

@@ -45,6 +45,33 @@ class AccessAttributesTest(unittest.TestCase):
         self.assertEqual({}, access_attributes({}))
         self.assertEqual({}, access_attributes({"access": None}))
 
+    def test_exposes_safe_station_and_manual_progress_metadata(self):
+        self.assertEqual(
+            {
+                "station_id": "gate_main",
+                "manual_state": "waiting_media",
+                "manual_station_id": "gate_side",
+            },
+            access_attributes({"access": {
+                "station_id": "gate_main",
+                "manual_state": "waiting_media",
+                "manual_station_id": "gate_side",
+                "material": "must not leak",
+            }}),
+        )
+
+    def test_rejects_malformed_metadata_instead_of_exposing_arbitrary_values(self):
+        self.assertEqual({}, access_attributes({"access": {
+            "station_id": {"secret": "must not leak"},
+            "manual_state": "unexpected text",
+            "manual_station_id": "../not-a-station",
+            "state": "secret text",
+            "generation": True,
+            "raw_status": -1,
+            "configured": "true",
+            "physical_result_confirmed": "true",
+        }}))
+
 
 if __name__ == "__main__":
     unittest.main()

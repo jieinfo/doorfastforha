@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from homeassistant.components.camera import Camera, CameraEntityFeature
+from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 
 from .const import DOMAIN, STATIONS_KEY
 from .station_entity import DoorfastStationEntity
+from .station_status import preview_attributes
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -34,7 +37,8 @@ async def async_setup_entry(hass, entry, async_add_entities):
         )
         if entity_id is not None:
             entity_registry.async_remove(entity_id)
-        hass.async_create_task(camera.async_remove(force_remove=True))
+        if camera.hass is not None and camera.entity_id is not None:
+            hass.async_create_task(camera.async_remove(force_remove=True))
 
     def handle_station(event, station_id):
         if event == "added":
@@ -43,7 +47,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
             camera = cameras.get(station_id)
             if camera is not None:
                 camera.station = registry.station(station_id)
-                camera.async_write_ha_state()
+                camera.async_write_station_state()
         elif event == "removed":
             remove_station(station_id)
 
@@ -84,6 +88,13 @@ class DoorfastStationCamera(Camera, DoorfastStationEntity):
             "monitor_state": snapshot["state"],
             "monitor_generation": snapshot["generation"],
             "monitor_ready": snapshot["ready"],
+            **{
+                f"monitor_{key}": value
+                for key, value in preview_attributes(
+                    self.client.status if self.client.online else {},
+                    self.station.station_id,
+                ).items()
+            },
         }
 
     def _media_available(self):
@@ -97,7 +108,17 @@ class DoorfastStationCamera(Camera, DoorfastStationEntity):
 
     def mark_removed(self):
         self._active = False
-        self.async_write_ha_state()
+        self.async_write_station_state()
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, f"{DOMAIN}_{self.entry_id}_STATUS", self._handle_status,
+        ))
+
+    @callback
+    def _handle_status(self, _data):
+        self.async_write_station_state()
 
     async def stream_source(self):
         if not self.available or not self._media_available():

@@ -21,6 +21,9 @@ class BinarySensorEntity:
     async def async_remove(self, force_remove=False):
         self.removed.append(force_remove)
 
+    async def async_added_to_hass(self):
+        pass
+
     def async_write_ha_state(self):
         self.writes += 1
 
@@ -45,7 +48,12 @@ core_module.callback = lambda function: function
 sys.modules["homeassistant.core"] = core_module
 
 dispatcher_module = types.ModuleType("homeassistant.helpers.dispatcher")
-dispatcher_module.async_dispatcher_connect = lambda *_args: lambda: None
+def connect(hass, signal, listener):
+    hass.listeners.setdefault(signal, []).append(listener)
+    return lambda: hass.listeners[signal].remove(listener)
+
+
+dispatcher_module.async_dispatcher_connect = connect
 sys.modules.setdefault("homeassistant.helpers", types.ModuleType("homeassistant.helpers"))
 sys.modules["homeassistant.helpers.dispatcher"] = dispatcher_module
 
@@ -98,6 +106,7 @@ binary_sensor = load_component("binary_sensor")
 # during collection; bind this module to the registry owned by this test so
 # full-suite import order cannot change the assertion target.
 binary_sensor.er = entity_registry_module
+binary_sensor.async_dispatcher_connect = connect
 
 DoorfastStation = client_types.DoorfastStation
 DoorfastStationReachability = binary_sensor.DoorfastStationReachability
@@ -158,6 +167,7 @@ class FakeHass:
             const_module.STATIONS_KEY: {"entry-1": registry},
         }
         self.tasks = []
+        self.listeners = {}
 
     def async_create_task(self, awaitable):
         task = asyncio.create_task(awaitable)
@@ -227,6 +237,22 @@ class StationReachabilityTest(unittest.IsolatedAsyncioTestCase):
             ["binary_sensor.doorfast_entry-1_station_gate_main_reachable"],
             ENTITY_REGISTRY.removed,
         )
+
+    async def test_offline_and_recovery_status_refresh_availability(self):
+        registry = FakeRegistry()
+        hass = FakeHass(registry)
+        entity = DoorfastStationReachability(registry.client, "entry-1", station())
+        entity.hass = hass
+        entity.entity_id = "binary_sensor.gate_main_reachable"
+        await entity.async_added_to_hass()
+        self.assertEqual(1, len(hass.listeners.get("doorfast_entry-1_STATUS", [])))
+        listener = hass.listeners["doorfast_entry-1_STATUS"][0]
+        writes = entity.writes
+        for online in (False, True):
+            registry.client.online = online
+            listener(registry.client.status)
+            self.assertEqual(online, entity.available)
+        self.assertEqual(writes + 2, entity.writes)
 
 
 if __name__ == "__main__":

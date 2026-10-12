@@ -11,7 +11,19 @@
   "entity": {
     "lock": {"unlock": {"name": "Unlock entrance"}},
     "button": {"elevator_up": {"name": "Call elevator up"}, "elevator_down": {"name": "Call elevator down"}, "answer": {"name": "Answer call"}, "hangup": {"name": "Hang up call"}, "call": {"name": "Call outdoor station"}},
-    "sensor": {"latest_event": {"name": "Doorfast status"}},
+    "sensor": {
+      "latest_event": {"name": "Doorfast status"},
+      "preview_status": {"name": "Preview status", "state": {
+        "idle": "Idle", "requesting": "Requesting preview", "awaiting_video": "Waiting for first frame",
+        "live": "Live video", "reconnecting": "Reconnecting (last frame retained)", "in_call": "In call",
+        "stopping": "Stopping", "preempted": "Preempted by a call", "failed": "Preview failed"
+      }},
+      "unlock_status": {"name": "Unlock progress / latest reply", "state": {
+        "idle": "Idle", "waiting_media": "Preparing preview for unlock", "waiting_reply": "Waiting for station reply",
+        "protocol_completed": "Station acknowledged (door position unverified)", "protocol_rejected": "Station rejected unlock",
+        "expired": "Reply timed out", "cancelled": "Cancelled", "send_failed": "Send failed"
+      }}
+    },
     "binary_sensor": {"ring_status": {"name": "Incoming call"}, "station_reachable": {"name": "Station online"}},
     "camera": {"video": {"name": "Video preview"}, "station_monitor": {"name": "Station monitor"}}
   }
