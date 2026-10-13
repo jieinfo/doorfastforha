@@ -1,4 +1,4 @@
-import { FloatToPcm16Resampler, PcmFrameAssembler } from "./pcm-dsp.mjs?v=0.1.0";
+import { FloatToPcm16Resampler, PcmFrameAssembler } from "./pcm-dsp.mjs?v=20261012.1";
 
 class DoorfastPcmProcessor extends AudioWorkletProcessor {
   constructor() {

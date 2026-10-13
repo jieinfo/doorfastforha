@@ -8,11 +8,10 @@ from typing import Any
 from homeassistant.components.frontend import add_extra_js_url, remove_extra_js_url
 from homeassistant.components.http import StaticPathConfig
 
-from .const import SW_VERSION
-
 _DATA_KEY = "doorfast_frontend"
 _STATIC_URL = "/doorfast_static"
-CARD_URL = f"{_STATIC_URL}/doorfast-ptt-card.mjs?v={SW_VERSION}"
+FRONTEND_ASSET_VERSION = "20261012.1"
+CARD_URL = f"{_STATIC_URL}/doorfast-ptt-card.mjs?v={FRONTEND_ASSET_VERSION}"
 
 
 def _state(hass: Any) -> dict[str, Any]:
