@@ -1,14 +1,33 @@
 # Doorfast HA/VM acceptance runner
 
+Continuous audio in this round is limited to **already-established/incoming
+`talking` calls**. The formal outbound CALL path has an existing call-control
+wiring defect; outbound duplex acceptance is pending a separate repair. Do not
+make the card automatically establish a call as a workaround. Stopping audio
+releases the listener/producer and does not hang up or unlock the station.
+
+Task 6 runs only local synthetic tests and host builds. No real HA runner,
+installation, dashboard edit, device control, TLS change, publication or SDK
+build was performed. The commands below that connect to HA are procedures for
+a separately authorized acceptance session, not evidence from this task.
+HTTP listening is limited to a trusted LAN; HTTPS is recommended for
+remote/public voice. Never expose the Doorfast CGI directly to the Internet.
+
 This repository contains a test-only, dependency-free acceptance runner for the
 Doorfast microphone bridge. It targets the Home Assistant WebSocket API and the
 Doorfast HTTP bridge implemented by Doorfast. The runner keeps PCM bodies and
 all producer credentials in memory, and writes only redacted JSONL evidence.
 
-The source references under test are recorded in every evidence file:
+The existing runner records these historical source references in its evidence:
 
 * `doorfastforha` `0bd2474` (HA main after setup rollback safety)
 * `doorfast` `a5fcca3` (Doorfast main after the HTTP PCM contract PR)
+
+Those embedded references are not the continuous-audio branch revisions. The
+Task 6 report records the exact HA audio commit and Doorfast
+`b632b8fc0add0e191d5a31c537c30a0fe184b94e` used for the new local contract checks.
+The runner covers its existing uplink lifecycle; it does not prove the new
+v1 listening contract or browser output by itself.
 
 The loopback fixture is the default mode. It starts a private HTTP server on
 `127.0.0.1`, with two independent synthetic Doorfast hosts, and supplies a
@@ -16,9 +35,27 @@ talking call with deterministic runtime IDs and generations. This is a protocol
 and lifecycle test; it does not claim physical audio delivery. The fixture is
 never used implicitly in installed mode.
 
-## Existing local setup
+## Distinguish the evidence levels
 
-The validated local HA setup is:
+| Level | What it proves | What it cannot prove |
+| --- | --- | --- |
+| Local Python composition | Real `AudioIdentity`, HTTP/WAV parsing, hub, manager and producer with synthetic streamed HTTP; independent listeners, resync and same-generation reboot isolation; cleanup | Installed HA operation, browser microphone or physical audio |
+| Local Node composition | Real card, PCM decoder, playback, native output and sender against controlled DOM/Web Audio/WS boundaries; scheduled nodes, late-result isolation and stop cleanup | Browser/device audio hardware, audible sound or echo cancellation |
+| Runner fixture against authorized HA | Real HA API/config-flow/WS ownership and existing uplink cleanup, with synthetic endpoints | New downlink/native output acceptance or physical delivery |
+| Browser at localhost | Browser interaction/microphone APIs on a secure-context exception | HTTPS deployment, network trust or real device audio |
+| Browser through authorized HTTPS | Real browser permission, static resource loading and bidirectional session setup | Audible two-way delivery until a physical observer checks it |
+| Field speaker/microphone check | Already-talking incoming call heard in both directions, echo and audible delay observed with named devices/browser | Outbound CALL acceptance or untested SDK/target builds |
+
+Synthetic samples are not recordings. Evidence should contain only check
+results, request counts, lengths and digests; do not save PCM/WAV, producer
+tokens, HA tokens or raw sensitive responses. The 300 ms bound is local
+scheduled buffering/cache freshness. Source timestamps measure selected versus
+latest bridge publication, not capture/end-to-end delay.
+
+## Historical local setup for an authorized runner session
+
+The earlier runner documentation recorded this setup; it was not revalidated
+by Task 6:
 
 * Docker image `ghcr.io/home-assistant/home-assistant:2024.11.0`
 * HA HTTP port `127.0.0.1:18124` mapped to container port `8123`
@@ -31,11 +68,11 @@ The HA container must have the `doorfast` custom component from
 token can be supplied in a file, or the runner can read the administrator
 refresh token from HA's `.storage/auth` file without printing it.
 
-## Fixture run against real HA
+## Fixture run against real HA (requires separate authorization)
 
 This command creates two temporary Doorfast config entries through HA's real
 config-flow REST API, verifies the four bundled frontend resources,
-then exercises start, bounded PCM submit, stop, WebSocket disconnect cleanup,
+then exercises the existing uplink start, bounded PCM submit, stop, WebSocket disconnect cleanup,
 multi-entry isolation, hangup cleanup, generation cleanup, unload cleanup, and
 reload. It deletes only the entries created by this run during cleanup.
 
@@ -64,7 +101,7 @@ Actions. Inspect the JSONL file for check-level evidence; `token`, `pcm`,
 `audio_session`, and `body` fields are always redacted, while opaque capture
 IDs are represented only by a SHA-256 fingerprint and length.
 
-## Installed endpoint mode
+## Installed endpoint mode (requires separate authorization)
 
 Installed mode is explicit and requires a configured HA entry. It talks to the
 endpoint already configured in that entry and never starts the private fixture
@@ -91,9 +128,74 @@ No production claim should be made from fixture evidence. Physical MT8157
 acceptance remains a separate stage after a real talking call and a verified
 PCM capture or playback observer are available.
 
+For a later authorized browser/field check, select your real HA entry and
+station (do not paste the synthetic `one` / `gate_main` values):
+
+```yaml
+type: custom:doorfast-ptt-card
+config_entry_id: one
+station_id: gate_main
+mode: duplex
+name: Main gate intercom
+```
+
+Confirm the selected incoming call is already `talking`; record the actual
+runtime/generation and browser/device versions without credentials. With HTTPS
+and microphone permission, click once and listen in both directions. Repeat
+with `mode: listen`, HTTP trusted-LAN access, and denied microphone permission:
+these must receive audio without opening a microphone producer. Click again,
+hide/blur the page, remove the card or disconnect HA and verify local audio
+stops. Reconnect must not automatically reacquire the microphone. Permission
+changes need an explicit new start. Record speaker audibility, echo and
+observed delay separately from fixture results. Outbound duplex and OpenWrt
+SDK/`DF_WITH_UBUS` compilation remain pending separate work.
+
+## v1 bridge contract checked by the local fixtures
+
+`GET /api/v1/audio/latest.wav` supplies `runtime` (16 lowercase hex),
+`station_id` and positive `generation`, with optional `after` revision. A
+successful chunk carries `X-Doorfast-Runtime-Id`, `X-Doorfast-Station-Id`,
+`X-Doorfast-Generation`, `X-Doorfast-Audio-Previous-Revision`,
+`X-Doorfast-Audio-Revision`, `X-Doorfast-Audio-Dropped-Bytes`,
+`X-Doorfast-Audio-Discontinuity` (`0`/`1`),
+`X-Doorfast-Audio-Timestamp-Ms`, `X-Doorfast-Audio-Latest-Timestamp-Ms`,
+`X-Doorfast-Audio-Format: s16le`, `X-Doorfast-Audio-Sample-Rate: 8000`,
+and `X-Doorfast-Audio-Channels: 1`.
+
+| HTTP response | Behavior |
+| --- | --- |
+| `200` WAV | Parse bounded mono PCM; advance only each consuming listener's cursor |
+| `304` with matching identity headers | Valid empty result; never replay PCM |
+| `404`, `code: audio_unavailable`, matching identity headers | Valid empty result |
+| `503`, `code: audio_temporarily_unavailable` | Retry without advancing the cursor; five seconds of continuous invalid results releases ownership |
+| `409`, `code: audio_cursor_expired` | Reset the bridge cursor and resync within the same identity, marking discontinuity |
+| `409`, `code: audio_identity_mismatch`, or mismatched chunk headers | Reject and release the shared hub and linked microphone |
+| `400`, `code: invalid_request` | Reject invalid identity/cursor parameters |
+
+Canonical WAV is at most 3244 bytes with at most 3200 PCM bytes. The HA reader
+rejects at 4096 consumed bytes without a byte-4097 EOF probe, so all accepted
+bodies are below 4096; arbitrary extended WAVs at that boundary are not
+guaranteed. Four listeners share at most four cached chunks and one read.
+Producer session credentials remain backend-only; the browser gets opaque
+listener/capture IDs. Existing legacy PTT and bridge requests remain covered by
+the full regression suites.
+
 ## Local checks
 
 ```sh
 python3 -m unittest discover -s tests
+python3 -m compileall -q custom_components/doorfast
+node --test tests/js/*.mjs
 python3 -m compileall -q doorfast_ha_e2e run_acceptance.py
 ```
+
+Run the focused composition checks with:
+
+```sh
+python3 -m unittest discover -s tests -p test_audio_contract.py
+node --test tests/js/test_duplex_lifecycle.mjs
+```
+
+The Task 6 report and raw logs live in
+`.superpowers/sdd/2026-10-12-ha-continuous-duplex-audio/`. Local host checks do
+not establish OpenWrt SDK or `DF_WITH_UBUS` target-build evidence.
