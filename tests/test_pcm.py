@@ -129,6 +129,24 @@ async def started(client):
 
 
 class PcmProducerTest(unittest.IsolatedAsyncioTestCase):
+    async def test_expected_runtime_rejects_reboot_before_open(self):
+        client = FakeClient([], [status(runtime="fedcba9876543210", station_id="front")])
+        producer = PcmProducer(client, "front", 7, expected_runtime_id=RUNTIME)
+        with self.assertRaises(PcmProducerError) as caught:
+            await producer.start()
+        self.assertEqual("runtime_mismatch", caught.exception.code)
+        self.assertFalse(any(call[0] == "open" for call in client.calls))
+
+    async def test_expected_runtime_rejects_recovery_before_reopen(self):
+        client = FakeClient([success(audio_session=TOKEN), error("session_expired")],
+            [status(station_id="front"), status(runtime="fedcba9876543210", station_id="front")])
+        producer = PcmProducer(client, "front", 7, expected_runtime_id=RUNTIME)
+        await producer.start()
+        with self.assertRaises(PcmProducerError) as caught:
+            await producer.submit([FRAME])
+        self.assertEqual("runtime_mismatch", caught.exception.code)
+        self.assertEqual(1, len([call for call in client.calls if call[0] == "open"]))
+
     async def test_station_and_generation_are_bound_before_open(self):
         client = FakeClient([success(audio_session=TOKEN)])
         client.status = status(station_id="front")

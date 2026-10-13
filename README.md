@@ -2,6 +2,15 @@
 
 This integration is a clean Home Assistant adapter for Doorfast host mode. It covers door unlock, elevator up/down calls, incoming-call notifications, hangup and optional video.
 
+Continuous audio attaches only to an **already-established/incoming `talking`
+call** at the selected station. This round has synthetic contract evidence;
+deployment, HTTPS microphone use, physical listening/echo checks and OpenWrt SDK
+validation remain separate, unperformed stages. Outbound duplex is **not
+accepted**: the existing formal outgoing CALL wiring still needs a separate
+repair. The audio card does not automatically call or answer a station.
+HTTP listening is for a trusted LAN only; use HTTPS for remote/public voice
+access. Do not expose the Doorfast CGI directly to the public Internet.
+
 Release 0.3.0 adds dynamic multi-station discovery, station reachability, and
 per-station monitor cameras. Configure one go2rtc stream for each station;
 repository fixture acceptance is simulated and does not prove physical-device
@@ -25,14 +34,13 @@ short-lived `503 Service Unavailable`. A call-generation change, unavailable
 video status, or `404`/`409` response clears the cached image so a previous
 visitor cannot appear in a later call.
 
-The client consumes Doorfast audio as generation-bound WAV chunks. It records
-the revision returned by each successful request and asks for the next retained
-chunk with that revision as its cursor. An unchanged response is not replayed,
-temporary failures preserve the cursor for retry, and an expired cursor or call
-generation change resets the sequence before resynchronizing. This client
-boundary prepares continuous playback without allowing audio from an earlier
-call into the current one; the integration does not yet expose a live audio
-player entity.
+The continuous audio card plays bounded PCM from Doorfast v1 WAV chunks through
+the browser's Web Audio output. The backend binds listeners to runtime, station
+and generation; a restart with a reused generation still invalidates the old
+session. Each listener consumes its own cursor, while up to four listeners share
+one HTTP reader and a four-chunk cache. Unchanged chunks are not replayed;
+temporary failures preserve the cursor, and an expired cursor resynchronizes
+within the same identity. Legacy audio-client and PTT paths remain supported.
 
 ## Active WebRTC preview
 
@@ -59,26 +67,101 @@ If go2rtc enables API authentication, open the Doorfast integration's options
 and enter the go2rtc API username and password. Keep the API URL credential-free;
 the integration sends Basic Auth only on its HA-to-go2rtc WebSocket connection.
 
-## Push to talk card
+## Listen or talk to an established call
 
 The integration bundles and automatically registers a `doorfast-ptt-card` dashboard
-card. After installing or upgrading the integration, restart Home Assistant and
-reload an already-open dashboard once. Add a manual card with the configuration:
+card with three explicit modes. Use your own config entry and discovered station
+ID in these examples; `one` / `gate_main` are synthetic fixture values. Adding a
+card does not establish a call, and stopping audio does not hang up, unlock, or
+stop video. Installation and dashboard changes require your deployment decision.
+
+| Mode | Gesture | Audio |
+| --- | --- | --- |
+| `ptt` (default) | Hold the button or Space/Enter; release to stop | Microphone uplink only; `station_id` is optional for legacy configuration |
+| `duplex` | Click to start; click again to stop | Continuous listening and microphone uplink when permission/security allow |
+| `listen` | Click to start; click again to stop | Listening only; never requests the microphone |
+
+For continuous intercom with the selected station already `talking`:
 
 ```yaml
 type: custom:doorfast-ptt-card
-config_entry_id: YOUR_DOORFAST_CONFIG_ENTRY_ID
+config_entry_id: one
+station_id: gate_main
+mode: duplex
+name: Main gate intercom
+```
+
+For listening only:
+
+```yaml
+type: custom:doorfast-ptt-card
+config_entry_id: one
+station_id: gate_main
+mode: listen
+name: Main gate audio
+```
+
+For the existing hold-to-talk behavior:
+
+```yaml
+type: custom:doorfast-ptt-card
+config_entry_id: one
+station_id: gate_main
+mode: ptt
 name: Doorfast Push to Talk
 ```
 
-Press and hold the button (or hold Space/Enter while it is focused) to transmit.
-The browser requires an HTTPS Home Assistant URL or localhost and prompts for
-microphone access on the first press. Releasing the button, losing focus, hiding
-the page, disconnecting the card, ending the microphone track, or losing the HA
-WebSocket stops capture. Audio is downmixed to mono, filtered and resampled to
+`duplex` and `listen` require `station_id`; an optional positive `generation`
+must match the current backend call, otherwise omit it to bind to that call.
+The browser requires an HTTPS Home Assistant URL or localhost for microphone
+capture. On HTTP, `duplex` visibly falls back to listening without asking for a
+microphone. Denying permission also leaves `duplex` listening only. PTT cannot
+start on an insecure browser origin. Microphone capture never automatically
+restarts after stopping, disconnecting, or changing permission: use a new click
+or hold gesture when ready.
+
+Losing focus, hiding the page, removing the card, ending the microphone track,
+or losing the HA WebSocket stops the session and releases its playback nodes,
+tracks, AudioContext, listener and producer. PTT also stops on button release.
+Audio is downmixed to mono, filtered and resampled to
 8 kHz signed 16-bit little-endian PCM in exact 20 ms frames. The browser sends
-only an opaque capture ID through HA's authenticated WebSocket; Doorfast producer
+PCM and an opaque capture ID through HA's authenticated WebSocket; Doorfast producer
 credentials stay in the integration backend.
+
+Uplink sends at most five 320-byte frames per request, with one request in
+flight and no replay of uncertain submissions. Downlink PCM is mono 8 kHz
+`s16le`, at most 3200 bytes per chunk (canonical WAV at most 3244 bytes). The
+HTTP reader rejects as soon as 4096 bytes have been consumed, without probing
+byte 4097; accepted bodies are therefore **below** 4096 bytes. This does not
+promise acceptance of arbitrary extended 4096-byte WAV files.
+
+The output uses the AudioContext sample clock: startup is about 120 ms for
+100 ms chunks, or a 100 ms lead for maximum 200 ms chunks, with the scheduled
+end no more than 300 ms ahead. On overflow/discontinuity, a playing tail is
+retained only if the incoming whole chunk can follow serially within that
+budget; otherwise it is stopped and playback resynchronizes to current audio.
+This is local buffering, not measured physical/end-to-end latency. Backend
+source lag compares the selected chunk's bridge publication timestamp to the
+latest publication timestamp, plus time in the HA cache; it does not measure
+true capture delay.
+
+| Feedback / backend code | What to do |
+| --- | --- |
+| Listening only: HTTPS required | Keep trusted-LAN listening, or open HA through HTTPS before starting again |
+| Listening only: Microphone denied | Change browser permission if desired, then explicitly stop/start |
+| `unsupported_audio_stream` | Update Doorfast to a bridge advertising `audio.pcm_stream_version: 1` |
+| `audio_identity_mismatch` / `runtime_mismatch` | Verify the selected station is already talking; start a fresh audio session |
+| `producer_busy` | Stop the existing producer before starting another microphone |
+| `audio_cursor_expired` | The backend resynchronizes within the same identity; old speech is not replayed |
+| `audio_connection_lost` / disconnected | Session resources are released; restore the connection and explicitly start again |
+
+Authenticated administrator WebSocket access is required. The listener idle
+lease and continuous invalid-result deadline are five seconds; a valid `304`
+keeps the reader alive. Audio/WAV contents, producer tokens and HA credentials
+must not be written to logs. After an authorized integration upgrade, restart
+HA and reload open dashboards so all cached frontend modules use the same
+resource version. See the [acceptance evidence levels](docs/ha-e2e-acceptance-runner.md)
+before making any device-level duplex claim.
 
 # 安装方式
 

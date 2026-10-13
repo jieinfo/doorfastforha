@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -12,6 +12,105 @@ class PcmHttpReply:
 
     status: int
     payload: dict[str, Any]
+
+
+_UINT64_MAX = (1 << 64) - 1
+
+
+class AudioStreamError(RuntimeError):
+    """Stable error raised while validating a station audio stream."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+@dataclass(frozen=True, slots=True)
+class AudioIdentity:
+    """Identity binding for one talking station call's audio stream."""
+
+    runtime_id: str
+    station_id: str
+    generation: int
+
+    @classmethod
+    def from_status(
+        cls,
+        status: Any,
+        station_id: Any,
+        expected_generation: int | None = None,
+    ) -> "AudioIdentity":
+        """Extract and validate the identity permitted to read station audio."""
+        try:
+            requested_station = require_station_id(station_id)
+        except ValueError as error:
+            raise AudioStreamError("audio_identity_mismatch") from error
+        if expected_generation is not None and (
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or not 1 <= expected_generation <= _UINT64_MAX
+        ):
+            raise AudioStreamError("audio_identity_mismatch")
+        if not isinstance(status, dict):
+            raise AudioStreamError("audio_identity_mismatch")
+        runtime_id = status.get("runtime_id")
+        call = status.get("call")
+        audio = status.get("audio")
+        if (
+            not isinstance(runtime_id, str)
+            or len(runtime_id) != 16
+            or any(character not in "0123456789abcdef" for character in runtime_id)
+            or not isinstance(call, dict)
+            or not isinstance(audio, dict)
+            or call.get("session") != "talking"
+            or call.get("station_id") != requested_station
+            or (
+                isinstance(audio.get("pcm_stream_version"), bool)
+                or not isinstance(audio.get("pcm_stream_version"), int)
+                or audio.get("pcm_stream_version") != 1
+            )
+        ):
+            raise AudioStreamError("audio_identity_mismatch")
+        generation = call.get("generation")
+        if (
+            isinstance(generation, bool)
+            or not isinstance(generation, int)
+            or not 1 <= generation <= _UINT64_MAX
+            or (
+                expected_generation is not None
+                and generation != expected_generation
+            )
+        ):
+            raise AudioStreamError("audio_identity_mismatch")
+        return cls(runtime_id, requested_station, generation)
+
+
+@dataclass(frozen=True, slots=True)
+class AudioChunk:
+    """One bounded PCM payload and its bridge revision metadata."""
+
+    identity: AudioIdentity
+    previous_revision: int
+    revision: int
+    pcm: bytes = field(repr=False)
+    timestamp_ms: int
+    latest_timestamp_ms: int
+    dropped_samples: int
+    discontinuity: bool
+
+
+@dataclass(frozen=True, slots=True)
+class AudioReadReply:
+    """Result of one independent v1 audio read."""
+
+    state: str
+    chunk: AudioChunk | None = None
+
+    def __post_init__(self) -> None:
+        if self.state not in {"chunk", "empty", "retry", "resync"}:
+            raise ValueError("invalid audio read state")
+        if (self.state == "chunk") != (self.chunk is not None):
+            raise ValueError("chunk state requires an audio chunk")
 
 
 def require_station_id(value: Any) -> str:

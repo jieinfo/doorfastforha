@@ -187,7 +187,10 @@ class DeviceRegistrationTest(unittest.IsolatedAsyncioTestCase):
             async def reconcile(self, *args):
                 pass
 
-            async def release_entry(self, *args):
+            async def close_entry(self, *args):
+                pass
+
+            def admit_entry(self, *args):
                 pass
 
         class Provider:

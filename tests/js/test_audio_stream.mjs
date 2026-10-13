@@ -137,13 +137,185 @@ test("closing while a request is pending prevents late completion from sending q
   assert.equal(sender.queuedFrames, 0);
 });
 
-test("playback polling stops safely on fetch rejection", async () => {
+function deferred() {
+  let resolve, reject;
+  const promise = new Promise((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
+async function flushMicrotasks() {
+  for (let count = 0; count < 12; count += 1) await Promise.resolve();
+}
+
+// Replace only the external timer boundary: the poller still performs all work.
+function controlledTimers(t) {
+  let id = 0;
+  const pending = new Map();
+  t.mock.method(globalThis, "setTimeout", (callback, delay) => {
+    pending.set(++id, { callback, delay });
+    return id;
+  });
+  t.mock.method(globalThis, "clearTimeout", (timer) => pending.delete(timer));
+  return {
+    pending,
+    async next() {
+      assert.equal(pending.size, 1, "exactly one polling timer is allowed");
+      const [timer, { callback, delay }] = pending.entries().next().value;
+      pending.delete(timer);
+      callback();
+      await flushMicrotasks();
+      return delay;
+    },
+  };
+}
+
+test("playback polling stops safely on fetch rejection", async (t) => {
+  const timers = controlledTimers(t);
   let errors = 0;
   const playback = new PcmAudioPlayback(async () => { throw new Error("gone"); }, {
     onError: () => { errors += 1; }, intervalMs: 1,
   });
   playback.start({ station_id: "front", generation: 7 });
-  await new Promise((resolve) => setTimeout(resolve, 5));
+  await timers.next();
   assert.equal(errors, 1);
   assert.equal(playback.timer, null);
+  assert.equal(timers.pending.size, 0);
+});
+
+// Catches listen_read empty results being forwarded as audio or slow chunk reads.
+test("listen_read chunks poll immediately while empty results wait 50 ms", async (t) => {
+  const timers = controlledTimers(t);
+  const chunk = {
+    state: "chunk", listener_id: "listener", generation: 7,
+    previous_revision: 0, revision: 1, pcm: new ArrayBuffer(1600), discontinuity: false,
+  };
+  const identity = { station_id: "front", generation: 7 };
+  const results = [chunk, { state: "empty" }, null, new ArrayBuffer(0)];
+  const played = [];
+  const playback = new PcmAudioPlayback(async () => results.shift(), {
+    playChunk: async (value, currentIdentity) => played.push([value, currentIdentity]),
+  });
+  t.after(() => playback.stop());
+  playback.start(identity);
+  assert.equal(await timers.next(), 0);
+  assert.equal(await timers.next(), 0);
+  assert.equal(await timers.next(), 50);
+  assert.equal(await timers.next(), 50);
+  assert.deepEqual(played, [[chunk, identity]]);
+  assert.equal([...timers.pending.values()][0].delay, 50);
+  playback.stop();
+  assert.equal(timers.pending.size, 0);
+});
+
+// Catches a replacement start overlapping an unabortable prior listen_read.
+test("playback keeps one fetch in flight across stop and repeated start", async (t) => {
+  const timers = controlledTimers(t);
+  const reads = [];
+  const played = [];
+  const playback = new PcmAudioPlayback((identity) => {
+    const read = deferred();
+    reads.push({ ...read, identity });
+    return read.promise;
+  }, { playChunk: (chunk) => played.push(chunk) });
+  t.after(() => playback.stop());
+  playback.start({ generation: 1 });
+  await timers.next();
+  assert.equal(reads.length, 1);
+  assert.equal(timers.pending.size, 0);
+  playback.stop();
+  playback.start({ generation: 2 });
+  playback.start({ generation: 3 });
+  if (timers.pending.size) await timers.next();
+  assert.equal(reads.length, 1, "old in-flight read still owns the request slot");
+  reads[0].resolve({ state: "chunk", pcm: new ArrayBuffer(1600) });
+  await flushMicrotasks();
+  assert.deepEqual(played, []);
+  await timers.next();
+  assert.equal(reads.length, 2);
+  assert.deepEqual(reads[1].identity, { generation: 3 });
+  reads[1].resolve({ state: "empty" });
+  await flushMicrotasks();
+  playback.stop();
+  assert.equal(timers.pending.size, 0);
+});
+
+// Catches a stopped fetch's late rejection calling stop on the new epoch.
+test("late fetch errors cannot stop or report errors for a new playback epoch", async (t) => {
+  const timers = controlledTimers(t);
+  const oldRead = deferred();
+  const errors = [];
+  let reads = 0;
+  const playback = new PcmAudioPlayback(() => {
+    reads += 1;
+    return reads === 1 ? oldRead.promise : Promise.resolve({ state: "empty" });
+  }, { onError: (error) => errors.push(error) });
+  t.after(() => playback.stop());
+  playback.start();
+  await timers.next();
+  playback.stop();
+  playback.start();
+  oldRead.reject(new Error("old read failed"));
+  await flushMicrotasks();
+  assert.deepEqual(errors, []);
+  await timers.next();
+  assert.equal(reads, 2);
+  assert.equal(timers.pending.size, 1);
+});
+
+// Catches old asynchronous playback completions scheduling timers or stopping a new epoch.
+for (const outcome of ["resolve", "reject"]) {
+  test(`late playChunk ${outcome} preserves the new playback epoch`, async (t) => {
+    const timers = controlledTimers(t);
+    const oldPlay = deferred();
+    const errors = [];
+    let reads = 0;
+    const playback = new PcmAudioPlayback(async () => {
+      reads += 1;
+      return reads === 1 ? new ArrayBuffer(320) : { state: "empty" };
+    }, {
+      playChunk: () => oldPlay.promise,
+      onError: (error) => errors.push(error),
+    });
+    t.after(() => playback.stop());
+    playback.start();
+    await timers.next();
+    playback.stop();
+    playback.start();
+    if (outcome === "reject") oldPlay.reject(new Error("old output failed"));
+    else oldPlay.resolve();
+    await flushMicrotasks();
+    assert.deepEqual(errors, []);
+    await timers.next();
+    assert.equal(reads, 2);
+    assert.equal(timers.pending.size, 1);
+  });
+}
+
+// Catches a stopped in-flight fetch reviving polling after it settles.
+test("stop during a pending read leaves no timer and never plays its late audio", async (t) => {
+  const timers = controlledTimers(t);
+  const read = deferred();
+  const played = [];
+  const playback = new PcmAudioPlayback(() => read.promise, { playChunk: (chunk) => played.push(chunk) });
+  playback.start();
+  await timers.next();
+  playback.stop();
+  read.resolve(new ArrayBuffer(320));
+  await flushMicrotasks();
+  assert.deepEqual(played, []);
+  assert.equal(timers.pending.size, 0);
+  assert.equal(playback.timer, null);
+});
+
+// Catches stale call identity audio reaching the output.
+test("isCurrent prevents playback of a superseded call identity", async (t) => {
+  const timers = controlledTimers(t);
+  const played = [];
+  const playback = new PcmAudioPlayback(async () => new ArrayBuffer(320), {
+    isCurrent: () => false, playChunk: (chunk) => played.push(chunk),
+  });
+  t.after(() => playback.stop());
+  playback.start();
+  await timers.next();
+  assert.deepEqual(played, []);
 });

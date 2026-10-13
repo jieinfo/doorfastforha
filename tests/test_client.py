@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib.util
+import struct
 from pathlib import Path
 import sys
 import types
@@ -545,6 +546,60 @@ class VideoFrameTest(unittest.IsolatedAsyncioTestCase):
 
 
 class AudioChunkTest(unittest.IsolatedAsyncioTestCase):
+    async def test_v1_and_legacy_readers_keep_independent_cursors_on_same_client(self):
+        # A v1 read must not replace the legacy cursor or require legacy WAV validity.
+        class StreamingBody:
+            def __init__(self, body):
+                self.body = body
+
+            async def read(self, size):
+                part, self.body = self.body[:size], self.body[size:]
+                return part
+
+        pcm = bytes(1600)
+        wav = struct.pack(
+            "<4sI4s4sIHHIIHH4sI", b"RIFF", 1636, b"WAVE", b"fmt ",
+            16, 1, 1, 8000, 16000, 2, 16, b"data", 1600,
+        ) + pcm
+        modern = FakeResponse(200, headers={
+            "X-Doorfast-Runtime-Id": "aaaaaaaaaaaaaaaa",
+            "X-Doorfast-Station-Id": "gate_main",
+            "X-Doorfast-Generation": "7",
+            "X-Doorfast-Audio-Previous-Revision": "100",
+            "X-Doorfast-Audio-Revision": "110",
+            "X-Doorfast-Audio-Dropped-Bytes": "0",
+            "X-Doorfast-Audio-Discontinuity": "0",
+            "X-Doorfast-Audio-Timestamp-Ms": "1000",
+            "X-Doorfast-Audio-Latest-Timestamp-Ms": "1000",
+            "X-Doorfast-Audio-Format": "s16le",
+            "X-Doorfast-Audio-Sample-Rate": "8000",
+            "X-Doorfast-Audio-Channels": "1",
+        })
+        modern.content = StreamingBody(wav)
+        legacy = lambda previous, revision: FakeResponse(
+            200, f"RIFFfake-{revision}-WAVE".encode(), {
+                "X-Doorfast-Generation": "7",
+                "X-Doorfast-Audio-Previous-Revision": str(previous),
+                "X-Doorfast-Audio-Revision": str(revision),
+                "ETag": f'"df-audio-7-{revision}"',
+            },
+        )
+        client = audio_client(legacy(30, 40), modern, legacy(40, 50))
+        self.assertEqual(b"RIFFfake-40-WAVE", await client.latest_audio_chunk())
+        identity = client_types_module.AudioIdentity("aaaaaaaaaaaaaaaa", "gate_main", 7)
+        reply = await client.read_audio_chunk(identity, after=100)
+        self.assertEqual(pcm, reply.chunk.pcm)
+        self.assertEqual(110, reply.chunk.revision)
+        self.assertEqual(40, client._audio_revision)
+        self.assertEqual('"df-audio-7-40"', client._audio_etag)
+        self.assertEqual(7, client._audio_generation)
+        self.assertEqual(b"RIFFfake-50-WAVE", await client.latest_audio_chunk())
+        self.assertEqual({"runtime": "aaaaaaaaaaaaaaaa", "station_id": "gate_main",
+                          "generation": 7, "after": 100},
+                         client.session.requests[1][1]["params"])
+        self.assertEqual({"generation": 7, "after": 40},
+                         client.session.requests[2][1]["params"])
+
     async def test_advances_cursor_without_replaying_unchanged_audio(self):
         client = audio_client(
             FakeResponse(

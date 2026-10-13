@@ -70,49 +70,63 @@ export class PcmBatchSender {
   }
 }
 
-/** Poll existing latest-audio snapshots and discard stale call generations. */
+/** Poll listen_read results and discard stale call generations. */
 export class PcmAudioPlayback {
   constructor(fetchChunk, options = {}) {
     this.fetchChunk = fetchChunk;
-    this.playChunk = options.playChunk ?? (async () => {});
-    this.intervalMs = options.intervalMs ?? 250;
+    // The caller decodes/validates wire PCM and owns the AudioContext lifetime.
+    this.output = options.output ?? null;
+    this.playChunk = options.playChunk ?? ((chunk) => {
+      this.output?.enqueue(chunk.pcm ?? chunk, { discontinuity: chunk.discontinuity ?? false });
+    });
+    this.intervalMs = options.intervalMs ?? 50;
     this.isCurrent = options.isCurrent ?? (() => true);
     this.onError = options.onError ?? (() => {});
     this.timer = null;
     this.epoch = 0;
+    this.inFlight = false;
+    this.poll = null;
   }
 
   start(identity = {}) {
     this.stop();
     const epoch = ++this.epoch;
     const poll = async () => {
-      if (epoch !== this.epoch) return;
-      let chunk;
+      if (epoch !== this.epoch || this.inFlight) return;
+      this.timer = null;
+      this.inFlight = true;
+      let delay = this.intervalMs;
       try {
-        chunk = await this.fetchChunk(identity);
-      } catch (error) {
-        if (epoch === this.epoch) this.onError(error);
-        this.stop();
-        return;
-      }
-      if (epoch !== this.epoch) return;
-      if (chunk && this.isCurrent(identity)) {
-        try {
+        const chunk = await this.fetchChunk(identity);
+        if (epoch !== this.epoch) return;
+        const hasAudio = chunk && chunk.state !== "empty"
+          && (!(chunk instanceof ArrayBuffer) || chunk.byteLength > 0)
+          && (!(chunk.pcm instanceof ArrayBuffer) || chunk.pcm.byteLength > 0);
+        if (hasAudio && this.isCurrent(identity)) {
           await this.playChunk(chunk, identity);
-        } catch (error) {
-          if (epoch === this.epoch) this.onError(error);
+        }
+        delay = hasAudio ? 0 : this.intervalMs;
+      } catch (error) {
+        if (epoch === this.epoch) {
           this.stop();
-          return;
+          this.onError(error);
+        }
+      } finally {
+        this.inFlight = false;
+        if (this.poll !== null) {
+          this.timer = setTimeout(this.poll, epoch === this.epoch ? delay : 0);
         }
       }
-      this.timer = setTimeout(poll, this.intervalMs);
     };
-    this.timer = setTimeout(poll, 0);
+    this.poll = poll;
+    if (!this.inFlight) this.timer = setTimeout(poll, 0);
   }
 
   stop() {
     this.epoch += 1;
     if (this.timer !== null) clearTimeout(this.timer);
     this.timer = null;
+    this.poll = null;
+    this.output?.stop();
   }
 }

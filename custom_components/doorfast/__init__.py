@@ -80,6 +80,7 @@ def service_client(hass, call):
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     pcm_ws = hass.data.setdefault(f"{DOMAIN}_pcm_ws", PcmWebSocketManager(hass))
     pcm_ws.register()
+    await pcm_ws.close_entry(entry.entry_id)
 
     clients = hass.data.setdefault(DOMAIN, {})
     client = DoorfastClient(hass, entry.data[CONF_SERVER_ADDRESS])
@@ -289,6 +290,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             "Doorfast configured: config entry ID=%s; relay endpoint=/api/doorfast/%s",
             entry.entry_id, entry.entry_id,
         )
+        pcm_ws.admit_entry(entry.entry_id)
         return True
     except Exception:
         if existing_view is not None:
@@ -314,10 +316,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 async def async_unload_entry(hass, entry):
     pcm_ws = hass.data.get(f"{DOMAIN}_pcm_ws")
     if pcm_ws is not None:
-        await pcm_ws.release_entry(entry.entry_id)
+        await pcm_ws.close_entry(entry.entry_id)
 
     unloaded = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if not unloaded:
+        if pcm_ws is not None and entry.entry_id in hass.data.get(DOMAIN, {}):
+            pcm_ws.admit_entry(entry.entry_id)
         return False
 
     await async_unregister_frontend(hass, entry.entry_id)
