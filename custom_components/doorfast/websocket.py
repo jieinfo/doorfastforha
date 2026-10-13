@@ -7,6 +7,7 @@ import binascii
 import secrets
 from dataclasses import dataclass, field
 from typing import Any, Callable
+from weakref import WeakValueDictionary
 
 from .const import DOMAIN
 from .audio import AudioListenerHub
@@ -51,6 +52,7 @@ class _Capture:
     station_id: str | None = None
     listener_id: str | None = None
     runtime_id: str | None = None
+    client: Any = None
     cleanup: Callable[[], None] = field(default=lambda: None)
 
 
@@ -64,6 +66,9 @@ class _Listener:
     lease_timer: Any = None
     reading: bool = False
     cleanup: Callable[[], None] = field(default=lambda: None)
+    reservation_key: tuple[int, str, str] | None = None
+    reservation: object | None = None
+    client: Any = None
 
 
 @dataclass
@@ -87,8 +92,18 @@ class PcmWebSocketManager:
         self._starting: dict[str, object] = {}
         self._listeners: dict[str, _Listener] = {}
         self._hubs: dict[str, AudioListenerHub] = {}
+        # Hubs (including in-flight reads on retired hubs) retain their lock.
+        # The registry must not keep removed config entries alive indefinitely.
+        self._fetch_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
         self._epochs: dict[str, int] = {}
         self._pending_cleanups: dict[str, _PendingStart] = {}
+        self._listener_reservations: dict[tuple[int, str, str], object] = {}
+        self._subscription_cleanup_depth: dict[int, int] = {}
+        self._admission: dict[str, bool] = {
+            entry_id: True
+            for entry_id in hass.data.get(DOMAIN, {})
+            if isinstance(entry_id, str)
+        }
         self._registered = False
 
     def register(self) -> None:
@@ -102,8 +117,8 @@ class PcmWebSocketManager:
         if not isinstance(entry_id, str) or not entry_id:
             raise ValueError("config_entry_id is required")
         client = self.hass.data.get(DOMAIN, {}).get(entry_id)
-        if client is None:
-            raise ValueError("unknown config entry")
+        if client is None or self._admission.get(entry_id) is not True:
+            raise AudioStreamError("not_loaded")
         return client
 
     @staticmethod
@@ -125,8 +140,39 @@ class PcmWebSocketManager:
         subscriptions = getattr(connection, "subscriptions", None)
         if isinstance(subscriptions, dict):
             subscription_key = ("doorfast_pcm", key)
-            subscriptions[subscription_key] = callback
-            return lambda: subscriptions.pop(subscription_key, None)
+            connection_key = id(connection)
+
+            def invoke() -> Any:
+                self._subscription_cleanup_depth[connection_key] = (
+                    self._subscription_cleanup_depth.get(connection_key, 0) + 1
+                )
+                try:
+                    return callback()
+                finally:
+                    depth = self._subscription_cleanup_depth.get(connection_key, 1) - 1
+                    if depth:
+                        self._subscription_cleanup_depth[connection_key] = depth
+                    else:
+                        self._subscription_cleanup_depth.pop(connection_key, None)
+
+            subscriptions[subscription_key] = invoke
+            removed = False
+
+            def remove() -> None:
+                nonlocal removed
+                if removed:
+                    return
+                removed = True
+                if self._subscription_cleanup_depth.get(connection_key, 0):
+                    # Home Assistant iterates this dictionary as a live view.
+                    # Defer physical removal; ownership is already invalidated.
+                    asyncio.get_running_loop().call_soon(
+                        subscriptions.pop, subscription_key, None
+                    )
+                else:
+                    subscriptions.pop(subscription_key, None)
+
+            return remove
         async def async_callback() -> None:
             task = callback()
             if task is not None:
@@ -172,6 +218,11 @@ class PcmWebSocketManager:
         if (listener is None or listener.connection is not connection
                 or listener.entry_id != msg.get("config_entry_id")):
             raise AudioStreamError("not_found")
+        if (
+            self._admission.get(listener.entry_id) is not True
+            or self.hass.data.get(DOMAIN, {}).get(listener.entry_id) is not listener.client
+        ):
+            raise AudioStreamError("not_found")
         return listener
 
     def _renew_lease(self, listener: _Listener) -> None:
@@ -202,10 +253,17 @@ class PcmWebSocketManager:
         listener.hub.remove(listener_id)
         if listener.hub.closed and self._hubs.get(listener.entry_id) is listener.hub:
             self._hubs.pop(listener.entry_id, None)
+        self._release_listener_reservation(listener)
         capture = self._by_entry.get(listener.entry_id)
         if capture is not None and capture.listener_id == listener_id:
             return self._invalidate_capture(capture.capture_id)
         return []
+
+    def _release_listener_reservation(self, listener: _Listener) -> None:
+        if listener.reservation_key is not None and (
+            self._listener_reservations.get(listener.reservation_key) is listener.reservation
+        ):
+            self._listener_reservations.pop(listener.reservation_key, None)
 
     def _invalidate_hub(self, entry_id: str, hub: AudioListenerHub) -> list[PcmProducer]:
         hub.close()
@@ -231,6 +289,9 @@ class PcmWebSocketManager:
             return
         pending = [True]
         cleanup = lambda: None
+        reservation_key: tuple[int, str, str] | None = None
+        reservation: object | None = None
+        published = False
         try:
             entry_id = msg.get("config_entry_id")
             client = self._client(entry_id)
@@ -240,11 +301,27 @@ class PcmWebSocketManager:
                 generation is not None and not _safe_int(generation, 1)
             ):
                 raise ValueError("Invalid listener identity")
+            reservation_key = (id(connection), entry_id, station_id)
+            if reservation_key in self._listener_reservations:
+                raise AudioStreamError("audio_listener_busy")
+            reservation = object()
+            self._listener_reservations[reservation_key] = reservation
             epoch = self._epochs.get(entry_id, 0)
-            cleanup = self._attach_pending(entry_id, connection, lambda: pending.__setitem__(0, False),
+
+            def cancel_pending() -> None:
+                pending[0] = False
+                if reservation_key is not None and (
+                    self._listener_reservations.get(reservation_key) is reservation
+                ):
+                    self._listener_reservations.pop(reservation_key, None)
+
+            cleanup = self._attach_pending(entry_id, connection, cancel_pending,
                 station_id=station_id, identity=self._listener_identity(client.status, station_id))
             status = await client.refresh()
-            if not pending[0] or self._epochs.get(entry_id, 0) != epoch:
+            if (not pending[0] or self._epochs.get(entry_id, 0) != epoch
+                or self._listener_reservations.get(reservation_key) is not reservation
+                or self.hass.data.get(DOMAIN, {}).get(entry_id) is not client
+                or self._admission.get(entry_id) is not True):
                 raise AudioStreamError("not_found")
             audio = status.get("audio") if isinstance(status, dict) else None
             if not isinstance(audio, dict) or type(audio.get("pcm_stream_version")) is not int or audio.get("pcm_stream_version") != 1:
@@ -262,16 +339,25 @@ class PcmWebSocketManager:
                 producers = self._invalidate_hub(entry_id, hub)
                 hub = None
             if hub is None:
-                hub = AudioListenerHub(client, identity, asyncio.get_running_loop().time)
+                hub = AudioListenerHub(
+                    client,
+                    identity,
+                    asyncio.get_running_loop().time,
+                    fetch_lock=self._fetch_locks.setdefault(entry_id, asyncio.Lock()),
+                )
                 self._hubs[entry_id] = hub
             listener_id = secrets.token_urlsafe(24)
             hub.add(listener_id)
-            listener = _Listener(entry_id, connection, listener_id, identity, hub)
+            listener = _Listener(
+                entry_id, connection, listener_id, identity, hub,
+                reservation_key=reservation_key, reservation=reservation, client=client,
+            )
             self._listeners[listener_id] = listener
             listener.cleanup = self._attach_cleanup(connection, listener_id,
                 lambda: self._schedule_stop(self._invalidate_listener(listener_id)))
             self._renew_lease(listener)
             cleanup()
+            published = True
             try:
                 connection.send_result(msg["id"], {"listener_id": listener_id,
                     "station_id": identity.station_id, "generation": identity.generation,
@@ -288,6 +374,10 @@ class PcmWebSocketManager:
             self._send_error(connection, msg, "unknown_error", "Unable to start audio listener")
         finally:
             cleanup()
+            if not published and reservation_key is not None and (
+                self._listener_reservations.get(reservation_key) is reservation
+            ):
+                self._listener_reservations.pop(reservation_key, None)
 
     async def listen_read(self, connection: Any, msg: dict[str, Any]) -> None:
         if not self._is_admin(connection):
@@ -303,7 +393,7 @@ class PcmWebSocketManager:
             acquired = True
             self._renew_lease(listener)
             reply = await listener.hub.read(listener.listener_id)
-            if self._listeners.get(listener.listener_id) is not listener:
+            if self._owned_listener(connection, msg) is not listener:
                 raise AudioStreamError("not_found")
             result = {"state": "empty"}
             if reply.state == "chunk":
@@ -321,6 +411,8 @@ class PcmWebSocketManager:
             self._renew_lease(listener)
             connection.send_result(msg["id"], result)
         except AudioStreamError as err:
+            if listener is not None and err.code == "not_found":
+                await self._stop_producers(self._invalidate_listener(listener.listener_id))
             if listener is not None and (listener.hub.closed or err.code == "audio_invalid_response"):
                 producers = self._invalidate_hub(listener.entry_id, listener.hub)
                 await self._stop_producers(producers)
@@ -391,13 +483,15 @@ class PcmWebSocketManager:
             try:
                 await producer.start()
                 if (self._starting.get(entry_id) is not reservation or
+                    self.hass.data.get(DOMAIN, {}).get(entry_id) is not client or
+                    self._admission.get(entry_id) is not True or
                     (listener is not None and (self._listeners.get(listener.listener_id) is not listener
                         or listener.hub.closed or listener.connection is not connection))):
                     raise PcmProducerError("not_found")
                 capture_id = secrets.token_urlsafe(24)
                 capture = _Capture(entry_id, connection, producer, capture_id, station_id,
                     listener.listener_id if listener else None,
-                    listener.identity.runtime_id if listener else None)
+                    listener.identity.runtime_id if listener else None, client=client)
                 self._captures[capture_id] = capture
                 self._by_entry[entry_id] = capture
                 capture.cleanup = self._attach_cleanup(connection, capture_id,
@@ -437,6 +531,11 @@ class PcmWebSocketManager:
         ):
             self._send_error(connection, msg, "not_found", "Unknown capture")
             return
+        if (self._admission.get(capture.entry_id) is not True
+            or self.hass.data.get(DOMAIN, {}).get(capture.entry_id) is not capture.client):
+            await self.release(capture.capture_id)
+            self._send_error(connection, msg, "not_found", "Unknown capture")
+            return
         if (
             ("station_id" in msg and msg.get("station_id") != capture.station_id)
             or ("generation" in msg and msg.get("generation") != capture.producer.generation)
@@ -463,6 +562,10 @@ class PcmWebSocketManager:
                 body[offset:offset + _FRAME_BYTES]
                 for offset in range(0, len(body), _FRAME_BYTES)
             ])
+            if (self._captures.get(capture.capture_id) is not capture
+                or self.hass.data.get(DOMAIN, {}).get(capture.entry_id) is not capture.client
+                or self._admission.get(capture.entry_id) is not True):
+                raise PcmProducerError("not_found")
             connection.send_result(msg["id"], {
                 "capture_id": capture.capture_id,
                 "accepted_frames": outcome.accepted_frames,
@@ -492,7 +595,12 @@ class PcmWebSocketManager:
     async def release(self, capture_id: str) -> None:
         await self._stop_producers(self._invalidate_capture(capture_id))
 
-    async def release_entry(self, entry_id: str) -> None:
+    def admit_entry(self, entry_id: str) -> None:
+        """Allow new audio ownership after a complete config-entry setup."""
+        if entry_id in self.hass.data.get(DOMAIN, {}):
+            self._admission[entry_id] = True
+
+    def _invalidate_entry(self, entry_id: str) -> list[PcmProducer]:
         self._epochs[entry_id] = self._epochs.get(entry_id, 0) + 1
         self._starting.pop(entry_id, None)
         self._revoke_pending(entry_id)
@@ -503,7 +611,16 @@ class PcmWebSocketManager:
         capture = self._by_entry.get(entry_id)
         if capture is not None:
             producers.extend(self._invalidate_capture(capture.capture_id))
-        await self._stop_producers(producers)
+        return producers
+
+    async def release_entry(self, entry_id: str) -> None:
+        """Release current ownership for hangup/reconcile without closing admission."""
+        await self._stop_producers(self._invalidate_entry(entry_id))
+
+    async def close_entry(self, entry_id: str) -> None:
+        """Close admission before teardown and invalidate all current ownership."""
+        self._admission[entry_id] = False
+        await self._stop_producers(self._invalidate_entry(entry_id))
 
     async def reconcile(self, entry_id: str, status: dict[str, Any]) -> None:
         producers = []

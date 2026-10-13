@@ -29,13 +29,20 @@ class AudioListenerHub:
     time spent in this cache and the continuous invalid-result deadline.
     """
 
-    def __init__(self, client: Any, identity: AudioIdentity, clock: Callable[[], float]):
+    def __init__(
+        self,
+        client: Any,
+        identity: AudioIdentity,
+        clock: Callable[[], float],
+        *,
+        fetch_lock: asyncio.Lock | None = None,
+    ):
         self._client = client
         self._identity = identity
         self._clock = clock
         self._listeners: dict[str, _Listener] = {}
         self._cache: deque[tuple[AudioChunk, float]] = deque(maxlen=4)
-        self._fetch_lock = asyncio.Lock()
+        self._fetch_lock = fetch_lock or asyncio.Lock()
         self._epoch = 0
         self._closed = False
         self._after: int | None = None

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import ast
+import asyncio
+import logging
 import sys
 import types
 import unittest
@@ -50,7 +53,7 @@ class FakePcm:
     def __init__(self):
         self.released = []
 
-    async def release_entry(self, entry_id):
+    async def close_entry(self, entry_id):
         self.released.append(entry_id)
 
 
@@ -131,6 +134,188 @@ def load_module():
 
 
 MODULE = load_module()
+
+
+class AudioEntryLifecycleTest(unittest.IsolatedAsyncioTestCase):
+    """Execute actual entry functions; substitute only HA and HTTP boundaries."""
+
+    async def asyncSetUp(self):
+        import test_audio_contract as audio
+        self.audio = audio
+        self.http = audio.HttpBoundary()
+        self.client = audio.client_module.DoorfastClient(None, "http://synthetic.invalid")
+        self.client.session = self.http
+        self.client.status = audio.status()
+        self.hass = FakeHass()
+        self.hass.async_create_task = asyncio.create_task
+        self.hass.data["doorfast"] = {"entry-1": self.client}
+        self.manager = audio.ws.PcmWebSocketManager(self.hass)
+        self.hass.data["doorfast_pcm_ws"] = self.manager
+        self.entry = types.SimpleNamespace(
+            entry_id="entry-1", data={"server_address": "http://synthetic.invalid"}, options={},
+            async_on_unload=lambda *args: None, add_update_listener=lambda *args: None,
+        )
+        self.forward_entered = asyncio.Event()
+        self.forward_resume = asyncio.Event()
+        self.forward_error = None
+        self.unload_result = True
+        self.provider = FakeProvider()
+
+        async def forward(*args):
+            self.forward_entered.set()
+            await self.forward_resume.wait()
+            if self.forward_error:
+                raise self.forward_error
+
+        async def unload(*args):
+            return self.unload_result
+
+        async def noop(*args, **kwargs):
+            pass
+
+        self.hass.config_entries = types.SimpleNamespace(
+            async_forward_entry_setups=forward, async_unload_platforms=unload,
+        )
+        self.hass.http = types.SimpleNamespace(register_view=lambda *args: None)
+        self.hass.services.async_register = lambda *args: None
+        const = sys.modules[MODULE.__package__ + ".const"]
+        namespace = {key: value for key, value in vars(const).items() if key.isupper()}
+        namespace.update(
+            PcmWebSocketManager=audio.ws.PcmWebSocketManager,
+            DoorfastClient=lambda *args: self.client,
+            StationRegistryCoordinator=lambda *args, **kwargs: types.SimpleNamespace(
+                station_ids=(), async_refresh=noop, async_close=noop),
+            DoorfastWebRTCProvider=lambda *args, **kwargs: self.provider,
+            EventGate=object, DoorfastEventView=lambda *args: types.SimpleNamespace(),
+            async_poll=__import__(MODULE.__package__ + ".polling", fromlist=["async_poll"]).async_poll,
+            sync_monitor_state=MODULE.sync_monitor_state,
+            rollback_entry_setup=MODULE.rollback_entry_setup,
+            async_register_frontend=noop, async_unregister_frontend=noop,
+            async_register_webrtc_provider=lambda *args: lambda: None,
+            async_dispatcher_send=lambda *args: None, is_ringing=lambda *args: False,
+            dr=types.SimpleNamespace(async_get=lambda hass: types.SimpleNamespace(async_get_or_create=lambda **kwargs: None)),
+            async_track_time_interval=lambda *args: lambda: None,
+            _async_update_listener=lambda *args: None, timedelta=lambda **kwargs: None,
+            _LOGGER=logging.getLogger(__name__), SERVICE_NAMES=(),
+        )
+        source = ast.parse((COMPONENT / "__init__.py").read_text())
+        functions = [node for node in source.body if isinstance(node, ast.AsyncFunctionDef)
+                     and node.name in {"async_setup_entry", "async_unload_entry"}]
+        module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), *functions], type_ignores=[])
+        exec(compile(ast.fix_missing_locations(module), str(COMPONENT / "__init__.py"), "exec"), namespace)
+        self.setup_entry = namespace["async_setup_entry"]
+        self.unload_entry = namespace["async_unload_entry"]
+
+    async def asyncTearDown(self):
+        self.forward_resume.set()
+        await self.manager.release_entry("entry-1")
+
+    async def listen(self):
+        connection = self.audio.Connection()
+        await self.manager.listen_start(connection, {
+            "id": 1, "config_entry_id": "entry-1", "station_id": "gate_main",
+        })
+        return connection
+
+    async def assert_closed(self):
+        connection = await self.listen()
+        self.assertEqual(["not_loaded"], [error.code for error in connection.errors])
+        await self.manager.start(connection, {"id": 2, "config_entry_id": "entry-1"})
+        self.assertEqual("not_loaded", connection.errors[-1].code)
+        self.assertEqual([], connection.results)
+
+    async def test_actual_unload_closes_admission_before_blocked_producer_end(self):
+        owner = await self.listen()
+        lid = owner.results[-1]["listener_id"]
+        await self.manager.start(owner, {"id": 2, "config_entry_id": "entry-1", "listener_id": lid})
+        entered, resume = asyncio.Event(), asyncio.Event()
+        original_request = self.http.request
+        class EndResponse(self.audio.Response):
+            async def __aenter__(self):
+                entered.set()
+                await resume.wait()
+                return self
+        def request(method, url, **kwargs):
+            reply = original_request(method, url, **kwargs)
+            return EndResponse(payload=reply.payload) if url.endswith("/session/end") else reply
+        self.http.request = request
+        task = asyncio.create_task(self.unload_entry(self.hass, self.entry))
+        await entered.wait()
+        try:
+            await self.assert_closed()
+            await self.manager.listen_read(owner, {"id": 3, "config_entry_id": "entry-1", "listener_id": lid})
+            self.assertEqual("not_found", owner.errors[-1].code)
+            self.assertFalse(self.manager._listeners)
+            self.assertFalse(self.manager._captures)
+        finally:
+            resume.set()
+            self.assertTrue(await task)
+        await self.assert_closed()
+
+    async def test_actual_false_unload_reopens_only_new_ownership(self):
+        old = await self.listen()
+        self.unload_result = False
+        self.assertFalse(await self.unload_entry(self.hass, self.entry))
+        new = await self.listen()
+        self.assertEqual([], new.errors)
+        self.assertNotEqual(old.results[-1]["listener_id"], new.results[-1]["listener_id"])
+        self.assertEqual(1, len(self.manager._listeners))
+
+    async def test_actual_unload_failure_or_cancellation_keeps_admission_closed(self):
+        for phase in ("platform", "provider", "cancel"):
+            with self.subTest(phase=phase):
+                self.hass.data["doorfast"] = {"entry-1": self.client}
+                self.manager.admit_entry("entry-1")
+                entered, resume = asyncio.Event(), asyncio.Event()
+                async def fail(*args):
+                    if phase == "cancel":
+                        entered.set()
+                        await resume.wait()
+                    raise RuntimeError("synthetic teardown failure")
+                if phase == "provider":
+                    self.hass.data["doorfast_webrtc_providers"] = {"entry-1": types.SimpleNamespace(async_close_entry=fail)}
+                    async def success(*args): return True
+                    self.hass.config_entries.async_unload_platforms = success
+                else:
+                    self.hass.config_entries.async_unload_platforms = fail
+                task = asyncio.create_task(self.unload_entry(self.hass, self.entry))
+                if phase == "cancel":
+                    await entered.wait()
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError): await task
+                else:
+                    with self.assertRaises(RuntimeError): await task
+                await self.assert_closed()
+
+    async def test_actual_setup_admits_only_after_success_and_rollback_stays_closed(self):
+        for outcome in ("failure", "cancel", "success"):
+            with self.subTest(outcome=outcome):
+                self.forward_entered.clear()
+                self.forward_resume.clear()
+                self.forward_error = RuntimeError("synthetic setup failure") if outcome == "failure" else None
+                task = asyncio.create_task(self.setup_entry(self.hass, self.entry))
+                await self.forward_entered.wait()
+                try:
+                    await self.assert_closed()
+                finally:
+                    if outcome == "cancel": task.cancel()
+                    self.forward_resume.set()
+                if outcome == "failure":
+                    with self.assertRaises(RuntimeError): await task
+                    await self.assert_closed()
+                elif outcome == "cancel":
+                    with self.assertRaises(asyncio.CancelledError): await task
+                    await self.assert_closed()
+                else:
+                    self.assertTrue(await task)
+                    self.assertEqual([], (await self.listen()).errors)
+
+    async def test_ordinary_release_keeps_entry_available(self):
+        first = await self.listen()
+        await self.manager.release_entry("entry-1")
+        second = await self.listen()
+        self.assertEqual([], second.errors)
+        self.assertNotEqual(first.results[-1]["listener_id"], second.results[-1]["listener_id"])
 
 
 class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
@@ -473,9 +658,24 @@ class SetupRollbackTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(listener.hub.closed)
             self.assertTrue(listener.lease_timer.cancelled())
             self.assertEqual({}, connection.subscriptions)
+            blocked = SubConnection()
+            await manager.listen_start(blocked, {
+                "id": 3, "config_entry_id": FakeEntry.entry_id, "station_id": "gate_main",
+            })
+            self.assertEqual("not_loaded", blocked.errors[-1][1])
         finally:
             resume.set()
             await task
+            blocked = SubConnection()
+            await manager.listen_start(
+                blocked,
+                {
+                    "id": 3,
+                    "config_entry_id": FakeEntry.entry_id,
+                    "station_id": "gate_main",
+                },
+            )
+            self.assertEqual("not_loaded", blocked.errors[-1][1])
             await manager.release_entry(FakeEntry.entry_id)
 
     async def test_preserves_resources_owned_by_another_entry(self):

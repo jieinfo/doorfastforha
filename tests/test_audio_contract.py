@@ -303,6 +303,102 @@ class AudioContractTest(unittest.IsolatedAsyncioTestCase):
         await self.manager.release_entry("one")
         self.assert_released()
 
+    async def test_entry_http_bound_survives_stop_runtime_change_and_client_reload(self):
+        """Old unabortable HTTP owns the slot until it settles, even after reload."""
+        for transition in ("stop", "runtime", "reload"):
+            with self.subTest(transition=transition):
+                await self.manager.release_entry("one")
+                old_connection, new_connection = Connection(), Connection()
+                self.http.current_status = status()
+                old_client = self.manager.hass.data["doorfast"]["one"]
+                old_client.session = self.http
+                old_id = await self.listen(old_connection)
+                entered, resume = asyncio.Event(), asyncio.Event()
+                active = 0
+                maximum = 0
+                class GatedResponse(Response):
+                    async def __aenter__(response):
+                        nonlocal active, maximum
+                        active += 1
+                        maximum = max(maximum, active)
+                        entered.set()
+                        await resume.wait()
+                        return response
+                    async def __aexit__(response, *args):
+                        nonlocal active
+                        active -= 1
+                self.http.responses = [GatedResponse(304, headers=identity_headers())]
+                old_read = asyncio.create_task(self.manager.listen_read(old_connection, {
+                    "id": 2, "config_entry_id": "one", "listener_id": old_id,
+                }))
+                await entered.wait()
+                if transition == "stop":
+                    await self.manager.listen_stop(old_connection, {
+                        "id": 3, "config_entry_id": "one", "listener_id": old_id,
+                    })
+                elif transition == "runtime":
+                    self.http.current_status = status(REBOOT_RUNTIME)
+                    await self.manager.reconcile("one", self.http.current_status)
+                else:
+                    await self.manager.close_entry("one")
+                    replacement = client_module.DoorfastClient(None, "http://synthetic.invalid")
+                    replacement.session = self.http
+                    self.manager.hass.data["doorfast"]["one"] = replacement
+                    self.manager.admit_entry("one")
+                new_id = await self.listen(new_connection)
+                self.http.responses.append(GatedResponse(304, headers=identity_headers(self.http.current_status["runtime_id"])))
+                new_read = asyncio.create_task(self.manager.listen_read(new_connection, {
+                    "id": 4, "config_entry_id": "one", "listener_id": new_id,
+                }))
+                await asyncio.sleep(0)
+                try:
+                    self.assertEqual(1, active)
+                    self.assertEqual(1, len(self.http.responses), "replacement must wait before issuing HTTP")
+                    new_read.cancel()
+                    with self.assertRaises(asyncio.CancelledError): await new_read
+                    third_connection = Connection()
+                    third_id = await self.listen(third_connection)
+                    third_read = asyncio.create_task(self.manager.listen_read(third_connection, {
+                        "id": 5, "config_entry_id": "one", "listener_id": third_id,
+                    }))
+                    await asyncio.sleep(0)
+                    self.assertEqual(1, active, "cancelled waiter must not unlock the old HTTP request")
+                    self.assertEqual(1, len(self.http.responses))
+                    # Another config entry is independent while entry one waits.
+                    separate_http = HttpBoundary()
+                    separate_http.responses = [Response(304, headers=identity_headers())]
+                    separate = client_module.DoorfastClient(None, "http://separate.invalid")
+                    separate.session = separate_http
+                    self.manager.hass.data["doorfast"]["two"] = separate
+                    self.manager.admit_entry("two")
+                    other = Connection()
+                    await self.manager.listen_start(other, {"id": 6, "config_entry_id": "two", "station_id": "gate_main"})
+                    await self.manager.listen_read(other, {"id": 7, "config_entry_id": "two", "listener_id": other.results[-1]["listener_id"]})
+                    self.assertEqual("empty", other.results[-1]["state"])
+                finally:
+                    resume.set()
+                    await old_read
+                    await asyncio.gather(new_read, return_exceptions=True)
+                    if "third_read" in locals(): await third_read
+                    await self.manager.release_entry("two")
+                self.assertEqual(1, maximum)
+                self.assertEqual(["not_found"], [error.code for error in old_connection.errors])
+                self.assertEqual("empty", third_connection.results[-1]["state"])
+                self.assertFalse(any(result.get("state") == "chunk" for result in old_connection.results))
+
+    async def test_removed_client_cannot_submit_owned_microphone_frames(self):
+        connection = self.connections[0]
+        listener_id = await self.listen(connection)
+        await self.manager.start(connection, {"id": 2, "config_entry_id": "one", "listener_id": listener_id})
+        capture_id = connection.results[-1]["capture_id"]
+        self.manager.hass.data["doorfast"].pop("one")
+        await self.manager.submit(connection, {
+            "id": 3, "config_entry_id": "one", "capture_id": capture_id,
+            "pcm": base64.b64encode(PCM).decode("ascii"),
+        })
+        self.assertEqual([], self.http.pcm_summaries, "removed entry must never submit microphone data")
+        self.assertEqual(["not_found"], [error.code for error in connection.errors])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -144,7 +144,7 @@ async def rollback_entry_setup(
     """
 
     try:
-        await pcm_ws.release_entry(entry.entry_id)
+        await pcm_ws.close_entry(entry.entry_id)
     except Exception:
         pass
 
