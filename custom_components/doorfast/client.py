@@ -17,7 +17,7 @@ from .client_types import (
 )
 from .audio import decode_pcm_wav
 from .station_control import positive_condition, validate_call_parameters, validate_reply, stable_error
-from .session_diagnostics import station_call_operation
+from .session_diagnostics import station_call_operation, _STATION_CALL_STAGE_ORDER
 
 _UINT64_MAX = (1 << 64) - 1
 
@@ -120,7 +120,11 @@ class DoorfastClient:
         operation = station_call_operation(status)
         if (old_operation is not None and operation is not None
                 and old_operation["runtime_id"] == operation["runtime_id"]
-                and operation["operation_id"] < old_operation["operation_id"]):
+                and (operation["operation_id"] < old_operation["operation_id"] or (
+                    operation["operation_id"] == old_operation["operation_id"]
+                    and _STATION_CALL_STAGE_ORDER[operation["stage"]]
+                        < _STATION_CALL_STAGE_ORDER[old_operation["stage"]]
+                ))):
             return self.status
         previous_runtime_id = self.status.get("runtime_id")
         runtime_changed = (

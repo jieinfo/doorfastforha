@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .const import MONITOR_READY_TIMEOUT, DEFAULT_VIDEO_PORT, DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION
-from .session_diagnostics import station_call_operation, station_call_phase, _uint64
+from .session_diagnostics import station_call_operation, station_call_phase, _uint64, _STATION_CALL_STAGE_ORDER
 from .station_control import validate_reply, validate_call_parameters, stable_error
 
 
@@ -70,7 +70,9 @@ class MonitorCoordinator:
         self._operation: dict[str, Any] | None = None
         self._accepted_call: dict[str, Any] | None = None
         self._native_generation = 0
-        self._call_request_epoch = 0
+        # The client owns the per-station admission counter across registry
+        # replacement. Inherit only that counter, never old call ownership.
+        self._call_request_epoch = getattr(client, "_station_control_epochs", {}).get(station_id, 0)
         self._release_call_audio = None
         self._ready = False
         self._publisher_running: bool | None = None
@@ -115,6 +117,8 @@ class MonitorCoordinator:
         self._release_call_audio = callback
 
     def _begin_call_request(self) -> int:
+        if self._unloaded:
+            raise RuntimeError("station coordinator is closed")
         self._call_request_epoch += 1
         epochs = getattr(self._client, "_station_control_epochs", None)
         if epochs is None:
@@ -257,9 +261,9 @@ class MonitorCoordinator:
                            and native.get("session") in {"preview", "ringing", "talking", "ending"})
         target = operation if operation is not None and operation["station_id"] == self.station_id else None
         if target is not None:
-            order = {"preparing": 0, "calling": 1, "talking": 2, "ending": 3, "ended": 4, "failed": 4}
             if (current is not None and target["operation_id"] == current["operation_id"]
-                    and order.get(target["stage"], 0) < order.get(current["stage"], 0)):
+                    and _STATION_CALL_STAGE_ORDER[target["stage"]]
+                        < _STATION_CALL_STAGE_ORDER[current["stage"]]):
                 return
             self._operation = target
             self._call_error = None if target["error"] == "none" else target["error"]

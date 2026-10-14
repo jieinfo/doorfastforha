@@ -26,6 +26,8 @@ _MEDIA_FAULTS = (_CALL_FAULTS - {"heartbeat_timeout"}) | {
 _STATION_CALL_STAGES = frozenset({
     "idle", "preparing", "calling", "talking", "ending", "ended", "failed",
 })
+_STATION_CALL_STAGE_ORDER = {"idle": 0, "preparing": 1, "calling": 2,
+                             "talking": 3, "ending": 4, "ended": 5, "failed": 5}
 _STATION_CALL_TIMERS = _CALL_TIMERS | {"startup"}
 _STATION_CALL_ERRORS = frozenset({
     "none", "busy", "station_unavailable", "ack_timeout", "dispatch_failed",

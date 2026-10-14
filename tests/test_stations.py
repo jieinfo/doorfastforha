@@ -6,6 +6,7 @@ import importlib.util
 import sys
 import types
 import unittest
+from unittest.mock import AsyncMock
 from pathlib import Path
 
 
@@ -93,6 +94,63 @@ class FailingMonitor(FakeMonitor):
 
 
 class StationRegistryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_rebuilt_real_coordinator_recovers_native_owner_and_audio_release(self):
+        from tests.test_client import DoorfastClient
+        from custom_components.doorfast.setup_lifecycle import sync_monitor_state
+
+        for rebuild in ("runtime", "remove_readd"):
+            with self.subTest(rebuild=rebuild):
+                runtime = "0123456789abcdef"
+                next_runtime = "fedcba9876543210" if rebuild == "runtime" else runtime
+                client = DoorfastClient(None, "http://synthetic.invalid")
+                replies = {}
+                async def transport(method, path, payload=None):
+                    return replies[path]
+                client._request = transport
+                station_row = {"id": "gate_main", "name": "Main gate",
+                    "logical_address": "32:02:01:00:02:01", "enabled": True,
+                    "stream_name": "doorfast_gate_main", "route_source": "configured",
+                    "route_fresh": True, "monitorable": True, "last_seen_ms": 0}
+                replies["/api/v1/status"] = {"runtime_id": runtime, "call": {"session": "idle", "generation": 0}}
+                replies["/api/v1/stations"] = {"runtime_id": runtime, "revision": 1, "stations": [station_row]}
+                replies["/api/v1/call"] = {"runtime_id": runtime, "station_id": "gate_main",
+                    "generation": 9, "operation_id": 3, "queued": True, "state": "preparing"}
+                await client.refresh()
+                registry = StationRegistryCoordinator(client, entry_id="entry-1")
+                await registry.async_refresh()
+                old = registry.monitor("gate_main")
+                await old.async_call()
+                if rebuild == "remove_readd":
+                    replies["/api/v1/stations"] = {"runtime_id": runtime, "revision": 2, "stations": []}
+                    await registry.async_refresh()
+                replies["/api/v1/status"] = {"runtime_id": next_runtime, "call": {
+                    "station_id": "gate_main", "session": "talking", "generation": 42}}
+                replies["/api/v1/stations"] = {"runtime_id": next_runtime, "revision": 3, "stations": [station_row]}
+                replies["/api/v1/monitor/status"] = {"runtime_id": next_runtime, "sessions": []}
+                replies["/api/v1/hangup"] = {"runtime_id": next_runtime, "station_id": "gate_main",
+                    "generation": 0, "operation_id": 0, "queued": True, "state": "ending"}
+                await client.refresh()
+                await registry.async_refresh()
+                current = registry.monitor("gate_main")
+                self.assertIsNot(old, current)
+                inherited_epochs = dict(client._station_control_epochs)
+                with self.assertRaises(RuntimeError):
+                    await old.async_call()
+                self.assertEqual(inherited_epochs, client._station_control_epochs)
+                release = AsyncMock()
+                current.set_call_audio_release(release)
+                provider = types.SimpleNamespace(async_reconcile_monitor=AsyncMock())
+                for _ in range(2):
+                    await sync_monitor_state(client, registry, provider)
+                    self.assertEqual("talking", current.call_state)
+                    self.assertEqual(42, current.snapshot["call_generation"])
+                    await client.refresh()
+                await current.async_hangup()
+                self.assertEqual((next_runtime, "gate_main", 42), release.await_args.args)
+                self.assertEqual(1, release.await_count)
+                self.assertEqual(0, current.snapshot["operation_id"])
+                await registry.async_close()
+
     def make_registry(self, client, closed):
         return StationRegistryCoordinator(
             client,
