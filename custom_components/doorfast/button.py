@@ -74,7 +74,20 @@ class StationButton(ButtonEntity, DoorfastStationEntity):
  @property
  def available(self): return self._active and self.station.enabled and self.client.online
  @property
- def extra_state_attributes(self): return {"call_state": self.monitor.call_state, "call_error": self.monitor.call_error}
+ def extra_state_attributes(self):
+  snapshot = getattr(self.monitor, "snapshot", {})
+  if not isinstance(snapshot, dict): snapshot = {}
+  return {
+   "call_state": snapshot.get("call_state", self.monitor.call_state),
+   "call_error": snapshot.get("call_error", self.monitor.call_error),
+   "operation_id": snapshot.get("operation_id", 0),
+   "runtime_id": snapshot.get("runtime_id"),
+   "station_id": snapshot.get("station_id", self.station.station_id),
+   "media_generation": snapshot.get("media_generation", 0),
+   "call_generation": snapshot.get("call_generation", 0),
+   "call_timer": snapshot.get("call_timer", "none"),
+   "call_remaining_ms": snapshot.get("call_remaining_ms", 0),
+  }
  def mark_removed(self): self._active=False; self.async_write_ha_state()
 
 class StationCallButton(StationButton):

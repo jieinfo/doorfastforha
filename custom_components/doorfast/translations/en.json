@@ -10,7 +10,101 @@
   },
   "entity": {
     "lock": {"unlock": {"name": "Unlock entrance"}},
-    "button": {"elevator_up": {"name": "Call elevator up"}, "elevator_down": {"name": "Call elevator down"}, "answer": {"name": "Answer call"}, "hangup": {"name": "Hang up call"}, "call": {"name": "Call outdoor station"}},
+    "button": {
+      "elevator_up": {
+        "name": "Call elevator up"
+      },
+      "elevator_down": {
+        "name": "Call elevator down"
+      },
+      "answer": {
+        "name": "Answer call"
+      },
+      "hangup": {
+        "name": "Hang up call",
+        "state_attributes": {
+          "call_state": {
+            "name": "Call stage",
+            "state": {
+              "idle": "Idle",
+              "preparing": "Preparing preview",
+              "calling": "Calling",
+              "talking": "In call",
+              "ending": "Ending call",
+              "ended": "Call ended",
+              "failed": "Call failed"
+            }
+          },
+          "call_error": {
+            "name": "Call error",
+            "state": {
+              "none": "No fault",
+              "busy": "Busy",
+              "station_unavailable": "Station unavailable",
+              "ack_timeout": "Acknowledgement timed out",
+              "dispatch_failed": "Control send failed",
+              "dispatch_timeout": "Control send timed out",
+              "media_failed": "Media failed",
+              "preempted": "Preempted",
+              "cancelled": "Cancelled",
+              "runtime_reset": "Runtime reset",
+              "unknown": "Unknown"
+            }
+          },
+          "call_timer": {
+            "name": "Call timer",
+            "state": {
+              "none": "No active timer",
+              "startup": "Startup",
+              "confirmation": "Confirmation",
+              "session": "Session"
+            }
+          }
+        }
+      },
+      "call": {
+        "name": "Call outdoor station",
+        "state_attributes": {
+          "call_state": {
+            "name": "Call stage",
+            "state": {
+              "idle": "Idle",
+              "preparing": "Preparing preview",
+              "calling": "Calling",
+              "talking": "In call",
+              "ending": "Ending call",
+              "ended": "Call ended",
+              "failed": "Call failed"
+            }
+          },
+          "call_error": {
+            "name": "Call error",
+            "state": {
+              "none": "No fault",
+              "busy": "Busy",
+              "station_unavailable": "Station unavailable",
+              "ack_timeout": "Acknowledgement timed out",
+              "dispatch_failed": "Control send failed",
+              "dispatch_timeout": "Control send timed out",
+              "media_failed": "Media failed",
+              "preempted": "Preempted",
+              "cancelled": "Cancelled",
+              "runtime_reset": "Runtime reset",
+              "unknown": "Unknown"
+            }
+          },
+          "call_timer": {
+            "name": "Call timer",
+            "state": {
+              "none": "No active timer",
+              "startup": "Startup",
+              "confirmation": "Confirmation",
+              "session": "Session"
+            }
+          }
+        }
+      }
+    },
     "sensor": {
       "latest_event": {"name": "Doorfast status", "state_attributes": {
         "call_timer": {"name": "Call timer", "state": {

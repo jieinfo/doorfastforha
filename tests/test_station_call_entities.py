@@ -164,6 +164,58 @@ class StationButtonTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("call", entity._attr_translation_key)
         self.assertEqual("Main Gate", entity.device_info["name"])
 
+    def test_station_buttons_expose_bounded_operation_attributes(self):
+        monitor = types.SimpleNamespace(
+            call_state="failed", call_error="unknown",
+            snapshot={"call_state": "talking", "call_error": None,
+                      "operation_id": 3, "runtime_id": "0123456789abcdef",
+                      "station_id": "gate_main", "media_generation": 9,
+                      "call_generation": 7, "call_timer": "session",
+                      "call_remaining_ms": 42, "state": "live", "ready": False},
+        )
+        client = types.SimpleNamespace(online=True)
+        for entity_class in (button.StationCallButton, button.StationHangupButton):
+            entity = entity_class(client, "entry-1", Station(), monitor)
+            self.assertEqual(
+                {"call_state": "talking", "call_error": None,
+                 "operation_id": 3, "runtime_id": "0123456789abcdef",
+                 "station_id": "gate_main", "media_generation": 9,
+                 "call_generation": 7, "call_timer": "session",
+                 "call_remaining_ms": 42},
+                entity.extra_state_attributes,
+            )
+
+    async def test_buttons_consume_real_coordinator_stage_error_timer_snapshot(self):
+        from custom_components.doorfast.monitor import MonitorCoordinator
+
+        runtime = "0123456789abcdef"
+        client = types.SimpleNamespace(online=True, status={"runtime_id": runtime})
+        for stage, timer, remaining, error in (
+            ("preparing", "startup", 30000, "none"),
+            ("calling", "confirmation", 1000, "none"),
+            ("talking", "session", 12000, "none"),
+            ("ending", "confirmation", 400, "none"),
+            ("failed", "none", 0, "ack_timeout"),
+        ):
+            with self.subTest(stage=stage):
+                monitor = MonitorCoordinator(client, runtime, "gate_main")
+                sample = {"runtime_id": runtime,
+                    "call": {"station_id": "gate_main", "generation": 7, "session": "talking" if stage == "talking" else "idle"},
+                    "station_call": {"operation_id": 3, "station_id": "gate_main", "stage": stage,
+                                     "call_generation": 7, "media_generation": 9,
+                                     "timer": timer, "remaining_ms": remaining, "error": error},
+                    "media": {"available": True, "sessions": [
+                        {"station_id": "gate_main", "generation": 9, "purpose": "call", "state": "viewing"}]}}
+                await monitor.async_apply_call_status(sample)
+                for entity_class in (button.StationCallButton, button.StationHangupButton):
+                    entity = entity_class(client, "entry-1", Station(), monitor)
+                    attrs = entity.extra_state_attributes
+                    self.assertEqual(stage, attrs["call_state"])
+                    self.assertEqual(None if error == "none" else "ack_timeout", attrs["call_error"])
+                    self.assertEqual((3, 7, 9, timer, remaining),
+                        tuple(attrs[key] for key in ("operation_id", "call_generation", "media_generation", "call_timer", "call_remaining_ms")))
+                    self.assertEqual({("doorfast", "entry-1_station_gate_main")}, entity.device_info["identifiers"])
+
     def test_controller_entities_use_bridge_device_name(self):
         entity = button.ElevatorButton(
             types.SimpleNamespace(), "entry-1", "up"

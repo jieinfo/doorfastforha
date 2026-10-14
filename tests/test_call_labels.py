@@ -17,3 +17,20 @@ class CallLabelsTest(unittest.TestCase):
                     (component / "translations" / f"{language}.json").read_text()
                 )
                 self.assertEqual(expected, translations["entity"]["button"]["call"]["name"])
+
+    def test_buttons_translate_coordinator_call_states_errors_and_timers(self):
+        component = Path(__file__).parents[1] / "custom_components" / "doorfast"
+        states = {"idle", "preparing", "calling", "talking", "ending", "ended", "failed"}
+        errors = {"none", "busy", "station_unavailable", "ack_timeout", "dispatch_failed",
+                  "dispatch_timeout", "media_failed", "preempted", "cancelled", "runtime_reset", "unknown"}
+        for language in ("en", "zh-Hans"):
+            translations = json.loads(
+                (component / "translations" / f"{language}.json").read_text()
+            )
+            for key in ("call", "hangup"):
+                with self.subTest(language=language, button=key):
+                    attrs = translations["entity"]["button"][key].get("state_attributes", {})
+                    self.assertEqual(states, set(attrs.get("call_state", {}).get("state", {})))
+                    self.assertEqual(errors, set(attrs.get("call_error", {}).get("state", {})))
+                    self.assertEqual({"none", "startup", "confirmation", "session"},
+                                     set(attrs.get("call_timer", {}).get("state", {})))

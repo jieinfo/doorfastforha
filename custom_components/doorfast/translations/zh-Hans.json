@@ -10,7 +10,101 @@
   },
   "entity": {
     "lock": {"unlock": {"name": "门禁解锁"}},
-    "button": {"elevator_up": {"name": "召梯上行"}, "elevator_down": {"name": "召梯下行"}, "answer": {"name": "接听通话"}, "hangup": {"name": "挂断通话"}, "call": {"name": "呼叫室外机"}},
+    "button": {
+      "elevator_up": {
+        "name": "召梯上行"
+      },
+      "elevator_down": {
+        "name": "召梯下行"
+      },
+      "answer": {
+        "name": "接听通话"
+      },
+      "hangup": {
+        "name": "挂断通话",
+        "state_attributes": {
+          "call_state": {
+            "name": "呼叫阶段",
+            "state": {
+              "idle": "空闲",
+              "preparing": "正在准备预览",
+              "calling": "呼叫中",
+              "talking": "通话中",
+              "ending": "正在结束通话",
+              "ended": "通话已结束",
+              "failed": "呼叫失败"
+            }
+          },
+          "call_error": {
+            "name": "呼叫错误",
+            "state": {
+              "none": "无故障",
+              "busy": "忙",
+              "station_unavailable": "门口机不可用",
+              "ack_timeout": "确认超时",
+              "dispatch_failed": "控制发送失败",
+              "dispatch_timeout": "控制发送超时",
+              "media_failed": "媒体失败",
+              "preempted": "被抢占",
+              "cancelled": "已取消",
+              "runtime_reset": "运行实例重置",
+              "unknown": "未知"
+            }
+          },
+          "call_timer": {
+            "name": "呼叫计时器",
+            "state": {
+              "none": "无活动计时器",
+              "startup": "启动准备",
+              "confirmation": "确认",
+              "session": "会话"
+            }
+          }
+        }
+      },
+      "call": {
+        "name": "呼叫室外机",
+        "state_attributes": {
+          "call_state": {
+            "name": "呼叫阶段",
+            "state": {
+              "idle": "空闲",
+              "preparing": "正在准备预览",
+              "calling": "呼叫中",
+              "talking": "通话中",
+              "ending": "正在结束通话",
+              "ended": "通话已结束",
+              "failed": "呼叫失败"
+            }
+          },
+          "call_error": {
+            "name": "呼叫错误",
+            "state": {
+              "none": "无故障",
+              "busy": "忙",
+              "station_unavailable": "门口机不可用",
+              "ack_timeout": "确认超时",
+              "dispatch_failed": "控制发送失败",
+              "dispatch_timeout": "控制发送超时",
+              "media_failed": "媒体失败",
+              "preempted": "被抢占",
+              "cancelled": "已取消",
+              "runtime_reset": "运行实例重置",
+              "unknown": "未知"
+            }
+          },
+          "call_timer": {
+            "name": "呼叫计时器",
+            "state": {
+              "none": "无活动计时器",
+              "startup": "启动准备",
+              "confirmation": "确认",
+              "session": "会话"
+            }
+          }
+        }
+      }
+    },
     "sensor": {
       "latest_event": {"name": "Doorfast 状态", "state_attributes": {
         "call_timer": {"name": "通话计时器", "state": {

@@ -53,6 +53,53 @@ def status(runtime=RUNTIME):
     }
 
 
+def outbound_status():
+    return {**status(),
+        "station_call": {"operation_id": 3, "station_id": "gate_main", "stage": "talking",
+                         "media_generation": 9, "call_generation": 7,
+                         "timer": "session", "remaining_ms": 12000, "error": "none"},
+        "media": {"available": True, "sessions": [
+            {"station_id": "gate_main", "generation": 9, "purpose": "call",
+             "state": "viewing", "ready": True, "source_live": True}]},
+    }
+
+
+def inadmissible_statuses():
+    # Each mutation breaks a distinct authoritative fact, never DSP/PCM details.
+    cases = []
+    for field, value in (("call_generation", 8), ("media_generation", 10),
+                         ("station_id", "gate_side"), ("operation_id", True),
+                         ("remaining_ms", 1 << 64), ("error", "raw secret"),
+                         ("stage", "calling"), ("stage", "preparing"), ("stage", "ending")):
+        sample = outbound_status()
+        sample["station_call"][field] = value
+        cases.append((field + str(value), sample))
+    for field, value in (("session", "idle"), ("generation", 0), ("station_id", "gate_side")):
+        sample = outbound_status()
+        sample["call"][field] = value
+        cases.append((field + str(value), sample))
+    for value in (None, {}, "queued"):
+        sample = outbound_status()
+        sample["station_call"] = value
+        cases.append(("malformed" + str(value), sample))
+    for field, value in (("generation", 10), ("purpose", "preview"), ("state", "idle")):
+        sample = outbound_status()
+        sample["media"]["sessions"][0][field] = value
+        cases.append(("media" + field, sample))
+    sample = outbound_status()
+    sample["media"]["sessions"] *= 2
+    cases.append(("ambiguous media", sample))
+    sample = outbound_status()
+    sample["media"]["available"] = False
+    cases.append(("unavailable media", sample))
+    sample = outbound_status()
+    sample.pop("station_call")
+    sample["call"].update(session="idle", generation=0)
+    sample["queued"] = True
+    cases.append(("legacy purpose-only ready queued idle", sample))
+    return cases
+
+
 def identity_headers(runtime=RUNTIME):
     return {
         "X-Doorfast-Runtime-Id": runtime,
@@ -228,6 +275,63 @@ class AudioContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, self.manager._pending_cleanups)
         self.assertTrue(all(timer.cancelled for timer in self.timers))
         self.assertTrue(all(not connection.subscriptions for connection in self.connections))
+
+    async def test_outbound_identity_conflicts_cannot_admit_listener_or_microphone(self):
+        for name, sample in inadmissible_statuses():
+            with self.subTest(case=name):
+                self.http.current_status = sample
+                self.client.status = sample
+                listener, microphone = Connection(), Connection()
+                try:
+                    await self.manager.listen_start(listener, {
+                        "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7})
+                    await self.manager.start(microphone, {
+                        "id": 2, "config_entry_id": "one", "station_id": "gate_main", "generation": 7})
+                    self.assertEqual([], listener.results)
+                    self.assertEqual(["audio_identity_mismatch"], [error.code for error in listener.errors])
+                    self.assertEqual([], microphone.results)
+                    self.assertTrue(microphone.errors)
+                    self.assertEqual([], self.http.producer_requests)
+                    self.assert_released()
+                finally:
+                    await self.manager.release_entry("one")
+                    self.http.producer_requests.clear()
+
+    async def test_matched_outbound_and_new_incoming_ignore_terminal_history(self):
+        samples = [outbound_status(), status()]
+        for stage in ("ended", "failed"):
+            for station in ("gate_main", "gate_side"):
+                sample = outbound_status()
+                sample["station_call"].update(stage=stage, station_id=station,
+                    call_generation=6, media_generation=8, timer="none", remaining_ms=0)
+                sample.pop("media")
+                samples.append(sample)
+        for sample in samples:
+            with self.subTest(operation=sample.get("station_call")):
+                self.http.current_status = sample
+                self.client.status = sample
+                connection = Connection()
+                listener_id = await self.listen(connection)
+                await self.manager.start(connection, {
+                    "id": 3, "config_entry_id": "one", "listener_id": listener_id})
+                self.assertEqual([], connection.errors)
+                self.assertEqual("active", connection.results[-1]["state"])
+                self.assertEqual("7", self.http.producer_requests[-1][1]["generation"])
+                await self.manager.release_entry("one")
+                self.assert_released()
+
+    async def test_real_microphone_rejects_mapping_conflict_before_session_open(self):
+        sample = outbound_status()
+        sample["station_call"]["call_generation"] = 8
+        self.http.current_status = sample
+        self.client.status = sample
+        connection = Connection()
+        await self.manager.start(connection, {
+            "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7})
+        self.assertEqual([], connection.results)
+        self.assertEqual(["status_not_ready"], [error.code for error in connection.errors])
+        self.assertEqual([], self.http.producer_requests)
+        self.assert_released()
 
     async def test_http_stream_resync_and_reused_generation_release_the_whole_chain(self):
         """Ignoring a terminal identity failure would retain old hub/producer ownership."""

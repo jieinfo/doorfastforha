@@ -118,6 +118,11 @@ def _status_identity(value: object, station_id: str | None = None) -> tuple[str,
         or (station_id is not None and actual_station != station_id)
     ):
         raise PcmProducerError("status_not_ready")
+    if "station_call" in value:
+        from .session_diagnostics import station_call_phase
+
+        if station_call_phase(value, actual_station) != "in_call":
+            raise PcmProducerError("status_not_ready")
     return runtime, generation
 
 
