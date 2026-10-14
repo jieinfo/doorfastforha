@@ -111,7 +111,7 @@
 
 - [ ] **步骤 5：Commit**
 
-  `git add custom_components/doorfast/translations custom_components/doorfast/strings.json custom_components/doorfast/entities.py tests/test_station_call_entities.py tests/test_audio_client.py tests/test_audio_contract.py tests/test_call_labels.py && git commit -m "fix: align HA call labels and audio admission"`
+  `git add custom_components/doorfast/translations custom_components/doorfast/button.py tests/test_station_call_entities.py tests/test_audio_client.py tests/test_audio_contract.py tests/test_call_labels.py && git commit -m "fix: align HA call labels and audio admission"`
 
 ### 任务 4：HA 完整验证与本地交付检查
 
@@ -131,7 +131,7 @@
 
   运行：`git diff --check`、`git diff --stat origin/codex/integrate-webrtc-camera...HEAD`、`git status --short --branch`；保留用户现有 `.DS_Store`，不修改发布版本号或 HACS 元数据，除非后续明确要求发布。
 
-- [ ] **步骤 4：Commit**
+- [ ] **步骤 4：记录验证结果**
 
-  `git add docs/superpowers/plans/2026-10-14-outbound-call-ha-status.md && git commit -m "docs: plan HA outbound call status repair"`
+  将完整命令、测试数量、退出码、JSON/compile 检查和最终 diff 摘要追加到本计划的 SDD ledger；计划文档已经在执行前提交，不重复制造空提交。
 
