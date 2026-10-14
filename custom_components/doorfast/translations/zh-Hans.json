@@ -12,11 +12,47 @@
     "lock": {"unlock": {"name": "门禁解锁"}},
     "button": {"elevator_up": {"name": "召梯上行"}, "elevator_down": {"name": "召梯下行"}, "answer": {"name": "接听通话"}, "hangup": {"name": "挂断通话"}, "call": {"name": "呼叫室外机"}},
     "sensor": {
-      "latest_event": {"name": "Doorfast 状态"},
+      "latest_event": {"name": "Doorfast 状态", "state_attributes": {
+        "call_timer": {"name": "通话计时器", "state": {
+          "none": "无活动计时器", "confirmation": "确认", "session": "会话", "unknown": "未知"
+        }},
+        "call_remaining_ms": {"name": "最近采样通话剩余时间（毫秒）"},
+        "call_end_reason": {"name": "通话结束原因", "state": {
+          "none": "无结束结果", "local_hangup": "本地主动挂断", "peer_hangup": "门口机主动挂断",
+          "session_timeout": "会话超时", "confirmation_timeout": "确认超时", "preempted": "被抢占",
+          "runtime_reset": "运行实例重置", "heartbeat_timeout": "保活超时", "unknown": "未知"
+        }},
+        "call_fault": {"name": "通话故障", "state": {
+          "none": "无故障", "dispatch_failed": "控制发送失败", "dispatch_timeout": "控制发送超时",
+          "confirmation_rejected": "确认被拒绝", "confirmation_timeout": "确认超时", "preempted": "被抢占",
+          "cancelled": "已取消", "runtime_reset": "运行实例重置", "heartbeat_timeout": "保活超时", "unknown": "未知"
+        }},
+        "call_last_station_id": {"name": "最近结束通话的门口机"},
+        "call_last_generation": {"name": "最近结束通话的代次"}
+      }},
       "preview_status": {"name": "预览状态", "state": {
         "idle": "空闲", "requesting": "请求预览中", "awaiting_video": "等待首帧",
         "live": "实时画面在线", "reconnecting": "重连中（保留最后画面）", "in_call": "通话中",
         "stopping": "停止中", "preempted": "被通话抢占", "failed": "预览失败"
+      }, "state_attributes": {
+        "monitor_timer": {"name": "预览计时器", "state": {
+          "none": "无活动计时器", "confirmation": "确认", "session": "会话",
+          "first_frame": "首帧", "reconnect": "重连", "unknown": "未知"
+        }},
+        "monitor_remaining_ms": {"name": "最近采样预览剩余时间（毫秒）"},
+        "monitor_end_reason": {"name": "预览结束原因", "state": {
+          "none": "无结束结果", "local_hangup": "本地主动挂断", "peer_hangup": "门口机主动挂断",
+          "session_timeout": "会话超时", "confirmation_timeout": "确认超时", "preempted": "被抢占",
+          "runtime_reset": "运行实例重置", "unknown": "未知"
+        }},
+        "monitor_failure_reason": {"name": "预览故障原因", "state": {
+          "none": "无故障", "dispatch_failed": "控制发送失败", "dispatch_timeout": "控制发送超时",
+          "confirmation_rejected": "确认被拒绝", "confirmation_timeout": "确认超时",
+          "first_frame_timeout": "首帧超时", "source_stalled": "视频源停顿", "encoder_failed": "编码器失败",
+          "publisher_failed": "发布器失败", "capacity_busy": "容量忙", "preempted": "被抢占",
+          "cancelled": "已取消", "runtime_reset": "运行实例重置", "unknown": "未知"
+        }},
+        "monitor_last_generation": {"name": "最近结束媒体会话的代次"}
       }},
       "unlock_status": {"name": "解锁进度／最近回复", "state": {
         "idle": "空闲", "waiting_media": "正在建立解锁所需预览", "waiting_reply": "等待门口机回复",

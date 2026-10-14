@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from enum import Enum
 import importlib.util
 import json
@@ -329,6 +330,158 @@ class StationStatusTest(unittest.IsolatedAsyncioTestCase):
             controller._handle_status({"call": call})
             self.assertEqual("unknown", controller.native_value)
             self.assertEqual("unknown", controller.extra_state_attributes["call_fault"])
+
+    async def test_push_and_poll_present_the_same_authoritative_diagnostics_for_three_stations(self):
+        # Replacing refreshed raw status with event.status would change all these attributes.
+        events = load_component("events")
+        polling = load_component("polling")
+        self.registry.items["gate_b2"] = station("gate_b2", "B2 gate")
+        self.registry.listener("added", "gate_b2")
+        controller = self.entities[0]
+        await controller.async_added_to_hass()
+        station_ids = ("gate_main", "gate_side", "gate_b2")
+        previews = [self.find(station_id, "preview_status") for station_id in station_ids]
+        for entity in previews:
+            await entity.async_added_to_hass()
+        snapshot = {"runtime_id": "runtime-a", "call": {
+            "session": "talking", "station_id": "gate_side", "generation": 12,
+            "timer": "session", "remaining_ms": 4000, "end_reason": "none", "fault": "none",
+            "last_station_id": "gate_main", "last_generation": 11},
+            "media": {"sessions": [
+                {"station_id": station_id, "generation": 9, "status_revision": 7,
+                 "state": "viewing", "purpose": "preview", "ready": True, "source_live": True,
+                 "timer": "none", "remaining_ms": 0, "end_reason": "none", "failure_reason": "none"}
+                for station_id in station_ids], "last_results": [
+                {"station_id": station_id, "generation": 8, "timer": "none", "remaining_ms": 0,
+                 "end_reason": "local_hangup", "failure_reason": "cancelled"}
+                for station_id in station_ids]}}
+
+        async def refresh():
+            self.registry.client.status = deepcopy(snapshot)
+            return self.registry.client.status
+
+        async def noop():
+            pass
+
+        def dispatch(kind, value):
+            if kind == "status":
+                for listener in self.hass.listeners["doorfast_entry-1_STATUS"]:
+                    listener(value)
+
+        async def dispatch_poll():
+            dispatch("status", self.registry.client.status)
+
+        self.registry.client.refresh = refresh
+        await polling.async_poll(self.registry.client, refresh, noop, noop, dispatch_poll)
+        call_expected = {"call_timer": "session", "call_remaining_ms": 4000,
+                         "call_end_reason": "none", "call_fault": "none",
+                         "call_last_station_id": "gate_main", "call_last_generation": 11}
+        for key, value in call_expected.items():
+            self.assertEqual(value, controller.extra_state_attributes[key])
+        poll_preview = [deepcopy(entity.extra_state_attributes) for entity in previews]
+        gate = events.EventGate()
+        for station_id in station_ids:
+            payload = {"schema_version": 1, "event_id": 1, "event": "monitor_failed",
+                       "generation": 9, "status_revision": 7, "timestamp_ms": 1000,
+                       "runtime_id": "runtime-a", "station_id": station_id,
+                       "status": {"timer": "reconnect", "remaining_ms": 100,
+                                  "end_reason": "preempted", "failure_reason": "source_stalled"}}
+            self.assertEqual(200, (await events.process_event(
+                payload, self.registry.client, gate, dispatch, lambda _: False, station_ids))[0])
+            self.assertEqual(poll_preview, [entity.extra_state_attributes for entity in previews])
+            for key, value in call_expected.items():
+                self.assertEqual(value, controller.extra_state_attributes[key])
+            self.assertEqual(snapshot["call"], self.registry.client.status["call"])
+            self.assertEqual(snapshot["media"], self.registry.client.status["media"])
+            for changes in ({}, {"event_id": 2, "generation": 8},
+                            {"event_id": 3, "status_revision": 6},
+                            {"event_id": 4, "runtime_id": "old-runtime"},
+                            {"event_id": 5, "generation": True}):
+                with self.subTest(station_id=station_id, changes=changes):
+                    response = await events.process_event(
+                        {**payload, **changes}, self.registry.client, gate, dispatch,
+                        lambda _: False, station_ids)
+                    self.assertEqual(400 if changes.get("generation") is True else 202, response[0])
+                    self.assertEqual(poll_preview, [entity.extra_state_attributes for entity in previews])
+                    for key, value in call_expected.items():
+                        self.assertEqual(value, controller.extra_state_attributes[key])
+        snapshot.update(runtime_id="runtime-b")
+        snapshot["media"] = {"sessions": [], "last_results": []}
+        snapshot["call"] = {"session": "idle", "generation": 0,
+                            "timer": "none", "remaining_ms": 0, "end_reason": "none", "fault": "none"}
+        await polling.async_poll(self.registry.client, refresh, noop, noop, dispatch_poll)
+        self.assertTrue(all(entity.extra_state_attributes["monitor_last_generation"] is None
+                            for entity in previews))
+        self.assertEqual(202, (await events.process_event(
+            payload, self.registry.client, gate, dispatch, lambda _: False, station_ids))[0])
+        self.assertTrue(all(entity.extra_state_attributes["monitor_end_reason"] == "unknown"
+                            for entity in previews))
+        self.assertIsNone(controller.extra_state_attributes["call_last_generation"])
+
+    async def test_call_push_ignores_embedded_diagnostics_and_late_hangup(self):
+        events = load_component("events")
+        controller = self.entities[0]
+        self.registry.client.status = {"call": {"session": "talking", "generation": 9,
+            "timer": "session", "remaining_ms": 8000, "end_reason": "none", "fault": "none",
+            "last_station_id": "gate_b2", "last_generation": 8}}
+        await controller.async_added_to_hass()
+
+        async def refresh():
+            return self.registry.client.status
+
+        def dispatch(kind, value):
+            if kind == "status":
+                controller._handle_status(value)
+
+        self.registry.client.refresh = refresh
+        payload = {"schema_version": 1, "event_id": 1, "event": "call_established",
+                   "generation": 9, "timestamp_ms": 1000, "status": {
+                       "call": {"end_reason": "peer_hangup", "timer": "none", "remaining_ms": 0}}}
+        gate = events.EventGate()
+        self.assertEqual(200, (await events.process_event(
+            payload, self.registry.client, gate, dispatch, lambda _: False))[0])
+        self.assertEqual("none", controller.extra_state_attributes["call_end_reason"])
+        self.assertEqual(8000, controller.extra_state_attributes["call_remaining_ms"])
+        for changes in ({}, {"event": "hangup", "generation": 8, "event_id": 2}):
+            self.assertEqual(202, (await events.process_event(
+                {**payload, **changes}, self.registry.client, gate, dispatch, lambda _: False))[0])
+            self.assertEqual("none", controller.extra_state_attributes["call_end_reason"])
+            self.assertEqual(8, controller.extra_state_attributes["call_last_generation"])
+
+    async def test_native_attribute_translations_cover_entity_diagnostic_domains(self):
+        # Missing/misplaced state_attributes makes these consumer values untranslated.
+        timer_media = {"none", "confirmation", "session", "first_frame", "reconnect", "unknown"}
+        timer_call = {"none", "confirmation", "session", "unknown"}
+        ends_media = {"none", "local_hangup", "peer_hangup", "session_timeout",
+                      "confirmation_timeout", "preempted", "runtime_reset", "unknown"}
+        faults_call = {"none", "dispatch_failed", "dispatch_timeout", "confirmation_rejected",
+                       "confirmation_timeout", "preempted", "cancelled", "runtime_reset",
+                       "heartbeat_timeout", "unknown"}
+        faults_media = (faults_call - {"heartbeat_timeout"}) | {
+            "first_frame_timeout", "source_stalled", "encoder_failed", "publisher_failed", "capacity_busy"}
+        domains = {"preview_status": {
+            "monitor_timer": timer_media, "monitor_remaining_ms": None,
+            "monitor_end_reason": ends_media, "monitor_failure_reason": faults_media,
+            "monitor_last_generation": None}, "latest_event": {
+            "call_timer": timer_call, "call_remaining_ms": None,
+            "call_end_reason": ends_media | {"heartbeat_timeout"}, "call_fault": faults_call,
+            "call_last_station_id": None, "call_last_generation": None}}
+        for language in ("en", "zh-Hans"):
+            translations = json.loads((COMPONENT / "translations" / f"{language}.json").read_text())
+            for kind, fields in domains.items():
+                entity = self.find("gate_main", kind) if kind == "preview_status" else self.entities[0]
+                translated = translations["entity"]["sensor"][entity._attr_translation_key]
+                self.assertIn("state_attributes", translated)
+                attributes = translated["state_attributes"]
+                self.assertEqual(set(fields), set(attributes))
+                for name, codes in fields.items():
+                    self.assertTrue(attributes[name]["name"].strip())
+                    if codes is not None:
+                        self.assertEqual(codes, set(attributes[name]["state"]))
+                        self.assertTrue(all(label.strip() for label in attributes[name]["state"].values()))
+                prefix = "monitor" if kind == "preview_status" else "call"
+                end_labels = attributes[f"{prefix}_end_reason"]["state"]
+                self.assertNotEqual(end_labels["confirmation_timeout"], end_labels["session_timeout"])
 
     async def test_unlock_progress_does_not_reuse_another_station_result(self):
         self.assertEqual(5, len(self.entities))

@@ -12,11 +12,48 @@
     "lock": {"unlock": {"name": "Unlock entrance"}},
     "button": {"elevator_up": {"name": "Call elevator up"}, "elevator_down": {"name": "Call elevator down"}, "answer": {"name": "Answer call"}, "hangup": {"name": "Hang up call"}, "call": {"name": "Call outdoor station"}},
     "sensor": {
-      "latest_event": {"name": "Doorfast status"},
+      "latest_event": {"name": "Doorfast status", "state_attributes": {
+        "call_timer": {"name": "Call timer", "state": {
+          "none": "No active timer", "confirmation": "Confirmation", "session": "Session", "unknown": "Unknown"
+        }},
+        "call_remaining_ms": {"name": "Sampled call time remaining (ms)"},
+        "call_end_reason": {"name": "Call end reason", "state": {
+          "none": "No end result", "local_hangup": "Locally hung up", "peer_hangup": "Station hung up",
+          "session_timeout": "Session timed out", "confirmation_timeout": "Confirmation timed out",
+          "preempted": "Preempted", "runtime_reset": "Runtime reset", "heartbeat_timeout": "Heartbeat timed out", "unknown": "Unknown"
+        }},
+        "call_fault": {"name": "Call fault", "state": {
+          "none": "No fault", "dispatch_failed": "Control send failed", "dispatch_timeout": "Control send timed out",
+          "confirmation_rejected": "Confirmation rejected", "confirmation_timeout": "Confirmation timed out",
+          "preempted": "Preempted", "cancelled": "Cancelled", "runtime_reset": "Runtime reset",
+          "heartbeat_timeout": "Heartbeat timed out", "unknown": "Unknown"
+        }},
+        "call_last_station_id": {"name": "Latest ended call station"},
+        "call_last_generation": {"name": "Latest ended call generation"}
+      }},
       "preview_status": {"name": "Preview status", "state": {
         "idle": "Idle", "requesting": "Requesting preview", "awaiting_video": "Waiting for first frame",
         "live": "Live video", "reconnecting": "Reconnecting (last frame retained)", "in_call": "In call",
         "stopping": "Stopping", "preempted": "Preempted by a call", "failed": "Preview failed"
+      }, "state_attributes": {
+        "monitor_timer": {"name": "Preview timer", "state": {
+          "none": "No active timer", "confirmation": "Confirmation", "session": "Session",
+          "first_frame": "First frame", "reconnect": "Reconnect", "unknown": "Unknown"
+        }},
+        "monitor_remaining_ms": {"name": "Sampled preview time remaining (ms)"},
+        "monitor_end_reason": {"name": "Preview end reason", "state": {
+          "none": "No end result", "local_hangup": "Locally hung up", "peer_hangup": "Station hung up",
+          "session_timeout": "Session timed out", "confirmation_timeout": "Confirmation timed out",
+          "preempted": "Preempted", "runtime_reset": "Runtime reset", "unknown": "Unknown"
+        }},
+        "monitor_failure_reason": {"name": "Preview failure reason", "state": {
+          "none": "No fault", "dispatch_failed": "Control send failed", "dispatch_timeout": "Control send timed out",
+          "confirmation_rejected": "Confirmation rejected", "confirmation_timeout": "Confirmation timed out",
+          "first_frame_timeout": "First frame timed out", "source_stalled": "Video source stalled",
+          "encoder_failed": "Encoder failed", "publisher_failed": "Publisher failed", "capacity_busy": "Capacity busy",
+          "preempted": "Preempted", "cancelled": "Cancelled", "runtime_reset": "Runtime reset", "unknown": "Unknown"
+        }},
+        "monitor_last_generation": {"name": "Latest ended media generation"}
       }},
       "unlock_status": {"name": "Unlock progress / latest reply", "state": {
         "idle": "Idle", "waiting_media": "Preparing preview for unlock", "waiting_reply": "Waiting for station reply",
