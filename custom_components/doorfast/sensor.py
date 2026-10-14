@@ -6,6 +6,7 @@ from .access_status import UNLOCK_PHASES, station_access_attributes
 from .const import CONTROLLER_NAME, DOMAIN, LATEST_EVENT, MANUFACTURER, STATIONS_KEY, SW_VERSION
 from .station_entity import DoorfastStationEntity
 from .station_status import PREVIEW_PHASES, preview_attributes
+from .session_diagnostics import call_diagnostics
 
 async def async_setup_entry(hass, entry, async_add_entities):
     async_add_entities([DoorfastStatus(hass, entry)])
@@ -66,8 +67,11 @@ class DoorfastStatus(SensorEntity):
         self._handle_status(self.client.status)
     @callback
     def _handle_status(self, data):
-        self._attrs = {**data, "latest_audio_url": self.client.latest_audio_url}
-        self._state = data.get("call", {}).get("session", data.get("event", "unknown"))
+        self._attrs = {**data, "latest_audio_url": self.client.latest_audio_url,
+                       **call_diagnostics(data)}
+        call = data.get("call")
+        self._state = (call.get("session", data.get("event", "unknown"))
+                       if isinstance(call, dict) else data.get("event", "unknown"))
         self.async_write_ha_state()
 
 

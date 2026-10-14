@@ -169,6 +169,8 @@ class StationStatusTest(unittest.IsolatedAsyncioTestCase):
 
         def add(items):
             for item in items:
+                if not hasattr(item, "cleanup"):
+                    SensorEntity.__init__(item)  # Initialize the external HA test stub.
                 item.hass = self.hass
                 item.entity_id = f"sensor.{item.unique_id}"
                 self.entities.append(item)
@@ -221,6 +223,112 @@ class StationStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(entity.available)
         self.assertIsNone(entity.native_value)
         self.assertGreater(entity.writes, 0)
+
+    async def test_three_station_phases_expose_only_their_sampled_diagnostics(self):
+        # Missing mapping, foreign history fallback, or ready=>live would break this.
+        self.registry.items["gate_b2"] = station("gate_b2", "B2 gate")
+        self.registry.listener("added", "gate_b2")
+        self.assertEqual(7, len(self.entities))
+        for station_id in ("gate_main", "gate_side", "gate_b2"):
+            entity = self.find(station_id, "preview_status")
+            await entity.async_added_to_hass()
+            session = {"station_id": station_id, "generation": 9, "purpose": "preview",
+                       "end_reason": "none", "failure_reason": "none",
+                       "timer": "first_frame", "remaining_ms": 900,
+                       "token": "do not expose", "address": "do not expose"}
+            self.registry.client.status = {"media": {"sessions": [session], "last_results": [
+                {"station_id": station_id, "generation": 8, "timer": "none", "remaining_ms": 0,
+                 "end_reason": "local_hangup", "failure_reason": "cancelled"}]}}
+            for state, ready, live, purpose, phase, timer, remaining, fault in (
+                ("requesting", False, False, "preview", "requesting", "none", 0, "none"),
+                ("awaiting_video", False, False, "preview", "awaiting_video", "first_frame", 900, "none"),
+                ("viewing", True, True, "preview", "live", "none", 0, "none"),
+                ("publishing", True, False, "preview", "reconnecting", "reconnect", 250, "source_stalled"),
+                ("viewing", True, True, "call", "in_call", "session", 12000, "none"),
+                ("failed", True, True, "preview", "failed", "none", 0, "first_frame_timeout"),
+            ):
+                with self.subTest(station_id=station_id, phase=phase):
+                    session.update(state=state, ready=ready, source_live=live, purpose=purpose,
+                                   timer=timer, remaining_ms=remaining, failure_reason=fault)
+                    entity._handle_status(self.registry.client.status)
+                    attrs = entity.extra_state_attributes
+                    self.assertEqual(phase, entity.native_value)
+                    self.assertIn("monitor_timer", attrs)
+                    self.assertEqual((timer, remaining, "none", fault, 8, 9),
+                                     (attrs["monitor_timer"], attrs["monitor_remaining_ms"],
+                                      attrs["monitor_end_reason"], attrs["monitor_failure_reason"],
+                                      attrs["monitor_last_generation"], attrs["generation"]))
+                    self.assertNotIn("do not expose", str(attrs))
+                    for other in ("gate_main", "gate_side", "gate_b2"):
+                        if other != station_id:
+                            other_attrs = self.find(other, "preview_status").extra_state_attributes
+                            self.assertEqual("unknown", other_attrs["monitor_timer"])
+                            self.assertIsNone(other_attrs["monitor_last_generation"])
+            session.update(state="viewing", ready=True, source_live="true", purpose="preview")
+            self.assertIsNone(entity.native_value)
+            self.assertIn("monitor_failure_reason", entity.extra_state_attributes)
+            self.assertEqual("first_frame_timeout", entity.extra_state_attributes["monitor_failure_reason"])
+
+    async def test_preview_terminal_preemption_and_restart_do_not_restore_current_history(self):
+        entity = self.find("gate_main", "preview_status")
+        self.registry.client.status = {"media": {"preempted_station_id": "gate_main",
+            "preempted_generation": 8, "sessions": [{"station_id": "gate_side", "generation": 9,
+                "purpose": "call", "state": "viewing", "ready": True, "source_live": True}],
+            "last_results": [{"station_id": "gate_main", "generation": 8,
+                "timer": "none", "remaining_ms": 0, "end_reason": "preempted",
+                "failure_reason": "preempted"}]}}
+        self.assertEqual("preempted", entity.native_value)
+        self.assertIn("monitor_timer", entity.extra_state_attributes)
+        self.assertEqual(("none", 0, "preempted", "preempted", 8), tuple(
+            entity.extra_state_attributes[field] for field in (
+                "monitor_timer", "monitor_remaining_ms", "monitor_end_reason",
+                "monitor_failure_reason", "monitor_last_generation")))
+        self.registry.client.status = {"runtime_id": "new", "media": {
+            "sessions": [], "last_results": []}}
+        self.assertEqual("idle", entity.native_value)
+        self.assertEqual(("unknown", None, "unknown", "unknown", None), tuple(
+            entity.extra_state_attributes[field] for field in (
+                "monitor_timer", "monitor_remaining_ms", "monitor_end_reason",
+                "monitor_failure_reason", "monitor_last_generation")))
+        self.registry.client.status = {"media": {"sessions": [{"station_id": "gate_main",
+            "state": "viewing", "ready": True, "source_live": True}]}}
+        self.assertEqual("live", entity.native_value)  # Existing phase contract stays independent.
+        self.assertEqual("unknown", entity.extra_state_attributes["monitor_timer"])
+        self.assertIsNone(entity.extra_state_attributes["monitor_last_generation"])
+        self.registry.client.online = False
+        self.assertIsNone(entity.extra_state_attributes["monitor_remaining_ms"])
+
+    async def test_controller_diagnostics_keep_current_call_and_terminal_owner_distinct(self):
+        controller = self.entities[0]
+        status = {"call": {"session": "talking", "generation": 9, "station_id": "gate_side",
+                  "timer": "session", "remaining_ms": 12000, "end_reason": "none", "fault": "none",
+                  "last_station_id": "gate_main", "last_generation": 8},
+                  "audio": {"ready": True, "generation": 9}}
+        self.registry.client.status = status
+        await controller.async_added_to_hass()
+        attrs = controller.extra_state_attributes
+        self.assertEqual("talking", controller.native_value)
+        self.assertIn("call_timer", attrs)
+        self.assertEqual(("session", 12000, "none", "none", "gate_main", 8), tuple(
+            attrs[field] for field in ("call_timer", "call_remaining_ms", "call_end_reason",
+                                      "call_fault", "call_last_station_id", "call_last_generation")))
+        self.assertIs(status["call"], attrs["call"])
+        self.assertIs(status["audio"], attrs["audio"])
+        self.assertIs(status, self.registry.client.status)
+        self.assertNotIn("call_timer", status)
+        controller._handle_status({"call": {"session": "idle", "timer": [], "remaining_ms": 42,
+                                          "last_station_id": "32:02:01:00:01:00", "last_generation": 8}})
+        self.assertEqual(("unknown", None, "unknown", "unknown", None, None), tuple(
+            controller.extra_state_attributes[field] for field in (
+                "call_timer", "call_remaining_ms", "call_end_reason", "call_fault",
+                "call_last_station_id", "call_last_generation")))
+        controller._handle_status({})
+        self.assertEqual("unknown", controller.native_value)
+        self.assertIsNone(controller.extra_state_attributes["call_remaining_ms"])
+        for call in (None, [], True, "talking"):
+            controller._handle_status({"call": call})
+            self.assertEqual("unknown", controller.native_value)
+            self.assertEqual("unknown", controller.extra_state_attributes["call_fault"])
 
     async def test_unlock_progress_does_not_reuse_another_station_result(self):
         self.assertEqual(5, len(self.entities))

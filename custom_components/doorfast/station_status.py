@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from .session_diagnostics import station_diagnostics
+
 
 PREVIEW_PHASES = (
     "idle", "requesting", "awaiting_video", "live", "reconnecting",
@@ -17,7 +19,9 @@ def preview_attributes(status: dict[str, Any], station_id: str) -> dict[str, Any
     A missing source_live flag from an older bridge is unknown, not live.
     No fallback to the first/default station or exposure of arbitrary fields.
     """
-    attributes: dict[str, Any] = {"phase": None, "source_live": None}
+    attributes: dict[str, Any] = {
+        "phase": None, "source_live": None, **station_diagnostics(status, station_id),
+    }
     media = status.get("media")
     if not isinstance(media, dict) or media.get("available") is False:
         return attributes
