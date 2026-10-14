@@ -5,6 +5,14 @@ from typing import Any
 
 from .session_diagnostics import _STATION_CALL_ERRORS, _STATION_CALL_STAGES, _uint64
 
+_ADMISSION_ERRORS = {
+    "capacity_busy": "busy",
+    "station_not_found": "station_unavailable",
+    "station_disabled": "station_unavailable",
+    "route_unavailable": "station_unavailable",
+    "encoder_failed": "media_failed",
+}
+
 
 def validate_reply(reply: Any, runtime_id: str, station_id: str) -> dict[str, Any]:
     if not isinstance(reply, dict):
@@ -36,6 +44,10 @@ def positive_condition(value: Any) -> int:
 
 def stable_error(error: Exception) -> str:
     code = getattr(error, "code", None)
+    if isinstance(code, str):
+        code = _ADMISSION_ERRORS.get(code, code)
+    # Runtime/operation/generation conflicts have no operation-error category;
+    # retain unknown rather than imply physical failure or expose raw text.
     return code if isinstance(code, str) and code in _STATION_CALL_ERRORS else "unknown"
 
 

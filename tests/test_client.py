@@ -230,6 +230,46 @@ class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
                 await coordinator.async_hangup()
             self.assertEqual(expected, coordinator.call_error)
 
+    async def test_actual_c_admission_errors_keep_stable_coordinator_categories(self):
+        from custom_components.doorfast.monitor import MonitorCoordinator
+
+        cases = (("capacity_busy", "busy"), ("station_not_found", "station_unavailable"),
+                 ("station_disabled", "station_unavailable"), ("route_unavailable", "station_unavailable"),
+                 ("encoder_failed", "media_failed"), ("runtime_mismatch", "unknown"),
+                 ("operation_mismatch", "unknown"), ("generation_mismatch", "unknown"),
+                 ("unclassified_secret", "unknown"))
+        stable = ("none", "busy", "station_unavailable", "ack_timeout", "dispatch_failed", "dispatch_timeout",
+                  "media_failed", "preempted", "cancelled", "runtime_reset", "unknown")
+        for code, expected in (*cases, *((code, code) for code in stable)):
+            for action in ("call", "hangup"):
+                with self.subTest(wire_code=code, action=action):
+                    body = {"error": {"code": code, "message": "synthetic secret URL"}}
+                    if code == "capacity_busy":
+                        body["error"].update(configured_capacity=2, effective_capacity=2, active_encoders=2)
+
+                    class Response:
+                        status = 409
+                        async def __aenter__(self): return self
+                        async def __aexit__(self, *args): return False
+                        async def json(self, **kwargs): return body
+
+                    requests = []
+                    def request(method, url, **kwargs):
+                        requests.append((method, url, kwargs["json"]))
+                        return Response()
+
+                    client = DoorfastClient(None, "http://synthetic.invalid")
+                    client.status = {"runtime_id": "0123456789abcdef"}
+                    client.session = types.SimpleNamespace(request=request)
+                    coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+                    with self.assertRaises(RuntimeError) as raised:
+                        await (coordinator.async_call() if action == "call" else coordinator.async_hangup())
+                    self.assertEqual(expected, coordinator.call_error)
+                    self.assertEqual(expected, raised.exception.code)
+                    self.assertNotIn("secret", str(raised.exception))
+                    self.assertEqual([("POST", f"http://synthetic.invalid/api/v1/{action}",
+                        {"runtime_id": "0123456789abcdef", "station_id": "gate_main"})], requests)
+
     async def test_old_operation_snapshot_cannot_replace_newer_shared_status(self):
         client = DoorfastClient(None, "http://synthetic.invalid")
         operation = {"operation_id": 4, "station_id": "gate_main", "stage": "calling",

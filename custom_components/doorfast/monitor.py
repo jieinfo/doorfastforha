@@ -217,7 +217,23 @@ class MonitorCoordinator:
                 conditions["operation_id"] = self._operation["operation_id"]
                 if self._operation["media_generation"]:
                     conditions["generation"] = self._operation["media_generation"]
-            control_generation = self._native_generation
+            # Audio consumers refresh the shared snapshot independently of this
+            # coordinator. Resolve their validated native owner before awaiting
+            # the request; a later incoming owner must survive the exact release.
+            status = getattr(self._client, "status", {})
+            native = status.get("call")
+            native = native if isinstance(native, dict) else {}
+            operation = station_call_operation(status)
+            control_generation = 0
+            if (status.get("runtime_id") == self.runtime_id
+                    and station_call_phase(status, self.station_id) == "in_call"
+                    and ("operation_id" not in conditions or (
+                        operation is not None
+                        and operation["station_id"] == self.station_id
+                        and operation["operation_id"] == conditions["operation_id"]
+                        and operation["media_generation"] == conditions.get("generation")
+                        and operation["call_generation"] == native.get("generation")))):
+                control_generation = native["generation"]
             try:
                 if not self._call_request_current(epoch):
                     raise RuntimeError("station runtime changed")

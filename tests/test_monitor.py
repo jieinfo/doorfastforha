@@ -129,6 +129,16 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         await coordinator.async_hangup()
         self.assertEqual({}, client.hangup_station.await_args.kwargs)
 
+    async def test_native_incoming_preview_and_ringing_publish_button_call_states(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        for stage in ("preview", "ringing"):
+            client.status = {"runtime_id": "0123456789abcdef",
+                "call": {"session": stage, "station_id": "gate_main", "generation": 42}}
+            await coordinator.async_apply_call_status(client.status)
+            self.assertEqual(stage, coordinator.snapshot["call_state"])
+            self.assertEqual(42, coordinator.snapshot["call_generation"])
+
     async def test_real_poll_applies_global_call_even_when_media_revision_unchanged(self):
         from custom_components.doorfast.setup_lifecycle import sync_monitor_state
         client = self.call_client()
@@ -164,7 +174,8 @@ class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
         release = AsyncMock()
         coordinator.set_call_audio_release(release)
         await coordinator.async_call()
-        await coordinator.async_apply_call_status(self.operation_status("talking"))
+        client.status = self.operation_status("talking")
+        await coordinator.async_apply_call_status(client.status)
         client.hangup_station.side_effect = ValueError("operation mismatch")
         with self.assertRaises(ValueError):
             await coordinator.async_hangup()

@@ -27,6 +27,8 @@
             "name": "Call stage",
             "state": {
               "idle": "Idle",
+              "preview": "Previewing",
+              "ringing": "Ringing",
               "preparing": "Preparing preview",
               "calling": "Calling",
               "talking": "In call",
@@ -69,6 +71,8 @@
             "name": "Call stage",
             "state": {
               "idle": "Idle",
+              "preview": "Previewing",
+              "ringing": "Ringing",
               "preparing": "Preparing preview",
               "calling": "Calling",
               "talking": "In call",

@@ -20,7 +20,7 @@ class CallLabelsTest(unittest.TestCase):
 
     def test_buttons_translate_coordinator_call_states_errors_and_timers(self):
         component = Path(__file__).parents[1] / "custom_components" / "doorfast"
-        states = {"idle", "preparing", "calling", "talking", "ending", "ended", "failed"}
+        states = {"idle", "preview", "ringing", "preparing", "calling", "talking", "ending", "ended", "failed"}
         errors = {"none", "busy", "station_unavailable", "ack_timeout", "dispatch_failed",
                   "dispatch_timeout", "media_failed", "preempted", "cancelled", "runtime_reset", "unknown"}
         for language in ("en", "zh-Hans"):
@@ -31,6 +31,8 @@ class CallLabelsTest(unittest.TestCase):
                 with self.subTest(language=language, button=key):
                     attrs = translations["entity"]["button"][key].get("state_attributes", {})
                     self.assertEqual(states, set(attrs.get("call_state", {}).get("state", {})))
+                    self.assertTrue(all(isinstance(label, str) and label.strip()
+                                        for label in attrs["call_state"]["state"].values()))
                     self.assertEqual(errors, set(attrs.get("call_error", {}).get("state", {})))
                     self.assertEqual({"none", "startup", "confirmation", "session"},
                                      set(attrs.get("call_timer", {}).get("state", {})))

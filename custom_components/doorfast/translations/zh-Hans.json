@@ -27,6 +27,8 @@
             "name": "呼叫阶段",
             "state": {
               "idle": "空闲",
+              "preview": "预览中",
+              "ringing": "响铃中",
               "preparing": "正在准备预览",
               "calling": "呼叫中",
               "talking": "通话中",
@@ -69,6 +71,8 @@
             "name": "呼叫阶段",
             "state": {
               "idle": "空闲",
+              "preview": "预览中",
+              "ringing": "响铃中",
               "preparing": "正在准备预览",
               "calling": "呼叫中",
               "talking": "通话中",

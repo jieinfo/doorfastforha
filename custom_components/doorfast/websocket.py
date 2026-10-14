@@ -79,6 +79,9 @@ class _PendingStart:
     station_id: str | None = None
     identity: AudioIdentity | None = None
     producer: PcmProducer | None = None
+    request_runtime_id: str | None = None
+    request_generation: int | None = None
+    revoked_identity: AudioIdentity | None = None
 
 
 class PcmWebSocketManager:
@@ -187,18 +190,21 @@ class PcmWebSocketManager:
     def _attach_pending(self, entry_id: str, connection: Any,
                         callback: Callable[[], None], listener_id: str | None = None,
                         *, station_id: str | None = None, identity: AudioIdentity | None = None,
-                        producer: PcmProducer | None = None) -> Callable[[], None]:
+                        producer: PcmProducer | None = None, request_runtime_id: str | None = None,
+                        request_generation: int | None = None) -> tuple[Callable[[], None], _PendingStart]:
         key = secrets.token_urlsafe(24)
         def revoke() -> None:
             self._pending_cleanups.pop(key, None)
             cleanup()
             callback()
         cleanup = self._attach_cleanup(connection, key, revoke)
-        self._pending_cleanups[key] = _PendingStart(entry_id, listener_id, revoke, station_id, identity, producer)
+        pending = _PendingStart(entry_id, listener_id, revoke, station_id, identity, producer,
+                                request_runtime_id, request_generation)
+        self._pending_cleanups[key] = pending
         def detach() -> None:
             self._pending_cleanups.pop(key, None)
             cleanup()
-        return detach
+        return detach, pending
 
     def _revoke_pending(self, entry_id: str, listener_id: str | None = None) -> None:
         for pending in list(self._pending_cleanups.values()):
@@ -330,7 +336,7 @@ class PcmWebSocketManager:
                 ):
                     self._listener_reservations.pop(reservation_key, None)
 
-            cleanup = self._attach_pending(entry_id, connection, cancel_pending,
+            cleanup, _ = self._attach_pending(entry_id, connection, cancel_pending,
                 station_id=station_id, identity=self._listener_identity(client.status, station_id))
             status = await client.refresh()
             if (not pending[0] or self._epochs.get(entry_id, 0) != epoch
@@ -493,13 +499,30 @@ class PcmWebSocketManager:
                 except TypeError:
                     # Legacy factories remain supported only for unbound PTT.
                     producer = self.producer_factory(client)
-            cleanup = self._attach_pending(entry_id, connection, cancel_start,
-                listener.listener_id if listener else None, producer=producer)
+            # Reserve the requested owner before the producer's first status
+            # await. This is a cancellation key, never an admission substitute:
+            # the producer still validates fresh native/operation/media facts.
+            status = getattr(client, "status", {})
+            runtime_id = status.get("runtime_id")
+            if (not isinstance(runtime_id, str) or len(runtime_id) != 16
+                    or any(character not in "0123456789abcdef" for character in runtime_id)):
+                runtime_id = None
+            candidate = listener.identity if listener is not None else (
+                AudioIdentity(runtime_id, station_id, generation)
+                if runtime_id is not None and station_id is not None and generation is not None else None)
+            cleanup, pending = self._attach_pending(entry_id, connection, cancel_start,
+                listener.listener_id if listener else None, station_id=station_id,
+                identity=candidate, producer=producer, request_runtime_id=runtime_id,
+                request_generation=generation)
             try:
                 await producer.start()
+                owner = getattr(producer, "call_identity", None)
+                revoked = pending.revoked_identity
                 if (self._starting.get(entry_id) is not reservation or
                     self.hass.data.get(DOMAIN, {}).get(entry_id) is not client or
                     self._admission.get(entry_id) is not True or
+                    (revoked is not None and (owner is None or
+                        owner == (revoked.runtime_id, revoked.station_id, revoked.generation))) or
                     not self._operation_allows_audio(getattr(client, "status", None)) or
                     (listener is not None and (self._listeners.get(listener.listener_id) is not listener
                         or listener.hub.closed or listener.connection is not connection))):
@@ -642,8 +665,24 @@ class PcmWebSocketManager:
             if pending.entry_id != entry_id:
                 continue
             owner = getattr(pending.producer, "call_identity", None)
-            if pending.identity == identity or owner == (runtime_id, station_id, generation):
+            # Once fresh admission chooses an owner it supersedes the request
+            # candidate, which may describe an older incoming runtime.
+            if owner is not None:
+                if owner == (runtime_id, station_id, generation):
+                    pending.revoke()
+            elif pending.identity == identity:
                 pending.revoke()
+            elif (pending.producer is not None
+                    and pending.request_runtime_id in (None, runtime_id)
+                    and pending.station_id in (None, station_id)
+                    and pending.request_generation in (None, generation)):
+                # An unbound first refresh can learn this owner after release.
+                # Keep one exact marker per pending request, never a global set.
+                # Two distinct relevant releases make only this request ambiguous.
+                if pending.revoked_identity not in (None, identity):
+                    pending.revoke()
+                else:
+                    pending.revoked_identity = identity
         hub = self._hubs.get(entry_id)
         if hub is not None and hub.identity == identity:
             producers.extend(self._invalidate_hub(entry_id, hub))

@@ -139,6 +139,15 @@ MODULE = load_module()
 class AudioEntryLifecycleTest(unittest.IsolatedAsyncioTestCase):
     """Execute actual entry functions; substitute only HA and HTTP boundaries."""
 
+    async def test_audio_fixture_keeps_one_module_and_exception_identity(self):
+        import importlib
+
+        qualified = importlib.import_module("tests.test_audio_contract")
+        natural = importlib.import_module("test_audio_contract")
+        self.assertIs(qualified, natural)
+        self.assertIs(qualified.AudioStreamError,
+                      sys.modules[f"{qualified.PACKAGE}.client_types"].AudioStreamError)
+
     async def asyncSetUp(self):
         import test_audio_contract as audio
         self.audio = audio
