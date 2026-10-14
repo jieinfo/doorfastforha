@@ -333,6 +333,108 @@ class AudioContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], self.http.producer_requests)
         self.assert_released()
 
+    async def test_operation_conflict_during_real_open_cannot_publish_microphone(self):
+        for conflict in ("malformed", "control", "media"):
+            for reconcile in (False, True):
+                with self.subTest(conflict=conflict, reconcile=reconcile):
+                    initial = outbound_status()
+                    self.http.current_status = initial
+                    self.client.status = initial
+                    entered, resume = asyncio.Event(), asyncio.Event()
+                    request = self.http.request
+
+                    class GatedOpen(Response):
+                        async def __aenter__(response):
+                            entered.set()
+                            await resume.wait()
+                            return response
+
+                    def gated_request(method, url, **kwargs):
+                        response = request(method, url, **kwargs)
+                        if url.endswith("/audio/session"):
+                            return GatedOpen(payload=response.payload)
+                        return response
+
+                    self.http.request = gated_request
+                    connection = Connection()
+                    opening = asyncio.create_task(self.manager.start(connection, {
+                        "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7}))
+                    try:
+                        await entered.wait()
+                        sample = outbound_status()
+                        if conflict == "malformed":
+                            sample["station_call"] = {}
+                        else:
+                            sample["station_call"]["call_generation" if conflict == "control" else "media_generation"] += 1
+                        self.http.current_status = sample
+                        self.client.status = sample
+                        if reconcile:
+                            await self.manager.reconcile("one", sample)
+                            self.assertEqual({}, self.manager._starting)
+                            self.assertEqual({}, self.manager._pending_cleanups)
+                            # A revoked start cannot revive if another poll
+                            # restores admission before the old open completes.
+                            self.client.status = initial
+                            self.http.current_status = initial
+                        resume.set()
+                        await opening
+                        self.assertEqual([], connection.results)
+                        self.assertTrue(connection.errors)
+                        self.assert_released()
+                        self.assertEqual(["session", "end"], [
+                            url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                    finally:
+                        resume.set()
+                        await opening
+                        self.http.request = request
+                        await self.manager.release_entry("one")
+                        self.http.producer_requests.clear()
+
+    async def test_direct_microphone_reconcile_revokes_observed_operation_conflict(self):
+        for conflict in ("malformed", "control", "media"):
+            with self.subTest(conflict=conflict):
+                initial = outbound_status()
+                self.http.current_status = initial
+                self.client.status = initial
+                connection = Connection()
+                await self.manager.start(connection, {
+                    "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7})
+                self.assertEqual("active", connection.results[-1]["state"])
+                capture = self.manager._by_entry["one"]
+                sample = outbound_status()
+                if conflict == "malformed":
+                    sample["station_call"] = {}
+                else:
+                    sample["station_call"]["call_generation" if conflict == "control" else "media_generation"] += 1
+                try:
+                    self.client.status = sample
+                    await self.manager.reconcile("one", sample)
+                    self.assert_released()
+                    self.assertEqual("idle", capture.producer.state.value)
+                    self.assertEqual(["session", "end"], [
+                        url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                finally:
+                    await self.manager.release_entry("one")
+                    self.http.producer_requests.clear()
+
+    def test_audio_identity_keeps_control_and_media_namespaces_distinct(self):
+        identity_type = sys.modules[f"{PACKAGE}.client_types"].AudioIdentity
+        self.assertEqual(identity_type(RUNTIME, "gate_main", 7),
+                         identity_type.from_status(outbound_status(), "gate_main", 7))
+        for field, value in (("call_generation", 9), ("media_generation", 7),
+                             ("operation_id", False), ("stage", "queued")):
+            sample = outbound_status()
+            sample["station_call"][field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(AudioStreamError, "audio_identity_mismatch"):
+                    identity_type.from_status(sample, "gate_main", 7)
+        incoming = outbound_status()
+        incoming["station_call"].update(stage="ended", call_generation=6,
+            media_generation=8, timer="none", remaining_ms=0)
+        incoming.pop("media")
+        self.assertEqual(identity_type(RUNTIME, "gate_main", 7),
+                         identity_type.from_status(incoming, "gate_main", 7))
+
     async def test_http_stream_resync_and_reused_generation_release_the_whole_chain(self):
         """Ignoring a terminal identity failure would retain old hub/producer ownership."""
         manager = self.manager
