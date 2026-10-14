@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from .session_diagnostics import station_diagnostics
+from .session_diagnostics import (
+    station_call_diagnostics, station_call_phase, station_diagnostics,
+)
 
 
 PREVIEW_PHASES = (
     "idle", "requesting", "awaiting_video", "live", "reconnecting",
-    "in_call", "stopping", "preempted", "failed",
+    "calling", "in_call", "stopping", "preempted", "failed",
 )
 
 
@@ -19,8 +21,11 @@ def preview_attributes(status: dict[str, Any], station_id: str) -> dict[str, Any
     A missing source_live flag from an older bridge is unknown, not live.
     No fallback to the first/default station or exposure of arbitrary fields.
     """
+    call_phase = station_call_phase(status, station_id)
     attributes: dict[str, Any] = {
-        "phase": None, "source_live": None, **station_diagnostics(status, station_id),
+        "phase": call_phase, "source_live": None,
+        **station_diagnostics(status, station_id),
+        **station_call_diagnostics(status, station_id),
     }
     media = status.get("media")
     if not isinstance(media, dict) or media.get("available") is False:
@@ -32,13 +37,14 @@ def preview_attributes(status: dict[str, Any], station_id: str) -> dict[str, Any
         return attributes
     matches = [item for item in sessions if item.get("station_id") == station_id]
     if not matches:
-        attributes["phase"] = "idle"
+        if call_phase is None:
+            attributes["phase"] = "idle"
         # Capacity preemption replaces the victim's slot with the call, so
         # there is no retained victim session to inspect. The marker itself
         # is historical: only an active call makes it a current preemption.
         generation = media.get("preempted_generation")
         if (
-            media.get("preempted_station_id") == station_id
+            call_phase is None and media.get("preempted_station_id") == station_id
             and type(generation) is int and 0 < generation < (1 << 64)
             and any(item.get("purpose") == "call" and item.get("state") in (
                 "requesting", "awaiting_video", "publishing", "viewing",
@@ -55,16 +61,19 @@ def preview_attributes(status: dict[str, Any], station_id: str) -> dict[str, Any
     if isinstance(live, bool):
         attributes["source_live"] = live
     if state in ("idle", "stopping", "preempted", "failed"):
-        attributes.update(phase=state, source_live=False)
-    elif session.get("purpose") == "call":
-        attributes["phase"] = "in_call"
-    elif state in ("requesting", "queued", "awaiting_video"):
-        attributes["phase"] = "requesting" if state == "queued" else state
-    elif state in ("publishing", "viewing") and session.get("ready") is True:
-        if live is True:
-            attributes["phase"] = "live"
-        elif live is False:
-            attributes["phase"] = "reconnecting"
+        attributes["source_live"] = False
+    if call_phase is None:
+        if state in ("idle", "stopping", "preempted", "failed"):
+            attributes["phase"] = state
+        elif session.get("purpose") == "call":
+            attributes["phase"] = "requesting"
+        elif state in ("requesting", "queued", "awaiting_video"):
+            attributes["phase"] = "requesting" if state == "queued" else state
+        elif state in ("publishing", "viewing") and session.get("ready") is True:
+            if live is True:
+                attributes["phase"] = "live"
+            elif live is False:
+                attributes["phase"] = "reconnecting"
     for field in (
         "generation", "started_ms", "confirmed_ms", "first_frame_ms",
         "publication_ms", "control_requests", "busy_replies", "queue_drops",

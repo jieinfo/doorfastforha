@@ -23,6 +23,14 @@ _MEDIA_FAULTS = (_CALL_FAULTS - {"heartbeat_timeout"}) | {
     "first_frame_timeout", "source_stalled", "encoder_failed", "publisher_failed",
     "capacity_busy",
 }
+_STATION_CALL_STAGES = frozenset({
+    "idle", "preparing", "calling", "talking", "ending", "ended", "failed",
+})
+_STATION_CALL_TIMERS = _CALL_TIMERS | {"startup"}
+_STATION_CALL_ERRORS = frozenset({
+    "none", "busy", "station_unavailable", "ack_timeout", "dispatch_failed",
+    "dispatch_timeout", "media_failed", "preempted", "cancelled", "runtime_reset", "unknown",
+})
 
 
 def _enum(value: Any, allowed: frozenset[str]) -> str:
@@ -38,6 +46,101 @@ def _station_id(value: Any) -> str | None:
         return require_station_id(value)
     except ValueError:
         return None
+
+
+def station_call_operation(status: Any) -> dict[str, Any] | None:
+    """Validate the bounded outbound record against its sampled top-level runtime.
+
+    Extra wire fields are discarded. A malformed present object is not the same
+    as an older bridge which does not publish operations at all.
+    """
+    if not isinstance(status, dict):
+        return None
+    record = status.get("station_call")
+    runtime_id = status.get("runtime_id")
+    if (not isinstance(record, dict) or not isinstance(runtime_id, str)
+            or len(runtime_id) != 16
+            or any(character not in "0123456789abcdef" for character in runtime_id)):
+        return None
+    stage = record.get("stage")
+    timer = record.get("timer")
+    error = record.get("error")
+    if (not isinstance(stage, str) or stage not in _STATION_CALL_STAGES
+            or not isinstance(timer, str) or timer not in _STATION_CALL_TIMERS
+            or not isinstance(error, str) or error not in _STATION_CALL_ERRORS):
+        return None
+    numbers = {field: _uint64(record.get(field)) for field in (
+        "operation_id", "media_generation", "call_generation", "remaining_ms",
+    )}
+    if any(value is None for value in numbers.values()):
+        return None
+    station_id = _station_id(record.get("station_id"))
+    if stage == "idle":
+        if (record.get("station_id") != "" or any(numbers.values())
+                or timer != "none" or error != "none"):
+            return None
+    elif station_id is None or numbers["operation_id"] == 0:
+        return None
+    if stage in ("ended", "failed") and (timer != "none" or numbers["remaining_ms"] != 0):
+        return None
+    return {"runtime_id": runtime_id, "station_id": station_id, "stage": stage,
+            "timer": timer, "error": error, **numbers}
+
+
+def station_call_diagnostics(status: Any, station_id: Any) -> dict[str, Any]:
+    """Keep outbound identities and safe codes scoped to the target station."""
+    result = {f"station_call_{field}": None for field in (
+        "runtime_id", "operation_id", "station_id", "stage", "media_generation",
+        "call_generation", "timer", "remaining_ms", "error",
+    )}
+    operation = station_call_operation(status)
+    if (_station_id(station_id) is not None and operation is not None
+            and operation["station_id"] == station_id):
+        result.update({f"station_call_{field}": value for field, value in operation.items()})
+    return result
+
+
+def station_call_phase(status: Any, station_id: Any) -> str | None:
+    """Admit TALKING only through the native owner and exact outbound mapping.
+
+    Native control generation and public media generation are separate
+    namespaces. Terminal operation history cannot claim a newer incoming owner.
+    """
+    if not isinstance(status, dict) or _station_id(station_id) is None:
+        return None
+    operation = station_call_operation(status)
+    if "station_call" in status and operation is None:
+        return None
+    active = operation is not None and operation["stage"] in (
+        "preparing", "calling", "talking", "ending",
+    )
+    if active:
+        if operation["station_id"] != station_id:
+            return None
+        if operation["stage"] in ("preparing", "calling"):
+            return "calling"
+        if operation["stage"] == "ending":
+            return "stopping"
+    call = status.get("call")
+    if (not isinstance(call, dict) or call.get("session") != "talking"
+            or call.get("station_id") != station_id or station_id == "unknown"
+            or _uint64(call.get("generation"), 1) is None):
+        return None
+    media = status.get("media")
+    if not isinstance(media, dict) or media.get("available") is False:
+        return None
+    session = _matching_record(media.get("sessions"), station_id)
+    if session is None or session.get("state") not in (
+        "requesting", "queued", "awaiting_video", "publishing", "viewing",
+    ):
+        return None
+    if active and (
+        operation["call_generation"] != call["generation"]
+        or operation["media_generation"] != session["generation"]
+        or session.get("purpose") != "call"
+    ):
+        return None
+    return "in_call"
 
 
 def _fields(record: dict[str, Any], prefix: str, timers: frozenset[str],

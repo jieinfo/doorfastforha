@@ -33,7 +33,7 @@
       }},
       "preview_status": {"name": "Preview status", "state": {
         "idle": "Idle", "requesting": "Requesting preview", "awaiting_video": "Waiting for first frame",
-        "live": "Live video", "reconnecting": "Reconnecting (last frame retained)", "in_call": "In call",
+        "live": "Live video", "reconnecting": "Reconnecting (last frame retained)", "calling": "Calling", "in_call": "In call",
         "stopping": "Stopping", "preempted": "Preempted by a call", "failed": "Preview failed"
       }, "state_attributes": {
         "monitor_timer": {"name": "Preview timer", "state": {
