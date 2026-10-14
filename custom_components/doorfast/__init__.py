@@ -126,6 +126,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     frontend_registration_attempted = False
 
     async def sync_current_monitor(*, include_event: bool = False) -> None:
+        for station_id in station_registry.station_ids:
+            coordinator = station_registry.monitor(station_id)
+            async def release_audio(runtime_id, target_station, generation):
+                await pcm_ws.release_call(entry.entry_id, runtime_id, target_station, generation)
+            coordinator.set_call_audio_release(release_audio)
         await sync_monitor_state(
             client,
             station_registry,
@@ -192,8 +197,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         registry = _service_resource(hass, STATIONS_KEY, call)
         if station_id not in registry.station_ids:
             raise HomeAssistantError("unknown Doorfast station")
-        await service_client(hass, call).call_station(
-            station_id,
+        await registry.monitor(station_id).async_call(
             call.data.get("primary_media_port", DEFAULT_VIDEO_PORT),
             call.data.get("secondary_media_port", DEFAULT_AUDIO_PORT),
             call.data.get("duration_seconds", DEFAULT_CALL_DURATION),
@@ -206,8 +210,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         registry = _service_resource(hass, STATIONS_KEY, call)
         if station_id not in registry.station_ids:
             raise HomeAssistantError("unknown Doorfast station")
-        await service_client(hass, call).hangup_station(
-            station_id, call.data.get("reason", "ha")
+        await registry.monitor(station_id).async_hangup(
+            call.data.get("reason", "ha")
         )
 
     async def start_monitor(call):

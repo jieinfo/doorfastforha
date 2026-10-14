@@ -6,7 +6,9 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
-from .const import MONITOR_READY_TIMEOUT
+from .const import MONITOR_READY_TIMEOUT, DEFAULT_VIDEO_PORT, DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION
+from .session_diagnostics import station_call_operation, station_call_phase, _uint64
+from .station_control import validate_reply, validate_call_parameters, stable_error
 
 
 _READY_STATES = frozenset(("publishing", "viewing"))
@@ -64,6 +66,12 @@ class MonitorCoordinator:
         self._state = "idle"
         self._call_state = "idle"
         self._call_error: str | None = None
+        self._call_lock = asyncio.Lock()
+        self._operation: dict[str, Any] | None = None
+        self._accepted_call: dict[str, Any] | None = None
+        self._native_generation = 0
+        self._call_request_epoch = 0
+        self._release_call_audio = None
         self._ready = False
         self._publisher_running: bool | None = None
         self._next_lease_id = 0
@@ -99,6 +107,26 @@ class MonitorCoordinator:
         return self._call_error
 
     @property
+    def call_request_epoch(self) -> int:
+        return self._call_request_epoch
+
+    def set_call_audio_release(self, callback) -> None:
+        """Share the station hangup release path with services and buttons."""
+        self._release_call_audio = callback
+
+    def _begin_call_request(self) -> int:
+        self._call_request_epoch += 1
+        epochs = getattr(self._client, "_station_control_epochs", None)
+        if epochs is None:
+            epochs = self._client._station_control_epochs = {}
+        epochs[self.station_id] = self._call_request_epoch
+        return self._call_request_epoch
+
+    def _call_request_current(self, epoch: int) -> bool:
+        return (not self._unloaded and epoch == self._call_request_epoch
+                and getattr(self._client, "status", {}).get("runtime_id", self.runtime_id) == self.runtime_id)
+
+    @property
     def ready(self) -> bool:
         return self._ready
 
@@ -128,34 +156,135 @@ class MonitorCoordinator:
             "status_revision": self._status_revision,
             "call_state": self._call_state,
             "call_error": self._call_error,
+            "operation_id": self._operation["operation_id"] if self._operation else 0,
+            "media_generation": self._operation["media_generation"] if self._operation else 0,
+            "call_generation": self._operation["call_generation"] if self._operation else self._native_generation,
+            "call_timer": self._operation["timer"] if self._operation else "none",
+            "call_remaining_ms": self._operation["remaining_ms"] if self._operation else 0,
         }
 
-    async def async_call(self) -> dict[str, Any]:
-        self._call_state, self._call_error = "calling", None
-        self._notify()
-        try:
-            response = await self._client.call_station(self.station_id)
-            if not isinstance(response, dict):
-                raise ValueError("Doorfast station call returned a non-object")
-            state = response.get("state", response.get("session", "calling"))
-            self._call_state = state if isinstance(state, str) else "calling"
+    async def async_call(self, primary_media_port=DEFAULT_VIDEO_PORT,
+                         secondary_media_port=DEFAULT_AUDIO_PORT,
+                         duration_seconds=DEFAULT_CALL_DURATION) -> dict[str, Any]:
+        validate_call_parameters(primary_media_port, secondary_media_port, duration_seconds)
+        async with self._call_lock:
+            if self._call_state in {"preparing", "calling", "talking"} and self._accepted_call is not None:
+                return dict(self._accepted_call)
+            epoch = self._begin_call_request()
+            self._operation = None
+            self._native_generation = 0
+            self._accepted_call = None
+            self._call_state, self._call_error = "calling", None
             self._notify()
-            return response
-        except Exception as error:
-            self._call_state, self._call_error = "failed", str(error)
-            self._notify()
-            raise
+            try:
+                if not self._call_request_current(epoch):
+                    raise RuntimeError("station runtime changed")
+                response = validate_reply(await self._client.call_station(
+                    self.station_id, primary_media_port, secondary_media_port, duration_seconds
+                ), self.runtime_id, self.station_id)
+                if not self._call_request_current(epoch):
+                    raise RuntimeError("station request expired")
+                self._accepted_call = response
+                operation_id = response.get("operation_id", 0)
+                self._operation = ({"runtime_id": self.runtime_id, "station_id": self.station_id,
+                    "operation_id": operation_id, "media_generation": response["generation"],
+                    "call_generation": 0, "stage": "preparing", "timer": "none",
+                    "remaining_ms": 0, "error": "none"} if operation_id else None)
+                # HTTP acceptance never proves that the physical call connected.
+                self._call_state = "calling"
+                self._notify()
+                return response
+            except Exception as error:
+                if self._call_request_current(epoch):
+                    self._call_state, self._call_error = "failed", stable_error(error)
+                    self._notify()
+                raise
 
-    async def async_hangup(self) -> dict[str, Any]:
-        try:
-            response = await self._client.hangup_station(self.station_id)
-            self._call_state, self._call_error = "idle", None
-            self._notify()
-            return response
-        except Exception as error:
-            self._call_state, self._call_error = "failed", str(error)
-            self._notify()
-            raise
+    async def async_hangup(self, reason="ha") -> dict[str, Any]:
+        if not isinstance(reason, str) or not reason:
+            raise ValueError("reason must be non-empty text")
+        async with self._call_lock:
+            epoch = self._begin_call_request()
+            conditions = {}
+            if self._operation is not None and (
+                self._call_state in {"ended", "failed"} or not self._native_generation
+                or self._operation["call_generation"] == self._native_generation
+            ):
+                conditions["operation_id"] = self._operation["operation_id"]
+                if self._operation["media_generation"]:
+                    conditions["generation"] = self._operation["media_generation"]
+            control_generation = self._native_generation
+            try:
+                if not self._call_request_current(epoch):
+                    raise RuntimeError("station runtime changed")
+                response = validate_reply(await self._client.hangup_station(
+                    self.station_id, **conditions
+                ), self.runtime_id, self.station_id)
+                if not self._call_request_current(epoch):
+                    raise RuntimeError("station request expired")
+                if control_generation and self._release_call_audio is not None:
+                    await self._release_call_audio(self.runtime_id, self.station_id, control_generation)
+                self._call_state = "ending" if response.get("queued") is True else response.get("state", "idle")
+                self._call_error = None
+                if self._operation is not None and "operation_id" in conditions:
+                    self._operation = {**self._operation, "stage": self._call_state}
+                self._notify()
+                return response
+            except Exception as error:
+                if self._call_request_current(epoch):
+                    self._call_error = stable_error(error)
+                    self._notify()
+                raise
+
+    async def async_apply_call_status(self, status: dict[str, Any], *, request_epoch=None) -> None:
+        """Consume global control facts separately from media revision changes."""
+        if (self._unloaded or self._call_lock.locked() or status.get("runtime_id") != self.runtime_id
+                or (request_epoch is not None and request_epoch != self._call_request_epoch)):
+            return
+        if getattr(self._client, "status", {}).get("runtime_id", self.runtime_id) != self.runtime_id:
+            return
+        operation = station_call_operation(status)
+        if "station_call" in status and operation is None:
+            return
+        current = self._operation
+        if current is not None and operation is not None and operation["operation_id"] < current["operation_id"]:
+            return
+        phase = station_call_phase(status, self.station_id)
+        native = status.get("call")
+        native = native if isinstance(native, dict) else {}
+        native_generation = _uint64(native.get("generation"), 1)
+        matching_native = (native.get("station_id") == self.station_id and native_generation is not None
+                           and native.get("session") in {"preview", "ringing", "talking", "ending"})
+        target = operation if operation is not None and operation["station_id"] == self.station_id else None
+        if target is not None:
+            order = {"preparing": 0, "calling": 1, "talking": 2, "ending": 3, "ended": 4, "failed": 4}
+            if (current is not None and target["operation_id"] == current["operation_id"]
+                    and order.get(target["stage"], 0) < order.get(current["stage"], 0)):
+                return
+            self._operation = target
+            self._call_error = None if target["error"] == "none" else target["error"]
+            self._call_state = target["stage"]
+            if target["stage"] == "talking" and phase != "in_call":
+                self._call_state = "calling"
+        elif current is None or operation is not None:
+            self._call_state = "idle"
+        if phase == "in_call":
+            self._call_state = "talking"
+            self._native_generation = native_generation
+        elif matching_native and (target is None or target["stage"] in {"ended", "failed"}):
+            self._call_state = native["session"]
+            self._native_generation = native_generation
+        elif matching_native and target is not None and target["call_generation"] == native_generation:
+            self._native_generation = native_generation
+        else:
+            self._native_generation = 0
+        if self._call_state not in {"preparing", "calling", "talking"}:
+            self._accepted_call = None
+        elif target is not None:
+            self._accepted_call = {"runtime_id": self.runtime_id, "station_id": self.station_id,
+                "operation_id": target["operation_id"], "generation": target["media_generation"],
+                "state": target["stage"], "queued": False}
+        self._notify()
 
     @staticmethod
     def _response_generation(response: dict[str, Any]) -> int:
@@ -863,6 +992,11 @@ class MonitorCoordinator:
         self._publisher_running = None
         if unload:
             self._unloaded = True
+            self._call_request_epoch += 1
+            self._operation = None
+            self._accepted_call = None
+            self._native_generation = 0
+            self._call_state, self._call_error = "idle", None
         return generation
 
     def lease_owned(self, lease: MonitorLease) -> bool:
@@ -916,16 +1050,6 @@ class MonitorCoordinator:
             and generation not in (None, 0, current_generation)
         ):
             raise ValueError("monitor status generation does not match coordinator")
-        call = merged.get("call")
-        if isinstance(call, dict):
-            call_state = call.get("session", call.get("state"))
-            if isinstance(call_state, str): self._call_state = call_state
-            call_error = call.get("error")
-            self._call_error = call_error if isinstance(call_error, str) else None
-        elif isinstance(merged.get("call_state"), str):
-            self._call_state = merged["call_state"]
-            self._call_error = merged.get("call_error") if isinstance(merged.get("call_error"), str) else None
-        self._notify()
 
         terminal_event = event in {"monitor_preempted", "monitor_failed"}
         if state == "failed":

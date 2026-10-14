@@ -16,8 +16,16 @@ from .client_types import (
     require_station_id,
 )
 from .audio import decode_pcm_wav
+from .station_control import positive_condition, validate_call_parameters, validate_reply, stable_error
+from .session_diagnostics import station_call_operation
 
 _UINT64_MAX = (1 << 64) - 1
+
+
+class DoorfastTransportError(RuntimeError):
+    def __init__(self, code: str | None = None):
+        super().__init__(code or "Doorfast request failed")
+        self.code = code
 
 class DoorfastClient:
     """Client for the Doorfast JSON bridge mapped to the local ubus API."""
@@ -33,8 +41,20 @@ class DoorfastClient:
         self._audio_revision: int | None = None
         self._audio_etag: str | None = None
         self._refresh_sequence = 0
+        self._station_control_epochs: dict[str, int] = {}
+        self._status_control_epochs: dict[str, int] = {}
     async def _request(self, method: str, path: str, payload: dict | None = None) -> dict[str, Any]:
         async with self.session.request(method, f"{self.base_url}{path}", json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
+            station_control = (method == "POST" and path in {"/api/v1/call", "/api/v1/hangup"}
+                               and isinstance(payload, dict) and "station_id" in payload)
+            if station_control and response.status >= 400:
+                try:
+                    data = await response.json(content_type=None)
+                    error = data.get("error") if isinstance(data, dict) else None
+                    code = error.get("code") if isinstance(error, dict) else None
+                except Exception:
+                    code = None
+                raise DoorfastTransportError(stable_error(DoorfastTransportError(code)))
             response.raise_for_status()
             data = await response.json(content_type=None)
             if not isinstance(data, dict): raise ValueError("Doorfast bridge returned a non-object response")
@@ -87,9 +107,21 @@ class DoorfastClient:
     async def refresh(self):
         self._refresh_sequence += 1
         refresh_sequence = self._refresh_sequence
+        control_epochs = dict(getattr(self, "_station_control_epochs", {}))
         status = await self._request("GET", "/api/v1/status")
         if refresh_sequence != self._refresh_sequence:
             return status
+        if (control_epochs != getattr(self, "_station_control_epochs", {})
+                and status.get("runtime_id") == self.status.get("runtime_id")):
+            # An observation begun before a newer station request cannot be
+            # the shared authority for sensors, audio or coordinators.
+            return self.status
+        old_operation = station_call_operation(self.status)
+        operation = station_call_operation(status)
+        if (old_operation is not None and operation is not None
+                and old_operation["runtime_id"] == operation["runtime_id"]
+                and operation["operation_id"] < old_operation["operation_id"]):
+            return self.status
         previous_runtime_id = self.status.get("runtime_id")
         runtime_changed = (
             isinstance(previous_runtime_id, str)
@@ -97,6 +129,7 @@ class DoorfastClient:
             and status.get("runtime_id") != previous_runtime_id
         )
         self.status = status
+        self._status_control_epochs = control_epochs
         self.online = True
         if runtime_changed or self._current_video_generation() != self._video_generation:
             self._clear_video_cache()
@@ -140,26 +173,28 @@ class DoorfastClient:
                            secondary_media_port=DEFAULT_AUDIO_PORT,
                            duration_seconds=DEFAULT_CALL_DURATION):
         station_id = require_station_id(station_id)
-        for value, name in ((primary_media_port, "primary_media_port"),
-                            (secondary_media_port, "secondary_media_port"),
-                            (duration_seconds, "duration_seconds")):
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
-        return await self._request("POST", "/api/v1/call", {
-            "runtime_id": self._control_runtime_id(), "station_id": station_id,
-            "primary_media_port": primary_media_port,
-            "secondary_media_port": secondary_media_port,
-            "duration_seconds": duration_seconds,
+        validate_call_parameters(primary_media_port, secondary_media_port, duration_seconds)
+        runtime_id = self._control_runtime_id()
+        response = await self._request("POST", "/api/v1/call", {
+            "runtime_id": runtime_id, "station_id": station_id,
         })
+        return validate_reply(response, runtime_id, station_id)
 
-    async def hangup_station(self, station_id: str, reason="ha"):
+    async def hangup_station(self, station_id: str, reason="ha", *, generation=None, operation_id=None):
         station_id = require_station_id(station_id)
         if not isinstance(reason, str) or not reason:
             raise ValueError("reason must be non-empty text")
-        return await self._request("POST", "/api/v1/hangup", {
-            "runtime_id": self._control_runtime_id(), "station_id": station_id,
-            "reason": reason,
-        })
+        runtime_id = self._control_runtime_id()
+        payload = {"runtime_id": runtime_id, "station_id": station_id}
+        for key, value in (("generation", generation), ("operation_id", operation_id)):
+            if value is not None:
+                payload[key] = positive_condition(value)
+        response = await self._request("POST", "/api/v1/hangup", payload)
+        response = validate_reply(response, runtime_id, station_id)
+        for key in ("operation_id", "generation"):
+            if key in payload and key in response and payload[key] != response[key]:
+                raise ValueError("station hangup reply condition mismatch")
+        return response
     async def call_elevator(self, direction="up"):
         if direction not in {"up", "down"}: raise ValueError("direction must be up or down")
         return await self._request("POST", "/api/v1/call_elevator", {"runtime_id": self._control_runtime_id(), "direction": direction})

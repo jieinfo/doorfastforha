@@ -146,6 +146,19 @@ class AudioWebsocketTest(unittest.IsolatedAsyncioTestCase):
             "pcm":base64.b64encode(b"\x01\x02").decode(),"discontinuity":False},self.connection.results[-1][1])
         self.assertFalse(self.client.opens)
 
+    async def test_station_release_requires_exact_runtime_station_and_control_generation(self):
+        lid = await self.listen()
+        await self.mic(lid)
+        for identity in ((RUNTIME, "gate_side", 7), (RUNTIME, "gate_main", 6),
+                         ("fedcba9876543210", "gate_main", 7)):
+            await self.manager.release_call("one", *identity)
+            self.assertIn(lid, self.manager._listeners)
+            self.assertIn("one", self.manager._by_entry)
+        await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+        self.assertNotIn(lid, self.manager._listeners)
+        self.assertNotIn("one", self.manager._by_entry)
+        self.assertEqual([(RUNTIME, 7)], self.client.ends)
+
     async def test_admin_and_entry_connection_ownership(self):
         other=SubConnection(False)
         await self.manager.listen_start(other,{"id":1,"config_entry_id":"one","station_id":"gate_main"})

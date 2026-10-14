@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import importlib.util
 import sys
 import types
@@ -114,6 +115,46 @@ class Hass:
 
 
 class StationButtonTest(unittest.IsolatedAsyncioTestCase):
+    async def test_service_and_button_share_duplicate_admission_and_hangup_ownership(self):
+        from tests.test_client import DoorfastClient
+        from custom_components.doorfast.monitor import MonitorCoordinator
+        from custom_components.doorfast.const import DEFAULT_VIDEO_PORT, DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION
+        from custom_components.doorfast.routing import select_client
+
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.status = {"runtime_id": "0123456789abcdef"}
+        requests = []
+        async def transport(method, path, payload):
+            requests.append((path, payload))
+            return {"runtime_id": "0123456789abcdef", "station_id": "gate_main",
+                    "operation_id": 3, "generation": 9, "queued": True,
+                    "state": "preparing" if path.endswith("call") else "ending"}
+        client._request = transport
+        monitor = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        registry = Registry(monitor)
+        hass = Hass(client, registry)
+        tree = ast.parse((COMPONENT / "__init__.py").read_text())
+        setup = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef)
+                     and node.name == "async_setup_entry")
+        functions = [node for node in setup.body if isinstance(node, ast.AsyncFunctionDef)
+                     and node.name in {"call_station", "hangup_station"}]
+        namespace = {"hass": hass, "STATIONS_KEY": "doorfast_stations", "HomeAssistantError": RuntimeError,
+                     "DEFAULT_VIDEO_PORT": DEFAULT_VIDEO_PORT, "DEFAULT_AUDIO_PORT": DEFAULT_AUDIO_PORT,
+                     "DEFAULT_CALL_DURATION": DEFAULT_CALL_DURATION,
+                     "_service_resource": lambda h, key, request: select_client(h.data[key], request.data.get("config_entry_id")),
+                     "service_client": lambda h, request: client}
+        exec(compile(ast.Module(body=functions, type_ignores=[]), str(COMPONENT / "__init__.py"), "exec"), namespace)
+        call = types.SimpleNamespace(data={"station_id": "gate_main", "config_entry_id": "entry-1"})
+        await namespace["call_station"](call)
+        call_button = button.StationCallButton(client, "entry-1", Station(), monitor)
+        await call_button.async_press()
+        self.assertEqual("calling", monitor.call_state)
+        self.assertEqual(1, len(requests))
+        await namespace["hangup_station"](call)
+        self.assertEqual("ending", monitor.call_state)
+        self.assertEqual(("/api/v1/hangup", {"runtime_id": "0123456789abcdef", "station_id": "gate_main",
+                                          "operation_id": 3, "generation": 9}), requests[-1])
+
     def test_station_entities_use_device_scoped_names(self):
         entity = button.StationCallButton(
             types.SimpleNamespace(online=True), "entry-1", Station(), Monitor()

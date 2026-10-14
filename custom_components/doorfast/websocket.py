@@ -617,6 +617,26 @@ class PcmWebSocketManager:
         """Release current ownership for hangup/reconcile without closing admission."""
         await self._stop_producers(self._invalidate_entry(entry_id))
 
+    async def release_call(self, entry_id: str, runtime_id: str,
+                           station_id: str, generation: int) -> None:
+        """Revoke only the exact native owner after accepted station hangup."""
+        identity = AudioIdentity(runtime_id, station_id, generation)
+        producers = []
+        for pending in tuple(self._pending_cleanups.values()):
+            if pending.entry_id != entry_id:
+                continue
+            owner = getattr(pending.producer, "call_identity", None)
+            if pending.identity == identity or owner == (runtime_id, station_id, generation):
+                pending.revoke()
+        hub = self._hubs.get(entry_id)
+        if hub is not None and hub.identity == identity:
+            producers.extend(self._invalidate_hub(entry_id, hub))
+        capture = self._by_entry.get(entry_id)
+        if (capture is not None and capture.producer.call_identity ==
+                (runtime_id, station_id, generation)):
+            producers.extend(self._invalidate_capture(capture.capture_id))
+        await self._stop_producers(producers)
+
     async def close_entry(self, entry_id: str) -> None:
         """Close admission before teardown and invalidate all current ownership."""
         self._admission[entry_id] = False
