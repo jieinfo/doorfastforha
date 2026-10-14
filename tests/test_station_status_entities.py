@@ -319,6 +319,30 @@ class StationStatusTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("idle", entity.native_value)
         self.assertIsNone(entity.extra_state_attributes.get("station_call_operation_id"))
 
+    async def test_sensor_shows_real_incoming_talking_without_video(self):
+        entity = self.find("gate_main", "preview_status")
+        side = self.find("gate_side", "preview_status")
+        await entity.async_added_to_hass()
+        for terminal_history in (False, True):
+            for media in (None, {"available": False, "sessions": []}, {}, {"sessions": []},
+                          {"sessions": [{"station_id": "gate_main", "generation": 9,
+                                         "state": "failed", "source_live": False}]}):
+                with self.subTest(terminal_history=terminal_history, media=media):
+                    status = {"runtime_id": "0123456789abcdef", "call": {
+                        "session": "talking", "station_id": "gate_main", "generation": 43}}
+                    if media is not None:
+                        status["media"] = media
+                    if terminal_history:
+                        status["station_call"] = {"operation_id": 17, "station_id": "gate_main",
+                            "stage": "ended", "media_generation": 9, "call_generation": 42,
+                            "timer": "none", "remaining_ms": 0, "error": "cancelled"}
+                    self.registry.client.status = status
+                    entity._handle_status(status)
+                    self.assertEqual("in_call", entity.native_value)
+                    self.assertEqual(False if media and media.get("sessions") else None,
+                                     entity.extra_state_attributes["source_live"])
+                    self.assertNotEqual("in_call", side.native_value)
+
     async def test_preview_terminal_preemption_and_restart_do_not_restore_current_history(self):
         entity = self.find("gate_main", "preview_status")
         self.registry.client.status = {"media": {"preempted_station_id": "gate_main",

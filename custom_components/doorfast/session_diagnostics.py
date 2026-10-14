@@ -104,7 +104,8 @@ def station_call_phase(status: Any, station_id: Any) -> str | None:
     """Admit TALKING only through the native owner and exact outbound mapping.
 
     Native control generation and public media generation are separate
-    namespaces. Terminal operation history cannot claim a newer incoming owner.
+    namespaces. Incoming TALKING does not depend on video availability; terminal
+    operation history cannot claim a newer incoming owner.
     """
     if not isinstance(status, dict) or _station_id(station_id) is None:
         return None
@@ -126,6 +127,8 @@ def station_call_phase(status: Any, station_id: Any) -> str | None:
             or call.get("station_id") != station_id or station_id == "unknown"
             or _uint64(call.get("generation"), 1) is None):
         return None
+    if not active:
+        return "in_call"
     media = status.get("media")
     if not isinstance(media, dict) or media.get("available") is False:
         return None
@@ -134,7 +137,7 @@ def station_call_phase(status: Any, station_id: Any) -> str | None:
         "requesting", "queued", "awaiting_video", "publishing", "viewing",
     ):
         return None
-    if active and (
+    if (
         operation["call_generation"] != call["generation"]
         or operation["media_generation"] != session["generation"]
         or session.get("purpose") != "call"

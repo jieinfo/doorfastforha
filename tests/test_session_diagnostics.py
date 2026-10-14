@@ -125,6 +125,31 @@ class SessionDiagnosticsTest(unittest.TestCase):
         self.assertEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
         self.assertIsNone(station_status.preview_attributes(status, "gate_main")["station_call_operation_id"])
 
+    def test_incoming_talking_is_independent_of_video_with_absent_or_terminal_operation(self):
+        # A media availability/row gate applied to incoming control would break this.
+        for operation_kind in ("absent", "idle", "ended", "failed"):
+            for media in (None, {"available": False, "sessions": []}, {}, {"sessions": []},
+                          {"sessions": [{"station_id": "gate_main", "state": "failed",
+                                         "source_live": False}]}):
+                with self.subTest(operation_kind=operation_kind, media=media):
+                    status = {"runtime_id": "0123456789abcdef", "call": {
+                        "session": "talking", "station_id": "gate_main", "generation": 43}}
+                    if media is not None:
+                        status["media"] = media
+                    if operation_kind == "idle":
+                        status["station_call"] = operation(operation_id=0, station_id="", stage="idle",
+                            media_generation=0, call_generation=0, timer="none", remaining_ms=0)
+                    elif operation_kind != "absent":
+                        status["station_call"] = operation(stage=operation_kind, timer="none", remaining_ms=0)
+                    attrs = station_status.preview_attributes(status, "gate_main")
+                    self.assertEqual("in_call", attrs["phase"])
+                    self.assertEqual(False if media and media.get("sessions") else None, attrs["source_live"])
+                    self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_side")["phase"])
+                    status["station_call"] = operation(stage="talking", timer="session", call_generation=43)
+                    self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+                    status["station_call"]["operation_id"] = True
+                    self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+
     def test_terminal_operation_preserves_live_preview_and_bounded_historical_attributes(self):
         for stage, error in (("failed", "ack_timeout"), ("ended", "cancelled")):
             status = call_snapshot(station_call=operation(stage=stage, timer="none", remaining_ms=0, error=error,
