@@ -172,6 +172,28 @@ class SessionDiagnosticsTest(unittest.TestCase):
             self.assertIsNone(attrs["call_last_station_id"])
             self.assertIsNone(attrs["call_last_generation"])
 
+    def test_call_unknown_terminal_sentinel_is_unavailable_without_mutating_status(self):
+        # Removing the call-specific sentinel guard would expose an ambiguous owner.
+        self.assertEqual("unknown", diagnostics.require_station_id("unknown"))
+        media = diagnostics.station_diagnostics({"media": {
+            "sessions": [], "last_results": [terminal("unknown", 8)]}}, "unknown")
+        self.assertEqual(8, media["monitor_last_generation"])
+        self.assertEqual("local_hangup", media["monitor_end_reason"])
+        for station_id, expected_owner, expected_generation in (
+            ("gate_main", "gate_main", 8), ("unknown", None, None),
+        ):
+            with self.subTest(station_id=station_id):
+                status = {"call": {"session": "talking", "station_id": "gate_side", "generation": 9,
+                    "timer": "confirmation", "remaining_ms": 1200, "end_reason": "none",
+                    "fault": "confirmation_timeout", "last_station_id": station_id, "last_generation": 8},
+                    "audio": {"ready": True, "generation": 9}}
+                original = deepcopy(status)
+                self.assertEqual({"call_timer": "confirmation", "call_remaining_ms": 1200,
+                    "call_end_reason": "none", "call_fault": "confirmation_timeout",
+                    "call_last_station_id": expected_owner, "call_last_generation": expected_generation},
+                    diagnostics.call_diagnostics(status))
+                self.assertEqual(original, status)
+
 
 if __name__ == "__main__":
     unittest.main()

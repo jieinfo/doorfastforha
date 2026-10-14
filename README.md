@@ -62,6 +62,12 @@ Read these attributes on the existing controller status and per-station
 | Preview status | `monitor_end_reason`, `monitor_failure_reason` | Current station diagnostics, or its latest terminal result when no current session exists |
 | Preview status | `monitor_last_generation` | Generation of that station's latest valid terminal result, never a substitute for the active generation |
 
+The producer's terminal call station value `unknown` is ambiguous, so HA sets
+both `call_last_station_id` and `call_last_generation` to `None` for that value.
+This also applies to a station actually named `unknown` until the producer
+provides a distinguishable identity; raw call/audio and station control remain
+unchanged.
+
 `remaining_ms` is computed by Doorfast when sampling status. HA displays the
 latest sample through the existing event/poll refresh cadence; it does not
 extrapolate a frontend countdown or expose a monotonic deadline. Known no-timer

@@ -59,6 +59,9 @@ def call_diagnostics(status: Any) -> dict[str, Any]:
     call = call if isinstance(call, dict) else {}
     result = _fields(call, "call", _CALL_TIMERS, _CALL_ENDS, _CALL_FAULTS, "fault")
     station_id = _station_id(call.get("last_station_id"))
+    # This wire sentinel cannot distinguish an unresolved owner from that name.
+    if station_id == "unknown":
+        station_id = None
     generation = _uint64(call.get("last_generation"), 1)
     result["call_last_station_id"] = station_id if generation is not None else None
     result["call_last_generation"] = generation if station_id is not None else None

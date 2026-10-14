@@ -331,6 +331,33 @@ class StationStatusTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("unknown", controller.native_value)
             self.assertEqual("unknown", controller.extra_state_attributes["call_fault"])
 
+    async def test_controller_unknown_terminal_sentinel_preserves_raw_call_and_audio(self):
+        # The actual controller must not present the wire sentinel as a terminal identity.
+        controller = self.entities[0]
+        status = {"call": {"session": "talking", "station_id": "gate_side", "generation": 9,
+            "timer": "confirmation", "remaining_ms": 1200, "end_reason": "none",
+            "fault": "confirmation_timeout", "last_station_id": "gate_main", "last_generation": 8},
+            "audio": {"ready": True, "generation": 9}}
+        self.registry.client.status = status
+        await controller.async_added_to_hass()
+        for station_id, expected_owner, expected_generation in (
+            ("gate_main", "gate_main", 8), ("unknown", None, None),
+        ):
+            with self.subTest(station_id=station_id):
+                status["call"]["last_station_id"] = station_id
+                original = deepcopy(status)
+                controller._handle_status(status)
+                attrs = controller.extra_state_attributes
+                self.assertEqual("talking", controller.native_value)
+                self.assertIs(status, self.registry.client.status)
+                self.assertIs(status["call"], attrs["call"])
+                self.assertIs(status["audio"], attrs["audio"])
+                self.assertEqual(original, status)
+                self.assertEqual(("confirmation", 1200, "none", "confirmation_timeout",
+                                  expected_owner, expected_generation), tuple(
+                    attrs[field] for field in ("call_timer", "call_remaining_ms", "call_end_reason",
+                                              "call_fault", "call_last_station_id", "call_last_generation")))
+
     async def test_push_and_poll_present_the_same_authoritative_diagnostics_for_three_stations(self):
         # Replacing refreshed raw status with event.status would change all these attributes.
         events = load_component("events")
