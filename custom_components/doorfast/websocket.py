@@ -499,20 +499,13 @@ class PcmWebSocketManager:
                 except TypeError:
                     # Legacy factories remain supported only for unbound PTT.
                     producer = self.producer_factory(client)
-            # Reserve the requested owner before the producer's first status
-            # await. This is a cancellation key, never an admission substitute:
-            # the producer still validates fresh native/operation/media facts.
-            status = getattr(client, "status", {})
-            runtime_id = status.get("runtime_id")
-            if (not isinstance(runtime_id, str) or len(runtime_id) != 16
-                    or any(character not in "0123456789abcdef" for character in runtime_id)):
-                runtime_id = None
-            candidate = listener.identity if listener is not None else (
-                AudioIdentity(runtime_id, station_id, generation)
-                if runtime_id is not None and station_id is not None and generation is not None else None)
+            # Only listener binding constrains the producer's expected runtime.
+            # A direct request may select a new runtime in its first refresh;
+            # cached status is not a binding or an audio admission substitute.
             cleanup, pending = self._attach_pending(entry_id, connection, cancel_start,
                 listener.listener_id if listener else None, station_id=station_id,
-                identity=candidate, producer=producer, request_runtime_id=runtime_id,
+                identity=listener.identity if listener else None, producer=producer,
+                request_runtime_id=listener.identity.runtime_id if listener else None,
                 request_generation=generation)
             try:
                 await producer.start()

@@ -233,6 +233,114 @@ class AudioEntryLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("not_loaded", connection.errors[-1].code)
         self.assertEqual([], connection.results)
 
+    async def test_runtime_replacement_poll_and_service_revoke_initial_microphone_refresh(self):
+        from importlib import import_module
+
+        audio = self.audio
+        stations = import_module(f"{audio.PACKAGE}.stations")
+        polling = import_module(f"{audio.PACKAGE}.polling")
+        routing = import_module(f"{audio.PACKAGE}.routing")
+        generation = import_module(f"{audio.PACKAGE}.generation")
+        registry = stations.StationRegistryCoordinator(self.client, entry_id="entry-1")
+        self.hass.data["doorfast_stations"] = {"entry-1": registry}
+        station_row = {"id": "gate_main", "name": "Main gate", "logical_address": "32:02:01:00:02:01",
+            "enabled": True, "stream_name": "doorfast_gate_main", "route_source": "configured",
+            "route_fresh": True, "monitorable": True, "last_seen_ms": 0}
+        mic_entered, mic_resume = asyncio.Event(), asyncio.Event()
+        monitor_entered, monitor_resume = asyncio.Event(), asyncio.Event()
+        original_request = self.http.request
+        first_refresh = True
+        hangups, dispatched = [], []
+
+        class InitialStatus(audio.Response):
+            async def __aenter__(response):
+                mic_entered.set()
+                await mic_resume.wait()
+                return response
+
+        class MonitorStatus(audio.Response):
+            async def __aenter__(response):
+                monitor_entered.set()
+                await monitor_resume.wait()
+                return response
+
+        def request(method, url, **kwargs):
+            nonlocal first_refresh
+            if url.endswith("/stations"):
+                return audio.Response(payload={"runtime_id": self.http.current_status["runtime_id"],
+                    "revision": 1, "stations": [station_row]})
+            if url.endswith("/monitor/status"):
+                return MonitorStatus(payload={"runtime_id": audio.REBOOT_RUNTIME, "sessions": []})
+            if url.endswith("/status") and first_refresh:
+                first_refresh = False
+                return InitialStatus(payload=audio.status(audio.REBOOT_RUNTIME))
+            if url.endswith("/hangup"):
+                hangups.append(kwargs["json"])
+                return audio.Response(payload={"runtime_id": audio.REBOOT_RUNTIME, "station_id": "gate_main",
+                    "generation": 0, "operation_id": 0, "queued": True, "state": "ending"})
+            return original_request(method, url, **kwargs)
+
+        self.http.request = request
+        await registry.async_refresh()
+        old = registry.monitor("gate_main")
+        source = ast.parse((COMPONENT / "__init__.py").read_text())
+        setup = next(node for node in source.body if isinstance(node, ast.AsyncFunctionDef)
+                     and node.name == "async_setup_entry")
+        functions = [node for node in setup.body if isinstance(node, ast.AsyncFunctionDef)
+                     and node.name in {"sync_current_monitor", "dispatch_status", "poll", "hangup_station"}]
+        service_resource = next(node for node in source.body if isinstance(node, ast.FunctionDef)
+                                and node.name == "_service_resource")
+        namespace = {"hass": self.hass, "entry": self.entry, "client": self.client, "station_registry": registry,
+            "pcm_ws": self.manager, "provider": self.provider, "DOMAIN": "doorfast", "STATIONS_KEY": "doorfast_stations",
+            "RING_STATUS": "ring_status", "HomeAssistantError": RuntimeError, "select_client": routing.select_client,
+            "async_poll": polling.async_poll, "sync_monitor_state": MODULE.sync_monitor_state,
+            "async_dispatcher_send": lambda *args: dispatched.append(args), "is_ringing": generation.is_ringing,
+            "_LOGGER": logging.getLogger(__name__)}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[service_resource, *functions], type_ignores=[])),
+                     str(COMPONENT / "__init__.py"), "exec"), namespace)
+        connection = audio.Connection()
+        opening = asyncio.create_task(self.manager.start(connection, {
+            "id": 1, "config_entry_id": "entry-1", "station_id": "gate_main", "generation": 7}))
+        poll = None
+        try:
+            await mic_entered.wait()
+            pending = next(iter(self.manager._pending_cleanups.values()))
+            self.assertIsNone(pending.producer.call_identity)
+            self.http.current_status = audio.status(audio.REBOOT_RUNTIME)
+            poll = asyncio.create_task(namespace["poll"]())
+            await monitor_entered.wait()
+            self.assertEqual(audio.REBOOT_RUNTIME, registry.snapshot.runtime_id)
+            self.assertIsNot(old, registry.monitor("gate_main"))
+            self.assertTrue(old._unloaded)
+            self.assertFalse(poll.done())
+            await namespace["hangup_station"](types.SimpleNamespace(data={
+                "config_entry_id": "entry-1", "station_id": "gate_main"}))
+            self.assertEqual([{"runtime_id": audio.REBOOT_RUNTIME, "station_id": "gate_main"}], hangups)
+            mic_resume.set()
+            await opening
+            monitor_resume.set()
+            await poll
+            self.assertEqual([], connection.results)
+            self.assertEqual(["not_found"], [error.code for error in connection.errors])
+            self.assertEqual(audio.ws.AudioIdentity(audio.REBOOT_RUNTIME, "gate_main", 7), pending.revoked_identity)
+            self.assertEqual({}, self.manager._captures)
+            self.assertEqual({}, self.manager._starting)
+            self.assertEqual({}, self.manager._pending_cleanups)
+            self.assertEqual([("session", {"runtime": audio.REBOOT_RUNTIME, "generation": "7"}),
+                              ("end", {"runtime": audio.REBOOT_RUNTIME, "generation": "7"})],
+                [(url.rsplit("/", 1)[-1], params) for url, params in self.http.producer_requests])
+            self.assertEqual("talking", self.client.status["call"]["session"])
+            self.assertEqual("ending", registry.monitor("gate_main").call_state)
+            self.assertEqual(1, self.provider.reconciled)
+            self.assertEqual(2, len(dispatched))
+        finally:
+            mic_resume.set()
+            monitor_resume.set()
+            await opening
+            if poll is not None:
+                await poll
+            await registry.async_close()
+
     async def test_actual_unload_closes_admission_before_blocked_producer_end(self):
         owner = await self.listen()
         lid = owner.results[-1]["listener_id"]
