@@ -42,6 +42,74 @@ one HTTP reader and a four-chunk cache. Unchanged chunks are not replayed;
 temporary failures preserve the cursor, and an expired cursor resynchronizes
 within the same identity. Legacy audio-client and PTT paths remain supported.
 
+## Read session diagnostics
+
+Update Doorfast as well as this integration to obtain classified diagnostics.
+An old bridge, missing optional diagnostics module, unsupported enum or malformed
+field produces `unknown` for diagnostic codes and `None` (JSON `null`) for
+unavailable numbers or terminal identity. Unknown does not mean idle, success or
+failure. Existing preview phases and control entity IDs remain unchanged.
+
+Read these attributes on the existing controller status and per-station
+**Preview status** sensors; no extra entity or button is created:
+
+| Sensor | Attributes | Meaning |
+| --- | --- | --- |
+| Controller status | `call_timer`, `call_remaining_ms` | Current call timer: `none`, `confirmation` or `session`; sampled relative milliseconds |
+| Controller status | `call_end_reason`, `call_fault` | Call end result and fault classification, kept distinct |
+| Controller status | `call_last_station_id`, `call_last_generation` | Validated station/generation pair for the last terminated call, separate from the current raw `call` identity |
+| Preview status | `monitor_timer`, `monitor_remaining_ms` | Selected station timer; also supports `first_frame` and `reconnect` |
+| Preview status | `monitor_end_reason`, `monitor_failure_reason` | Current station diagnostics, or its latest terminal result when no current session exists |
+| Preview status | `monitor_last_generation` | Generation of that station's latest valid terminal result, never a substitute for the active generation |
+
+`remaining_ms` is computed by Doorfast when sampling status. HA displays the
+latest sample through the existing event/poll refresh cadence; it does not
+extrapolate a frontend countdown or expose a monotonic deadline. Known no-timer
+state is `none/0`. Persistent preview `requesting` has a repeated request
+interval, not a total confirmation deadline, so it also reports `none/0`.
+
+Confirmation expiry sets `call_fault=confirmation_timeout` while the call can
+remain active with `call_end_reason=none`. `session_timeout` is a whole-session
+deadline end reason, not the confirmation fault. `heartbeat_timeout` is a
+call-only fault/end classification. Media `source_stalled` or `capacity_busy`
+can describe a recovering current session without implying termination.
+`publisher_failed`, `confirmation_rejected` and `runtime_reset` are accepted
+vocabulary without verified producer triggers in this implementation; a label
+alone does not prove publishing failure, explicit refusal or a reset result.
+Insufficient producer evidence remains `unknown`, and a new runtime starts
+with empty terminal history.
+
+Current `media.sessions[]` and per-station `media.last_results[]` are independent.
+For example, these synthetic Preview status attributes describe current
+generation 9 waiting for a frame while the terminal marker still refers to
+generation 8:
+
+```json
+{
+  "generation": 9,
+  "monitor_timer": "first_frame",
+  "monitor_remaining_ms": 900,
+  "monitor_end_reason": "none",
+  "monitor_failure_reason": "none",
+  "monitor_last_generation": 8
+}
+```
+
+Generation 8's stopped-session reason cannot become generation 9's current
+failure. Unsupported current collections and duplicate or invalid matching
+current records cannot borrow historical reasons; another station's result
+cannot fill this station's attributes. A supported empty current list can use
+that station's valid terminal result.
+Only whitelisted codes, validated numbers and the validated terminal call
+station ID enter the new properties, without tokens, media bodies or addresses.
+
+English and Simplified Chinese native attribute labels are supplied under the
+existing sensor translation keys. Local tests validate their structure and
+codes; actual HA frontend rendering is pending, and older frontends may show
+stable codes. See the [read-only diagnostic acceptance procedure](docs/ha-e2e-acceptance-runner.md#check-session-diagnostics-without-controls)
+for the remaining CI, deployment and field checks. Status diagnostics do not
+establish browser listening or physical full-duplex acceptance.
+
 ## Active WebRTC preview
 
 When Doorfast reports the media module as installed and available, the camera

@@ -18,6 +18,13 @@ Doorfast microphone bridge. It targets the Home Assistant WebSocket API and the
 Doorfast HTTP bridge implemented by Doorfast. The runner keeps PCM bodies and
 all producer credentials in memory, and writes only redacted JSONL evidence.
 
+Session diagnostics require an updated Doorfast producer and its optional
+diagnostics extension for complete classification. Older bridges or unavailable
+extensions safely show `unknown` codes and `None` (JSON `null`) numbers/terminal
+identity. The local session tests below are synthetic regression evidence;
+Actions, installed diagnostic inspection, native frontend localization and
+field checks remain pending. The audio runner does not establish those results.
+
 The existing runner records these historical source references in its evidence:
 
 * `doorfastforha` `0bd2474` (HA main after setup rollback safety)
@@ -51,6 +58,58 @@ results, request counts, lengths and digests; do not save PCM/WAV, producer
 tokens, HA tokens or raw sensitive responses. The 300 ms bound is local
 scheduled buffering/cache freshness. Source timestamps measure selected versus
 latest bridge publication, not capture/end-to-end delay.
+
+## Check session diagnostics without controls
+
+Use the existing controller status and station Preview status sensors, with
+the [attribute reference in README](../README.md#read-session-diagnostics).
+This inspection adds no buttons/entities, changes no dashboard and invokes no
+monitor, call, hangup or unlock service.
+
+1. Before a deployment update, require passing Actions for the intended package;
+   then update through HACS as a separate deployment step. Record producer,
+   integration and HA/frontend versions. Local suites alone do not establish CI
+   or installation acceptance.
+2. Inspect refreshed status and the existing sensor attributes for each of the
+   three configured stations. Use synthetic fixture IDs `gate_main`, `gate_side`
+   and `gate_b2` only in local tests; compare actual configured station IDs and
+   generations during an authorized installation inspection. Retain only safe
+   diagnostic codes and numbers, never complete raw status or access materials.
+3. Compare current `media.sessions[]` diagnostics with that station's attributes.
+   `media.last_results[]` contains only its latest terminal result. A current
+   generation 9 with `monitor_end_reason=none` must retain its current reason even
+   if terminal generation 8 ended with `local_hangup`; independently,
+   `monitor_last_generation` may be 8. With no current session, a unique valid
+   terminal record can supply the reason and `none/0` timer. Invalid or ambiguous
+   current data stays unknown rather than borrowing history. New runtime empty
+   history clears terminal markers.
+4. Check timer meaning against the same sampled bridge snapshot. Relative
+   `remaining_ms` is sampled by Doorfast, never extrapolated in the frontend.
+   Confirmation expiry is `call_fault=confirmation_timeout` and can leave
+   `call_end_reason=none`; whole-session expiry is `end_reason=session_timeout`.
+   `heartbeat_timeout` belongs only to call diagnostics. Recovering media can
+   report `source_stalled` or `capacity_busy` while still current. Accepted
+   `publisher_failed`, `confirmation_rejected` and `runtime_reset` vocabulary
+   does not establish an implemented producer trigger. Insufficient evidence is
+   `unknown`; runtime replacement does not manufacture a reset terminal result.
+5. Compare accepted event refresh and the next poll for the same station and
+   generation. The local fixtures cover equivalence plus stale generation,
+   revision/runtime and conflicting embedded event data rejection. Event loss
+   must not restore an earlier terminal reason over a current session. Confirm
+   old bridge missing fields yield unknown codes and `None` numbers, not zero or
+   fabricated success/failure.
+6. In a later authorized frontend/field acceptance, inspect English and Simplified
+   Chinese native attribute labels on the existing sensors; older frontends may
+   show stable codes. Compare the fields with Doorfast logs from separately
+   authorized first-frame timeout/short-stream recovery, real call end and normal
+   stop cases at stations 1, 2 and B2. Read-only inspection does not initiate
+   those cases, and diagnostic results do not prove audible sound, real video
+   delivery or physical full-duplex operation.
+
+The controller's `call_last_station_id` / `call_last_generation` pair attributes
+the last terminated call independently of the current raw `call`. Diagnostic
+properties are bounded codes, numbers and a validated station ID; they add no
+tokens, passwords, SDP, media bodies, network addresses or access materials.
 
 ## Historical local setup for an authorized runner session
 
@@ -186,6 +245,9 @@ the full regression suites.
 python3 -m unittest discover -s tests
 python3 -m compileall -q custom_components/doorfast
 node --test tests/js/*.mjs
+python3 -m json.tool custom_components/doorfast/translations/en.json >/dev/null
+python3 -m json.tool custom_components/doorfast/translations/zh-Hans.json >/dev/null
+git diff --check
 python3 -m compileall -q doorfast_ha_e2e run_acceptance.py
 ```
 
@@ -199,3 +261,11 @@ node --test tests/js/test_duplex_lifecycle.mjs
 The Task 6 report and raw logs live in
 `.superpowers/sdd/2026-10-12-ha-continuous-duplex-audio/`. Local host checks do
 not establish OpenWrt SDK or `DF_WITH_UBUS` target-build evidence.
+
+Session normalization and real entity/event/poll fixture coverage live in
+`tests/test_session_diagnostics.py` and `tests/test_station_status_entities.py`.
+They cover legacy bridge fields, three-station isolation, current generation 9
+versus terminal 8, stable sensor IDs/options/counts, safe properties and native
+translation dictionaries. They do not render a real HA frontend or perform an
+installed/field diagnostic session. Full-suite failure-path fixture logs are
+expected; assess the test summary and command exit status.
