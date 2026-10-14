@@ -126,6 +126,191 @@ def audio_client(*responses):
 
 
 class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_refresh_started_before_control_change_cannot_replace_authoritative_status(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        fresh = {"runtime_id": "0123456789abcdef", "call": {"session": "talking", "generation": 42}}
+        client.status = fresh
+        client._refresh_sequence = 0
+        client._station_control_epochs = {}
+        client._video_generation = client._audio_generation = None
+        entered, resume = asyncio.Event(), asyncio.Event()
+        async def request(*args):
+            entered.set()
+            await resume.wait()
+            return {"runtime_id": "0123456789abcdef", "call": {"session": "idle", "generation": 0}}
+        client._request = request
+        refresh = asyncio.create_task(client.refresh())
+        await entered.wait()
+        client._station_control_epochs["gate_main"] = 1
+        resume.set()
+        await refresh
+        self.assertIs(fresh, client.status)
+
+    async def test_hangup_reply_rejects_changed_operation_before_success(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.status = {"runtime_id": "0123456789abcdef"}
+        client._request = AsyncMock(return_value={"runtime_id": "0123456789abcdef",
+            "station_id": "gate_main", "queued": True, "state": "ending", "generation": 9, "operation_id": 4})
+        with self.assertRaises(ValueError):
+            await client.hangup_station("gate_main", operation_id=3, generation=9)
+
+    async def test_real_delayed_refresh_after_new_call_preserves_sensor_and_coordinator(self):
+        from tests.test_station_status_entities import sensor, station
+        from custom_components.doorfast.monitor import MonitorCoordinator
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        client.online = True
+        client.status = {"runtime_id": "0123456789abcdef", "call": {"session": "idle", "generation": 0},
+                         "media": {"sessions": []}}
+        entered, resume = asyncio.Event(), asyncio.Event()
+        async def request(method, path, payload=None):
+            if method == "GET":
+                entered.set()
+                await resume.wait()
+                return {"runtime_id": "0123456789abcdef", "call": {"session": "idle", "generation": 0}}
+            return {"runtime_id": "0123456789abcdef", "station_id": "gate_main", "operation_id": 3,
+                    "generation": 9, "queued": True, "state": "preparing"}
+        client._request = request
+        monitor = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        refresh = asyncio.create_task(client.refresh())
+        await entered.wait()
+        await monitor.async_call()
+        fresh = {"runtime_id": "0123456789abcdef", "station_call": {"operation_id": 3,
+            "station_id": "gate_main", "stage": "talking", "media_generation": 9, "call_generation": 42,
+            "timer": "session", "remaining_ms": 12000, "error": "none"},
+            "call": {"session": "talking", "generation": 42, "station_id": "gate_main"},
+            "media": {"sessions": [{"station_id": "gate_main", "generation": 9, "purpose": "call",
+                                    "state": "publishing", "source_live": False, "ready": True}]}}
+        client.status = fresh
+        await monitor.async_apply_call_status(fresh)
+        entity = sensor.DoorfastPreviewStatus(client, "entry-1", station())
+        self.assertEqual("in_call", entity.native_value)
+        resume.set()
+        await refresh
+        await monitor.async_apply_call_status(client.status)
+        self.assertEqual("in_call", entity.native_value)
+        self.assertEqual("talking", monitor.call_state)
+        self.assertFalse(entity.extra_state_attributes["source_live"])
+
+    async def test_station_http_structured_errors_become_stable_codes(self):
+        class Response:
+            status = 409
+            def raise_for_status(self): raise RuntimeError("HTTP secret URL")
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            async def json(self, **kwargs): return {"error": {"code": "busy", "message": "secret URL"}}
+        class Session:
+            def request(self, *args, **kwargs): return Response()
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.base_url = "http://synthetic.invalid"
+        client.session = Session()
+        client.status = {"runtime_id": "0123456789abcdef"}
+        with self.assertRaises(Exception) as raised:
+            await client.call_station("gate_main")
+        self.assertEqual("busy", getattr(raised.exception, "code", None))
+
+        class Unknown(Response):
+            async def json(self, **kwargs): return {"error": {"code": "secret-url-code"}}
+        client.session = types.SimpleNamespace(request=lambda *args, **kwargs: Unknown())
+        with self.assertRaises(Exception) as raised:
+            await client.call_station("gate_main")
+        self.assertEqual("unknown", getattr(raised.exception, "code", None))
+        self.assertNotIn("secret", str(raised.exception))
+        from custom_components.doorfast.monitor import MonitorCoordinator
+        for body, expected in (({"error": {"code": "station_unavailable", "message": "secret"}}, "station_unavailable"),
+                               (["secret"], "unknown"), ({"error": {"code": "secret"}}, "unknown")):
+            class Failure(Response):
+                async def json(self, **kwargs): return body
+            client.session = types.SimpleNamespace(request=lambda *args, **kwargs: Failure())
+            coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+            with self.assertRaises(RuntimeError):
+                await coordinator.async_call()
+            self.assertEqual(expected, coordinator.call_error)
+
+            with self.assertRaises(RuntimeError):
+                await coordinator.async_hangup()
+            self.assertEqual(expected, coordinator.call_error)
+
+    async def test_actual_c_admission_errors_keep_stable_coordinator_categories(self):
+        from custom_components.doorfast.monitor import MonitorCoordinator
+
+        cases = (("capacity_busy", "busy"), ("station_not_found", "station_unavailable"),
+                 ("station_disabled", "station_unavailable"), ("route_unavailable", "station_unavailable"),
+                 ("encoder_failed", "media_failed"), ("runtime_mismatch", "unknown"),
+                 ("operation_mismatch", "unknown"), ("generation_mismatch", "unknown"),
+                 ("unclassified_secret", "unknown"))
+        stable = ("none", "busy", "station_unavailable", "ack_timeout", "dispatch_failed", "dispatch_timeout",
+                  "media_failed", "preempted", "cancelled", "runtime_reset", "unknown")
+        for code, expected in (*cases, *((code, code) for code in stable)):
+            for action in ("call", "hangup"):
+                with self.subTest(wire_code=code, action=action):
+                    body = {"error": {"code": code, "message": "synthetic secret URL"}}
+                    if code == "capacity_busy":
+                        body["error"].update(configured_capacity=2, effective_capacity=2, active_encoders=2)
+
+                    class Response:
+                        status = 409
+                        async def __aenter__(self): return self
+                        async def __aexit__(self, *args): return False
+                        async def json(self, **kwargs): return body
+
+                    requests = []
+                    def request(method, url, **kwargs):
+                        requests.append((method, url, kwargs["json"]))
+                        return Response()
+
+                    client = DoorfastClient(None, "http://synthetic.invalid")
+                    client.status = {"runtime_id": "0123456789abcdef"}
+                    client.session = types.SimpleNamespace(request=request)
+                    coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+                    with self.assertRaises(RuntimeError) as raised:
+                        await (coordinator.async_call() if action == "call" else coordinator.async_hangup())
+                    self.assertEqual(expected, coordinator.call_error)
+                    self.assertEqual(expected, raised.exception.code)
+                    self.assertNotIn("secret", str(raised.exception))
+                    self.assertEqual([("POST", f"http://synthetic.invalid/api/v1/{action}",
+                        {"runtime_id": "0123456789abcdef", "station_id": "gate_main"})], requests)
+
+    async def test_old_operation_snapshot_cannot_replace_newer_shared_status(self):
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        operation = {"operation_id": 4, "station_id": "gate_main", "stage": "calling",
+            "media_generation": 9, "call_generation": 42, "timer": "confirmation",
+            "remaining_ms": 800, "error": "none"}
+        client.status = {"runtime_id": "0123456789abcdef", "station_call": operation}
+        client._request = AsyncMock(return_value={"runtime_id": "0123456789abcdef",
+            "station_call": {**operation, "operation_id": 3, "stage": "ended", "timer": "none", "remaining_ms": 0}})
+        await client.refresh()
+        self.assertEqual(4, client.status["station_call"]["operation_id"])
+
+    async def test_strict_station_json_at_actual_http_transport_boundary(self):
+        class Response:
+            status = 200
+            async def __aenter__(self): return self
+            async def __aexit__(self, *args): return False
+            def raise_for_status(self): pass
+            async def json(self, **kwargs): return self.payload
+
+        class Session:
+            def __init__(self): self.sent = []
+            def request(self, method, url, **kwargs):
+                self.sent.append((method, url, kwargs["json"]))
+                response = Response()
+                response.payload = {"runtime_id": "0123456789abcdef", "station_id": "gate_main",
+                                    "operation_id": 3, "generation": 9, "state": "preparing", "queued": True}
+                return response
+
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.status = {"runtime_id": "0123456789abcdef"}
+        client.base_url = "http://synthetic.invalid"
+        client.session = Session()
+        await client.call_station("gate_main", 9303, 9302, 45)
+        await client.hangup_station("gate_main", "ha", generation=9, operation_id=3)
+        self.assertEqual([
+            ("POST", "http://synthetic.invalid/api/v1/call",
+             {"runtime_id": "0123456789abcdef", "station_id": "gate_main"}),
+            ("POST", "http://synthetic.invalid/api/v1/hangup",
+             {"runtime_id": "0123456789abcdef", "station_id": "gate_main", "generation": 9, "operation_id": 3})
+        ], client.session.sent)
+
     async def test_station_call_and_form_hangup_bind_runtime_and_station(self):
         client = DoorfastClient.__new__(DoorfastClient)
         client.status = {"runtime_id": "0123456789abcdef", "call": {"generation": 7}}
@@ -146,9 +331,6 @@ class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
                     {
                         "runtime_id": "0123456789abcdef",
                         "station_id": "gate_main",
-                        "primary_media_port": 8303,
-                        "secondary_media_port": 8302,
-                        "duration_seconds": 45,
                     },
                 ),
                 call(
@@ -157,7 +339,6 @@ class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
                     {
                         "runtime_id": "0123456789abcdef",
                         "station_id": "gate_main",
-                        "reason": "ha",
                     },
                 ),
             ],
@@ -254,6 +435,29 @@ class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
         )
 
 class MonitorPayloadTest(unittest.IsolatedAsyncioTestCase):
+    async def test_station_hangup_validates_optional_operation_and_control_keys(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.status = {"runtime_id": "0123456789abcdef"}
+        client._request = AsyncMock(return_value={"queued": True, "state": "ending"})
+        await client.hangup_station("gate_main", generation=42, operation_id=3)
+        self.assertEqual({"runtime_id": "0123456789abcdef", "station_id": "gate_main",
+                          "generation": 42, "operation_id": 3}, client._request.await_args.args[2])
+        for bad in (True, 0, -1, 2**64, "3"):
+            with self.assertRaises(ValueError):
+                await client.hangup_station("gate_main", operation_id=bad)
+
+    async def test_call_rejects_malformed_or_conflicting_reply_identity(self):
+        client = DoorfastClient.__new__(DoorfastClient)
+        client.status = {"runtime_id": "0123456789abcdef"}
+        valid = {"runtime_id": "0123456789abcdef", "station_id": "gate_main",
+                 "operation_id": 3, "generation": 9, "state": "preparing", "queued": True}
+        for changes in ({"operation_id": True}, {"generation": 2**64},
+                        {"station_id": "gate_side"}, {"runtime_id": "fedcba9876543210"},
+                        {"state": "secret http://password"}, {"queued": 1}):
+            client._request = AsyncMock(return_value={**valid, **changes})
+            with self.assertRaises(ValueError):
+                await client.call_station("gate_main")
+
     async def test_uses_exact_monitor_endpoints_and_payloads(self):
         client = DoorfastClient.__new__(DoorfastClient)
         client._request = AsyncMock(

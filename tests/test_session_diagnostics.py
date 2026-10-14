@@ -18,6 +18,27 @@ spec = importlib.util.spec_from_file_location(
 assert spec and spec.loader
 diagnostics = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(diagnostics)
+spec = importlib.util.spec_from_file_location(
+    f"{PACKAGE}.station_status", COMPONENT / "station_status.py"
+)
+assert spec and spec.loader
+station_status = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(station_status)
+
+
+def operation(**fields):
+    return {"operation_id": 17, "station_id": "gate_main", "stage": "calling",
+            "media_generation": 9, "call_generation": 42, "timer": "confirmation",
+            "remaining_ms": 900, "error": "none", **fields}
+
+
+def call_snapshot(**fields):
+    return {"runtime_id": "0123456789abcdef",
+            "call": {"session": "idle", "station_id": "gate_main", "generation": 0},
+            "station_call": operation(), "media": {"sessions": [
+                {"station_id": "gate_main", "generation": 9, "purpose": "call",
+                 "state": "viewing", "ready": True, "source_live": False,
+                 "started_ms": 100, "first_frame_ms": 300}]}, **fields}
 
 
 def record(station_id="gate_main", generation=9, **fields):
@@ -33,6 +54,163 @@ def terminal(station_id="gate_main", generation=8, **fields):
 
 
 class SessionDiagnosticsTest(unittest.TestCase):
+    def test_station_call_phases_require_actual_control_owner_and_distinct_media_key(self):
+        # purpose-only classification and comparing control to media both break this matrix.
+        for stage, native, phase in (
+            ("preparing", "idle", "calling"), ("calling", "idle", "calling"),
+            ("calling", "preview", "calling"), ("talking", "talking", "in_call"),
+            ("talking", "idle", "requesting"), ("ending", "talking", "stopping"),
+            ("failed", "idle", "requesting"), ("ended", "idle", "requesting"),
+        ):
+            with self.subTest(stage=stage, native=native):
+                terminal = stage in ("failed", "ended")
+                status = call_snapshot(station_call=operation(stage=stage,
+                    timer="none" if terminal else "confirmation",
+                    remaining_ms=0 if terminal else 900))
+                status["call"].update(session=native, generation=42)
+                attrs = station_status.preview_attributes(status, "gate_main")
+                self.assertEqual(phase, attrs["phase"])
+                self.assertFalse(attrs["source_live"])
+                self.assertEqual(200, attrs["first_frame_latency_ms"])
+
+    def test_call_media_without_operation_or_matching_talking_is_only_requesting(self):
+        for native in ({"session": "idle", "generation": 0},
+                       {"session": "talking", "station_id": "gate_side", "generation": 42},
+                       {"session": "talking", "station_id": "gate_main", "generation": 0}):
+            status = call_snapshot(call=native)
+            status.pop("station_call")
+            status["media"]["sessions"][0]["source_live"] = True
+            self.assertEqual("requesting", station_status.preview_attributes(status, "gate_main")["phase"])
+
+    def test_active_call_identity_conflicts_and_ambiguous_media_do_not_manufacture_talking(self):
+        for mutation in (
+            lambda s: s["call"].update(station_id="gate_side"),
+            lambda s: s["call"].update(generation=9),
+            lambda s: s["station_call"].update(media_generation=42),
+            lambda s: s["station_call"].update(station_id="gate_side"),
+            lambda s: s["station_call"].update(call_generation=0),
+            lambda s: s["station_call"].update(media_generation=0),
+            lambda s: s["media"]["sessions"].append(deepcopy(s["media"]["sessions"][0])),
+            lambda s: s["media"]["sessions"].append(None),
+            lambda s: s["media"]["sessions"][0].update(generation=True),
+            lambda s: s["call"].update(generation=True),
+            lambda s: s.update(runtime_id="old runtime"),
+        ):
+            status = call_snapshot(call={"session": "talking", "station_id": "gate_main", "generation": 42},
+                                   station_call=operation(stage="talking", timer="session"))
+            mutation(status)
+            self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+
+    def test_preparation_does_not_require_a_ready_media_row(self):
+        for media in ({"sessions": []}, {}, None, {"available": False, "sessions": []}):
+            status = call_snapshot(media=media, station_call=operation(stage="preparing",
+                media_generation=0, call_generation=0, timer="startup", remaining_ms=30000))
+            self.assertEqual("calling", station_status.preview_attributes(status, "gate_main")["phase"])
+            self.assertNotEqual("calling", station_status.preview_attributes(status, "gate_side")["phase"])
+
+    def test_incoming_talking_survives_unrelated_terminal_operation_and_old_snapshots(self):
+        for terminal_station in (None, "gate_side", "gate_main"):
+            status = call_snapshot(call={"session": "talking", "station_id": "gate_main", "generation": 43})
+            if terminal_station is None:
+                status.pop("station_call")
+                status.pop("runtime_id")
+            else:
+                status["station_call"] = operation(station_id=terminal_station,
+                    stage="ended", timer="none", remaining_ms=0)
+            self.assertEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+
+        status = call_snapshot(call={"session": "talking", "station_id": "gate_main", "generation": 43},
+            station_call=operation(operation_id=0, station_id="", stage="idle", media_generation=0,
+                                   call_generation=0, timer="none", remaining_ms=0))
+        self.assertEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+        self.assertIsNone(station_status.preview_attributes(status, "gate_main")["station_call_operation_id"])
+
+    def test_incoming_talking_is_independent_of_video_with_absent_or_terminal_operation(self):
+        # A media availability/row gate applied to incoming control would break this.
+        for operation_kind in ("absent", "idle", "ended", "failed"):
+            for media in (None, {"available": False, "sessions": []}, {}, {"sessions": []},
+                          {"sessions": [{"station_id": "gate_main", "state": "failed",
+                                         "source_live": False}]}):
+                with self.subTest(operation_kind=operation_kind, media=media):
+                    status = {"runtime_id": "0123456789abcdef", "call": {
+                        "session": "talking", "station_id": "gate_main", "generation": 43}}
+                    if media is not None:
+                        status["media"] = media
+                    if operation_kind == "idle":
+                        status["station_call"] = operation(operation_id=0, station_id="", stage="idle",
+                            media_generation=0, call_generation=0, timer="none", remaining_ms=0)
+                    elif operation_kind != "absent":
+                        status["station_call"] = operation(stage=operation_kind, timer="none", remaining_ms=0)
+                    attrs = station_status.preview_attributes(status, "gate_main")
+                    self.assertEqual("in_call", attrs["phase"])
+                    self.assertEqual(False if media and media.get("sessions") else None, attrs["source_live"])
+                    self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_side")["phase"])
+                    status["station_call"] = operation(stage="talking", timer="session", call_generation=43)
+                    self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+                    status["station_call"]["operation_id"] = True
+                    self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+
+    def test_terminal_operation_preserves_live_preview_and_bounded_historical_attributes(self):
+        for stage, error in (("failed", "ack_timeout"), ("ended", "cancelled")):
+            status = call_snapshot(station_call=operation(stage=stage, timer="none", remaining_ms=0, error=error,
+                token="private token", sdp="private sdp"))
+            status["media"]["sessions"][0].update(purpose="preview", source_live=True)
+            original = deepcopy(status)
+            attrs = station_status.preview_attributes(status, "gate_main")
+            self.assertEqual("live", attrs["phase"])
+            self.assertEqual((stage, error, 17, 9, 42, "none", 0, "0123456789abcdef"), tuple(
+                attrs.get(name) for name in ("station_call_stage", "station_call_error", "station_call_operation_id",
+                    "station_call_media_generation", "station_call_call_generation", "station_call_timer",
+                    "station_call_remaining_ms", "station_call_runtime_id")))
+            self.assertNotIn("private", str(attrs))
+            self.assertEqual(original, status)
+            self.assertIsNone(station_status.preview_attributes(status, "gate_side").get("station_call_operation_id"))
+
+    def test_station_call_codes_and_uint64_values_are_validated_before_consumption(self):
+        for key in ("operation_id", "media_generation", "call_generation", "remaining_ms"):
+            for value in (True, False, -1, 2**64, "9", 9.0, None, [], {}):
+                with self.subTest(key=key, value=value):
+                    status = call_snapshot(call={"session": "talking", "station_id": "gate_main", "generation": 42})
+                    status["station_call"][key] = value
+                    attrs = station_status.preview_attributes(status, "gate_main")
+                    self.assertNotEqual("in_call", attrs["phase"])
+                    self.assertIsNone(attrs.get("station_call_operation_id"))
+        for key, values in (
+            ("stage", (None, True, [], {}, "private stage")),
+            ("timer", (None, True, [], {}, "first_frame", "private timer")),
+            ("error", (None, True, [], {}, "confirmation_timeout", "private error")),
+            ("station_id", (None, True, [], {}, "Gate", "secret token")),
+        ):
+            for value in values:
+                status = call_snapshot()
+                status["station_call"][key] = value
+                attrs = station_status.preview_attributes(status, "gate_main")
+                self.assertIsNone(attrs.get("station_call_operation_id"))
+                self.assertNotIn("private", str(attrs))
+        for value in (None, True, [], {}, "private operation"):
+            status = call_snapshot(station_call=value,
+                call={"session": "talking", "station_id": "gate_main", "generation": 42})
+            self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+        for changes in ({"operation_id": 0}, {"stage": "idle"}, {"stage": "unknown"}):
+            status = call_snapshot(station_call=operation(**changes),
+                call={"session": "talking", "station_id": "gate_main", "generation": 42})
+            self.assertNotEqual("in_call", station_status.preview_attributes(status, "gate_main")["phase"])
+
+    def test_station_call_whitelists_and_terminal_timer_invariants(self):
+        errors = ("none", "busy", "station_unavailable", "ack_timeout", "dispatch_failed",
+                  "dispatch_timeout", "media_failed", "preempted", "cancelled", "runtime_reset", "unknown")
+        for error in errors:
+            status = call_snapshot(station_call=operation(error=error))
+            self.assertEqual(error, station_status.preview_attributes(status, "gate_main").get("station_call_error"))
+        for timer in ("none", "startup", "confirmation", "session"):
+            status = call_snapshot(station_call=operation(timer=timer, remaining_ms=2**64 - 1))
+            self.assertEqual(timer, station_status.preview_attributes(status, "gate_main").get("station_call_timer"))
+            self.assertEqual(2**64 - 1, station_status.preview_attributes(status, "gate_main").get("station_call_remaining_ms"))
+        for terminal in (operation(stage="failed", timer="session", remaining_ms=0),
+                         operation(stage="ended", timer="none", remaining_ms=1)):
+            attrs = station_status.preview_attributes(call_snapshot(station_call=terminal), "gate_main")
+            self.assertIsNone(attrs.get("station_call_operation_id"))
+
     def test_call_diagnostics_are_additive_and_do_not_expose_access_material(self):
         status = {"call": {"timer": "confirmation", "remaining_ms": 1200,
                   "end_reason": "none", "fault": "confirmation_timeout",

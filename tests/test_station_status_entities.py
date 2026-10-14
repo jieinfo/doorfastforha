@@ -218,6 +218,9 @@ class StationStatusTest(unittest.IsolatedAsyncioTestCase):
         session.update(state="publishing", source_live="true")
         self.assertIsNone(entity.native_value)
         session.update(source_live=True, purpose="call")
+        self.registry.client.status["call"] = {
+            "session": "talking", "station_id": "gate_main", "generation": 42,
+        }
         self.assertEqual("in_call", entity.native_value)
         self.registry.client.online = False
         listener(self.registry.client.status)
@@ -251,6 +254,10 @@ class StationStatusTest(unittest.IsolatedAsyncioTestCase):
                 with self.subTest(station_id=station_id, phase=phase):
                     session.update(state=state, ready=ready, source_live=live, purpose=purpose,
                                    timer=timer, remaining_ms=remaining, failure_reason=fault)
+                    self.registry.client.status["call"] = {
+                        "session": "talking" if purpose == "call" else "idle",
+                        "station_id": station_id, "generation": 42 if purpose == "call" else 0,
+                    }
                     entity._handle_status(self.registry.client.status)
                     attrs = entity.extra_state_attributes
                     self.assertEqual(phase, entity.native_value)
@@ -269,6 +276,72 @@ class StationStatusTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(entity.native_value)
             self.assertIn("monitor_failure_reason", entity.extra_state_attributes)
             self.assertEqual("first_frame_timeout", entity.extra_state_attributes["monitor_failure_reason"])
+
+    async def test_sensor_consumes_authoritative_outbound_stages_and_incoming_talking(self):
+        entity = self.find("gate_main", "preview_status")
+        side = self.find("gate_side", "preview_status")
+        await entity.async_added_to_hass()
+        status = {"runtime_id": "0123456789abcdef", "call": {
+            "session": "idle", "station_id": "gate_main", "generation": 0},
+            "station_call": {"operation_id": 17, "station_id": "gate_main", "stage": "preparing",
+                "media_generation": 9, "call_generation": 0, "timer": "startup", "remaining_ms": 30000,
+                "error": "none", "token": "private token"}, "media": {"sessions": []}}
+        for stage, native, generation, timer, remaining, expected in (
+            ("preparing", "idle", 0, "startup", 30000, "calling"),
+            ("calling", "preview", 42, "confirmation", 900, "calling"),
+            ("talking", "talking", 42, "session", 120000, "in_call"),
+            ("ending", "talking", 42, "confirmation", 900, "stopping"),
+            ("failed", "idle", 42, "none", 0, "reconnecting"),
+            ("ended", "talking", 43, "none", 0, "in_call"),
+        ):
+            with self.subTest(stage=stage):
+                if stage != "preparing":
+                    status["media"]["sessions"] = [{"station_id": "gate_main", "generation": 9,
+                        "purpose": "preview" if stage in ("failed", "ended") else "call",
+                        "state": "viewing", "ready": True, "source_live": False}]
+                status["call"].update(session=native, generation=generation)
+                status["station_call"].update(stage=stage, call_generation=42 if stage != "preparing" else 0,
+                    timer=timer, remaining_ms=remaining, error="media_failed" if stage == "failed" else "none")
+                self.registry.client.status = status
+                entity._handle_status(status)
+                self.assertEqual(expected, entity.native_value)
+                attrs = entity.extra_state_attributes
+                self.assertEqual(stage, attrs.get("station_call_stage"))
+                self.assertEqual((17, 9, 42 if stage != "preparing" else 0, timer, remaining), tuple(
+                    attrs[name] for name in ("station_call_operation_id", "station_call_media_generation",
+                        "station_call_call_generation", "station_call_timer", "station_call_remaining_ms")))
+                self.assertNotIn("private", str(attrs))
+                if stage != "preparing":
+                    self.assertFalse(attrs["source_live"])
+                self.assertNotEqual("in_call", side.native_value)
+                self.assertIsNone(side.extra_state_attributes["station_call_operation_id"])
+        self.registry.client.status = {"media": {"sessions": []}}
+        self.assertEqual("idle", entity.native_value)
+        self.assertIsNone(entity.extra_state_attributes.get("station_call_operation_id"))
+
+    async def test_sensor_shows_real_incoming_talking_without_video(self):
+        entity = self.find("gate_main", "preview_status")
+        side = self.find("gate_side", "preview_status")
+        await entity.async_added_to_hass()
+        for terminal_history in (False, True):
+            for media in (None, {"available": False, "sessions": []}, {}, {"sessions": []},
+                          {"sessions": [{"station_id": "gate_main", "generation": 9,
+                                         "state": "failed", "source_live": False}]}):
+                with self.subTest(terminal_history=terminal_history, media=media):
+                    status = {"runtime_id": "0123456789abcdef", "call": {
+                        "session": "talking", "station_id": "gate_main", "generation": 43}}
+                    if media is not None:
+                        status["media"] = media
+                    if terminal_history:
+                        status["station_call"] = {"operation_id": 17, "station_id": "gate_main",
+                            "stage": "ended", "media_generation": 9, "call_generation": 42,
+                            "timer": "none", "remaining_ms": 0, "error": "cancelled"}
+                    self.registry.client.status = status
+                    entity._handle_status(status)
+                    self.assertEqual("in_call", entity.native_value)
+                    self.assertEqual(False if media and media.get("sessions") else None,
+                                     entity.extra_state_attributes["source_live"])
+                    self.assertNotEqual("in_call", side.native_value)
 
     async def test_preview_terminal_preemption_and_restart_do_not_restore_current_history(self):
         entity = self.find("gate_main", "preview_status")

@@ -79,6 +79,9 @@ class _PendingStart:
     station_id: str | None = None
     identity: AudioIdentity | None = None
     producer: PcmProducer | None = None
+    request_runtime_id: str | None = None
+    request_generation: int | None = None
+    revoked_identity: AudioIdentity | None = None
 
 
 class PcmWebSocketManager:
@@ -187,18 +190,21 @@ class PcmWebSocketManager:
     def _attach_pending(self, entry_id: str, connection: Any,
                         callback: Callable[[], None], listener_id: str | None = None,
                         *, station_id: str | None = None, identity: AudioIdentity | None = None,
-                        producer: PcmProducer | None = None) -> Callable[[], None]:
+                        producer: PcmProducer | None = None, request_runtime_id: str | None = None,
+                        request_generation: int | None = None) -> tuple[Callable[[], None], _PendingStart]:
         key = secrets.token_urlsafe(24)
         def revoke() -> None:
             self._pending_cleanups.pop(key, None)
             cleanup()
             callback()
         cleanup = self._attach_cleanup(connection, key, revoke)
-        self._pending_cleanups[key] = _PendingStart(entry_id, listener_id, revoke, station_id, identity, producer)
+        pending = _PendingStart(entry_id, listener_id, revoke, station_id, identity, producer,
+                                request_runtime_id, request_generation)
+        self._pending_cleanups[key] = pending
         def detach() -> None:
             self._pending_cleanups.pop(key, None)
             cleanup()
-        return detach
+        return detach, pending
 
     def _revoke_pending(self, entry_id: str, listener_id: str | None = None) -> None:
         for pending in list(self._pending_cleanups.values()):
@@ -211,6 +217,21 @@ class PcmWebSocketManager:
             return AudioIdentity.from_status(status, station_id)
         except AudioStreamError:
             return None
+
+    @staticmethod
+    def _operation_allows_audio(status: Any) -> bool:
+        """Keep observed outbound conflicts closed across producer awaits.
+
+        Legacy microphone status needs neither a station nor a listener stream
+        capability. Its existing native owner guards remain independent.
+        """
+        if not isinstance(status, dict) or "station_call" not in status:
+            return True
+        from .session_diagnostics import station_call_phase
+
+        call = status.get("call")
+        station_id = call.get("station_id") if isinstance(call, dict) else None
+        return station_call_phase(status, station_id) == "in_call"
 
     def _owned_listener(self, connection: Any, msg: dict[str, Any]) -> _Listener:
         listener_id = msg.get("listener_id")
@@ -315,7 +336,7 @@ class PcmWebSocketManager:
                 ):
                     self._listener_reservations.pop(reservation_key, None)
 
-            cleanup = self._attach_pending(entry_id, connection, cancel_pending,
+            cleanup, _ = self._attach_pending(entry_id, connection, cancel_pending,
                 station_id=station_id, identity=self._listener_identity(client.status, station_id))
             status = await client.refresh()
             if (not pending[0] or self._epochs.get(entry_id, 0) != epoch
@@ -478,13 +499,24 @@ class PcmWebSocketManager:
                 except TypeError:
                     # Legacy factories remain supported only for unbound PTT.
                     producer = self.producer_factory(client)
-            cleanup = self._attach_pending(entry_id, connection, cancel_start,
-                listener.listener_id if listener else None, producer=producer)
+            # Only listener binding constrains the producer's expected runtime.
+            # A direct request may select a new runtime in its first refresh;
+            # cached status is not a binding or an audio admission substitute.
+            cleanup, pending = self._attach_pending(entry_id, connection, cancel_start,
+                listener.listener_id if listener else None, station_id=station_id,
+                identity=listener.identity if listener else None, producer=producer,
+                request_runtime_id=listener.identity.runtime_id if listener else None,
+                request_generation=generation)
             try:
                 await producer.start()
+                owner = getattr(producer, "call_identity", None)
+                revoked = pending.revoked_identity
                 if (self._starting.get(entry_id) is not reservation or
                     self.hass.data.get(DOMAIN, {}).get(entry_id) is not client or
                     self._admission.get(entry_id) is not True or
+                    (revoked is not None and (owner is None or
+                        owner == (revoked.runtime_id, revoked.station_id, revoked.generation))) or
+                    not self._operation_allows_audio(getattr(client, "status", None)) or
                     (listener is not None and (self._listeners.get(listener.listener_id) is not listener
                         or listener.hub.closed or listener.connection is not connection))):
                     raise PcmProducerError("not_found")
@@ -617,6 +649,42 @@ class PcmWebSocketManager:
         """Release current ownership for hangup/reconcile without closing admission."""
         await self._stop_producers(self._invalidate_entry(entry_id))
 
+    async def release_call(self, entry_id: str, runtime_id: str,
+                           station_id: str, generation: int) -> None:
+        """Revoke only the exact native owner after accepted station hangup."""
+        identity = AudioIdentity(runtime_id, station_id, generation)
+        producers = []
+        for pending in tuple(self._pending_cleanups.values()):
+            if pending.entry_id != entry_id:
+                continue
+            owner = getattr(pending.producer, "call_identity", None)
+            # Once fresh admission chooses an owner it supersedes the request
+            # candidate, which may describe an older incoming runtime.
+            if owner is not None:
+                if owner == (runtime_id, station_id, generation):
+                    pending.revoke()
+            elif pending.identity == identity:
+                pending.revoke()
+            elif (pending.producer is not None
+                    and pending.request_runtime_id in (None, runtime_id)
+                    and pending.station_id in (None, station_id)
+                    and pending.request_generation in (None, generation)):
+                # An unbound first refresh can learn this owner after release.
+                # Keep one exact marker per pending request, never a global set.
+                # Two distinct relevant releases make only this request ambiguous.
+                if pending.revoked_identity not in (None, identity):
+                    pending.revoke()
+                else:
+                    pending.revoked_identity = identity
+        hub = self._hubs.get(entry_id)
+        if hub is not None and hub.identity == identity:
+            producers.extend(self._invalidate_hub(entry_id, hub))
+        capture = self._by_entry.get(entry_id)
+        if (capture is not None and capture.producer.call_identity ==
+                (runtime_id, station_id, generation)):
+            producers.extend(self._invalidate_capture(capture.capture_id))
+        await self._stop_producers(producers)
+
     async def close_entry(self, entry_id: str) -> None:
         """Close admission before teardown and invalidate all current ownership."""
         self._admission[entry_id] = False
@@ -634,6 +702,7 @@ class PcmWebSocketManager:
                     or call.get("session") != "talking"
                     or status.get("runtime_id") != identity[0]
                     or type(call.get("generation")) is not int or call.get("generation") != identity[2]
+                    or not self._operation_allows_audio(status)
                     or (identity[1] is not None and call.get("station_id") != identity[1])):
                     pending.revoke()
             elif pending.station_id is not None:
@@ -663,6 +732,7 @@ class PcmWebSocketManager:
             or (capture.station_id is not None and station_id != capture.station_id)
             or session != "talking"
             or (capture.runtime_id is not None and status.get("runtime_id") != capture.runtime_id)
+            or not self._operation_allows_audio(status)
         ):
             producers.extend(self._invalidate_capture(capture.capture_id))
         await self._stop_producers(producers)

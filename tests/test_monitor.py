@@ -7,6 +7,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from unittest.mock import AsyncMock
 
 
 ROOT = Path(__file__).parents[1]
@@ -44,6 +45,209 @@ class FakeClient:
 
 
 class MonitorCoordinatorTest(unittest.IsolatedAsyncioTestCase):
+    def operation_status(self, stage="calling", operation_id=3, **changes):
+        record = {"operation_id": operation_id, "station_id": "gate_main", "stage": stage,
+                  "media_generation": 9, "call_generation": 42,
+                  "timer": "none", "remaining_ms": 0, "error": "none", **changes}
+        return {"runtime_id": "0123456789abcdef", "station_call": record,
+                "call": {"station_id": "gate_main", "session": "idle" if stage in {"ended", "failed"} else "talking",
+                         "generation": 0 if stage in {"ended", "failed"} else 42},
+                "media": {"sessions": [{"station_id": "gate_main", "generation": 9,
+                                         "purpose": "call", "state": "publishing"}]}}
+
+    def call_client(self):
+        client = FakeClient()
+        client.status = {"runtime_id": "0123456789abcdef"}
+        client.call_station = AsyncMock(return_value={"runtime_id": "0123456789abcdef",
+            "station_id": "gate_main", "operation_id": 3, "generation": 9,
+            "state": "preparing", "queued": True})
+        client.hangup_station = AsyncMock(return_value={"queued": True, "state": "ending"})
+        return client
+
+    async def test_call_records_operation_and_hangup_preserves_ending(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        await coordinator.async_call()
+        self.assertEqual("calling", coordinator.call_state)
+        self.assertEqual((3, 9, 0), tuple(coordinator.snapshot[key] for key in
+                         ("operation_id", "media_generation", "call_generation")))
+        await coordinator.async_apply_call_status(self.operation_status("talking"))
+        await coordinator.async_hangup()
+        self.assertEqual("ending", coordinator.call_state)
+        self.assertEqual({"operation_id": 3, "generation": 9}, client.hangup_station.await_args.kwargs)
+        await coordinator.async_apply_call_status(self.operation_status("calling"))
+        self.assertEqual("ending", coordinator.call_state)
+        await coordinator.async_apply_call_status(self.operation_status("ended"))
+        self.assertEqual("ended", coordinator.call_state)
+
+    async def test_concurrent_call_deduplicates_first_request_without_preview_leases(self):
+        client = self.call_client()
+        entered, resume = asyncio.Event(), asyncio.Event()
+        reply = client.call_station.return_value
+        async def call_station(*args, **kwargs):
+            entered.set()
+            await resume.wait()
+            return reply
+        client.call_station.side_effect = call_station
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        first = asyncio.create_task(coordinator.async_call())
+        await entered.wait()
+        second = asyncio.create_task(coordinator.async_call())
+        await asyncio.sleep(0)
+        resume.set()
+        self.assertEqual([reply, reply], await asyncio.gather(first, second))
+        self.assertEqual(1, client.call_station.await_count)
+        self.assertEqual(0, coordinator.viewer_count)
+        self.assertEqual([], client.calls)
+
+    async def test_old_snapshot_and_old_operation_do_not_overwrite_new_admission(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        before = coordinator.call_request_epoch
+        await coordinator.async_call()
+        await coordinator.async_apply_call_status(self.operation_status("ended"), request_epoch=before)
+        self.assertEqual("calling", coordinator.call_state)
+        await coordinator.async_apply_call_status(self.operation_status("ended", operation_id=2))
+        self.assertEqual(3, coordinator.snapshot["operation_id"])
+        self.assertEqual("calling", coordinator.call_state)
+
+    async def test_errors_are_bounded_and_do_not_leak_transport_text(self):
+        client = self.call_client()
+        client.call_station.side_effect = RuntimeError("http://admin:secret/device")
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        with self.assertRaises(RuntimeError):
+            await coordinator.async_call()
+        self.assertEqual("unknown", coordinator.call_error)
+
+    async def test_incoming_hangup_omits_outbound_conditions_from_terminal_history(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        status = self.operation_status("ended", call_generation=41)
+        status["call"].update(session="talking", generation=42)
+        await coordinator.async_apply_call_status(status)
+        self.assertEqual("talking", coordinator.call_state)
+        await coordinator.async_hangup()
+        self.assertEqual({}, client.hangup_station.await_args.kwargs)
+
+    async def test_native_incoming_preview_and_ringing_publish_button_call_states(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        for stage in ("preview", "ringing"):
+            client.status = {"runtime_id": "0123456789abcdef",
+                "call": {"session": stage, "station_id": "gate_main", "generation": 42}}
+            await coordinator.async_apply_call_status(client.status)
+            self.assertEqual(stage, coordinator.snapshot["call_state"])
+            self.assertEqual(42, coordinator.snapshot["call_generation"])
+
+    async def test_real_poll_applies_global_call_even_when_media_revision_unchanged(self):
+        from custom_components.doorfast.setup_lifecycle import sync_monitor_state
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        await coordinator.async_call()
+        registry = types.SimpleNamespace(station_ids=("gate_main",), monitor=lambda station: coordinator)
+        provider = types.SimpleNamespace(async_reconcile_monitor=AsyncMock())
+        client.monitor_status = AsyncMock(return_value={"runtime_id": coordinator.runtime_id,
+            "status_revision": 5, "sessions": [{"station_id": "gate_main", "generation": 9,
+                "state": "publishing", "status_revision": 5}]})
+        for stage in ("calling", "talking", "ending", "ended"):
+            client.status = self.operation_status(stage)
+            await sync_monitor_state(client, registry, provider)
+            self.assertEqual(stage, coordinator.call_state)
+        self.assertEqual(5, coordinator.status_revision)
+
+    async def test_status_refresh_captured_before_new_call_does_not_clear_ownership(self):
+        from custom_components.doorfast.setup_lifecycle import sync_monitor_state
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        registry = types.SimpleNamespace(station_ids=("gate_main",), monitor=lambda station: coordinator)
+        provider = types.SimpleNamespace(async_reconcile_monitor=AsyncMock())
+        client.status = self.operation_status("ended")
+        client._status_control_epochs = {"gate_main": 0}
+        client.monitor_status = AsyncMock(return_value={"runtime_id": coordinator.runtime_id, "sessions": []})
+        await coordinator.async_call()
+        await sync_monitor_state(client, registry, provider)
+        self.assertEqual("calling", coordinator.call_state)
+
+    async def test_hangup_conflict_keeps_ownership_and_audio_and_uses_same_operation(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        release = AsyncMock()
+        coordinator.set_call_audio_release(release)
+        await coordinator.async_call()
+        client.status = self.operation_status("talking")
+        await coordinator.async_apply_call_status(client.status)
+        client.hangup_station.side_effect = ValueError("operation mismatch")
+        with self.assertRaises(ValueError):
+            await coordinator.async_hangup()
+        self.assertEqual(("talking", 3), (coordinator.call_state, coordinator.snapshot["operation_id"]))
+        self.assertEqual(0, release.await_count)
+        self.assertEqual({"operation_id": 3, "generation": 9}, client.hangup_station.await_args.kwargs)
+        client.hangup_station.side_effect = None
+        await coordinator.async_hangup()
+        self.assertEqual(("0123456789abcdef", "gate_main", 42), release.await_args.args)
+
+    async def test_new_runtime_discards_delayed_call_reply(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        reply = client.call_station.return_value
+        async def changed(*args):
+            client.status = {"runtime_id": "fedcba9876543210"}
+            return reply
+        client.call_station.side_effect = changed
+        with self.assertRaises(RuntimeError):
+            await coordinator.async_call()
+        self.assertEqual(0, coordinator.snapshot["operation_id"])
+
+    async def test_preparing_status_learns_authoritative_startup_timer(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        await coordinator.async_call()
+        await coordinator.async_apply_call_status(self.operation_status("preparing",
+            call_generation=0, timer="startup", remaining_ms=27000))
+        self.assertEqual(("startup", 27000, 0), tuple(coordinator.snapshot[key] for key in
+                         ("call_timer", "call_remaining_ms", "call_generation")))
+
+    async def test_poll_during_call_admission_cannot_terminalize_pending_request(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        reply = client.call_station.return_value
+        async def pending(*args):
+            await coordinator.async_apply_call_status(self.operation_status("ended"),
+                request_epoch=coordinator.call_request_epoch)
+            self.assertEqual("calling", coordinator.call_state)
+            return reply
+        client.call_station.side_effect = pending
+        await coordinator.async_call()
+
+    async def test_failed_new_call_does_not_reuse_old_operation_for_hangup(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        await coordinator.async_call()
+        await coordinator.async_apply_call_status(self.operation_status("ended"))
+        client.call_station.side_effect = RuntimeError("new request failed")
+        with self.assertRaises(RuntimeError):
+            await coordinator.async_call()
+        await coordinator.async_hangup()
+        self.assertEqual({}, client.hangup_station.await_args.kwargs)
+
+    async def test_legacy_idle_snapshot_after_accepted_call_clears_calling(self):
+        client = self.call_client()
+        client.call_station.return_value = {"queued": True}
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        await coordinator.async_call()
+        await coordinator.async_apply_call_status({"runtime_id": coordinator.runtime_id,
+            "call": {"session": "idle", "generation": 0}})
+        self.assertEqual("idle", coordinator.call_state)
+
+    async def test_operation_learned_from_poll_deduplicates_call(self):
+        client = self.call_client()
+        coordinator = MonitorCoordinator(client, "0123456789abcdef", "gate_main")
+        await coordinator.async_apply_call_status(self.operation_status("preparing", call_generation=0))
+        reply = await coordinator.async_call()
+        self.assertEqual(3, reply["operation_id"])
+        self.assertEqual(0, client.call_station.await_count)
+
+
     async def test_provisional_preview_lease_does_not_wait_for_ready(self):
         client = FakeClient()
         client.start_result = {"state": "requesting", "generation": 7}

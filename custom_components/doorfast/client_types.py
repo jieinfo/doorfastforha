@@ -82,6 +82,12 @@ class AudioIdentity:
             )
         ):
             raise AudioStreamError("audio_identity_mismatch")
+        # Import lazily: the reviewed parser also uses this module's station ID
+        # validator. Incoming calls without an operation retain legacy admission.
+        from .session_diagnostics import station_call_phase
+
+        if station_call_phase(status, requested_station) != "in_call":
+            raise AudioStreamError("audio_identity_mismatch")
         return cls(runtime_id, requested_station, generation)
 
 

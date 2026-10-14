@@ -21,6 +21,8 @@ async def sync_monitor_state(
     station_ids = getattr(monitor, "station_ids", None)
     monitor_for_station = getattr(monitor, "monitor", None)
     if station_ids is not None and callable(monitor_for_station):
+        call_snapshot = client.status
+        call_epochs = dict(getattr(client, "_status_control_epochs", {}))
         expected_runtime = client.status.get("runtime_id")
         before_poll = {
             current_station_id: (
@@ -78,6 +80,14 @@ async def sync_monitor_state(
         )
         for current_station_id in target_station_ids:
             coordinator = monitor_for_station(current_station_id)
+            apply_call_status = getattr(coordinator, "async_apply_call_status", None)
+            if callable(apply_call_status):
+                # Call ownership is global and must be consumed even when the
+                # per-station media revision is unchanged.
+                await apply_call_status(call_snapshot, request_epoch=(
+                    call_epochs.get(current_station_id, 0)
+                    if hasattr(client, "_status_control_epochs") else None
+                ))
             item = by_station.get(current_station_id)
             if item is None:
                 current_marker = (

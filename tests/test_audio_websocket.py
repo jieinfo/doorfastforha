@@ -146,6 +146,81 @@ class AudioWebsocketTest(unittest.IsolatedAsyncioTestCase):
             "pcm":base64.b64encode(b"\x01\x02").decode(),"discontinuity":False},self.connection.results[-1][1])
         self.assertFalse(self.client.opens)
 
+    async def test_station_release_requires_exact_runtime_station_and_control_generation(self):
+        lid = await self.listen()
+        await self.mic(lid)
+        for identity in ((RUNTIME, "gate_side", 7), (RUNTIME, "gate_main", 6),
+                         ("fedcba9876543210", "gate_main", 7)):
+            await self.manager.release_call("one", *identity)
+            self.assertIn(lid, self.manager._listeners)
+            self.assertIn("one", self.manager._by_entry)
+        await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+        self.assertNotIn(lid, self.manager._listeners)
+        self.assertNotIn("one", self.manager._by_entry)
+        self.assertEqual([(RUNTIME, 7)], self.client.ends)
+
+    async def test_same_operation_stale_stage_preserves_real_sensor_and_pcm_owner(self):
+        from tests.test_station_status_entities import sensor, station
+
+        def snapshot(stage, session="talking", runtime=RUNTIME, operation_id=3, generation=7):
+            data = status(runtime, generation)
+            data["call"]["session"] = session
+            data["station_call"] = {"operation_id": operation_id, "station_id": "gate_main",
+                "stage": stage, "media_generation": 9, "call_generation": generation,
+                "timer": "none" if stage in {"ended", "failed"} else "confirmation",
+                "remaining_ms": 0, "error": "none"}
+            data["media"] = {"status_revision": 5, "sessions": [{"station_id": "gate_main",
+                "generation": 9, "purpose": "call", "state": "publishing", "ready": True,
+                "source_live": False, "status_revision": 5}]}
+            return data
+
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        response = snapshot("talking")
+        async def request(*args, **kwargs): return response
+        client._request = request
+        client.pcm_session_open = self.client.pcm_session_open
+        client.pcm_session_end = self.client.pcm_session_end
+        await client.refresh()
+        self.hass.data["doorfast"]["one"] = client
+        lid = await self.listen()
+        await self.mic(lid)
+        self.assertFalse(self.connection.errors)
+        capture = self.manager._by_entry["one"]
+        entity = sensor.DoorfastPreviewStatus(client, "one", station())
+        self.assertEqual("in_call", entity.native_value)
+        for stage in ("preparing", "calling"):
+            response = snapshot(stage, "preview")
+            if stage == "calling":
+                response["media"]["status_revision"] = 4
+                response["media"]["sessions"][0]["status_revision"] = 4
+            await client.refresh()
+            await self.manager.reconcile("one", client.status)
+            self.assertIn(lid, self.manager._listeners)
+            self.assertIs(capture, self.manager._by_entry["one"])
+            self.assertEqual("in_call", entity.native_value)
+            self.assertEqual(5, client.status["media"]["status_revision"])
+        # Call progress is independent of unchanged media revision.
+        response = snapshot("ending", "ending")
+        await client.refresh()
+        self.assertEqual("stopping", entity.native_value)
+        response = snapshot("ended", "idle")
+        await client.refresh()
+        await self.manager.reconcile("one", client.status)
+        self.assertNotIn(lid, self.manager._listeners)
+        self.assertNotIn("one", self.manager._by_entry)
+        # Terminal operation history must still allow a new native incoming call.
+        response = snapshot("ended", generation=8)
+        response["station_call"]["call_generation"] = 7
+        await client.refresh()
+        self.assertEqual("in_call", entity.native_value)
+        response = snapshot("preparing", "idle", operation_id=4)
+        await client.refresh()
+        self.assertEqual("calling", entity.native_value)
+        response = snapshot("preparing", "idle", runtime="fedcba9876543210", operation_id=1)
+        await client.refresh()
+        self.assertEqual("fedcba9876543210", client.status["runtime_id"])
+        self.assertEqual("calling", entity.native_value)
+
     async def test_admin_and_entry_connection_ownership(self):
         other=SubConnection(False)
         await self.manager.listen_start(other,{"id":1,"config_entry_id":"one","station_id":"gate_main"})

@@ -17,6 +17,11 @@ from unittest.mock import patch
 # Reuse only the existing dependency stubs, not its decoder or client fixtures.
 import test_audio_client  # noqa: F401
 
+# Both unittest discovery and qualified module selections share this fixture.
+# Loading it twice would replace the synthetic package's exception classes.
+sys.modules.setdefault("test_audio_contract", sys.modules[__name__])
+sys.modules.setdefault("tests.test_audio_contract", sys.modules[__name__])
+
 
 COMPONENT = Path(__file__).parents[1] / "custom_components" / "doorfast"
 PACKAGE = "_doorfast_audio_contract"
@@ -37,6 +42,7 @@ for dependency in ("const", "generation", "client_types", "audio", "pcm"):
     load(dependency)
 client_module = load("client")
 ws = load("websocket")
+monitor_module = load("monitor")
 AudioStreamError = sys.modules[f"{PACKAGE}.client_types"].AudioStreamError
 RUNTIME = "0123456789abcdef"
 REBOOT_RUNTIME = "fedcba9876543210"
@@ -51,6 +57,53 @@ def status(runtime=RUNTIME):
         "audio": {"pcm_stream_version": 1},
         "audio_tx": {"active": True, "generation": 7},
     }
+
+
+def outbound_status():
+    return {**status(),
+        "station_call": {"operation_id": 3, "station_id": "gate_main", "stage": "talking",
+                         "media_generation": 9, "call_generation": 7,
+                         "timer": "session", "remaining_ms": 12000, "error": "none"},
+        "media": {"available": True, "sessions": [
+            {"station_id": "gate_main", "generation": 9, "purpose": "call",
+             "state": "viewing", "ready": True, "source_live": True}]},
+    }
+
+
+def inadmissible_statuses():
+    # Each mutation breaks a distinct authoritative fact, never DSP/PCM details.
+    cases = []
+    for field, value in (("call_generation", 8), ("media_generation", 10),
+                         ("station_id", "gate_side"), ("operation_id", True),
+                         ("remaining_ms", 1 << 64), ("error", "raw secret"),
+                         ("stage", "calling"), ("stage", "preparing"), ("stage", "ending")):
+        sample = outbound_status()
+        sample["station_call"][field] = value
+        cases.append((field + str(value), sample))
+    for field, value in (("session", "idle"), ("generation", 0), ("station_id", "gate_side")):
+        sample = outbound_status()
+        sample["call"][field] = value
+        cases.append((field + str(value), sample))
+    for value in (None, {}, "queued"):
+        sample = outbound_status()
+        sample["station_call"] = value
+        cases.append(("malformed" + str(value), sample))
+    for field, value in (("generation", 10), ("purpose", "preview"), ("state", "idle")):
+        sample = outbound_status()
+        sample["media"]["sessions"][0][field] = value
+        cases.append(("media" + field, sample))
+    sample = outbound_status()
+    sample["media"]["sessions"] *= 2
+    cases.append(("ambiguous media", sample))
+    sample = outbound_status()
+    sample["media"]["available"] = False
+    cases.append(("unavailable media", sample))
+    sample = outbound_status()
+    sample.pop("station_call")
+    sample["call"].update(session="idle", generation=0)
+    sample["queued"] = True
+    cases.append(("legacy purpose-only ready queued idle", sample))
+    return cases
 
 
 def identity_headers(runtime=RUNTIME):
@@ -228,6 +281,717 @@ class AudioContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, self.manager._pending_cleanups)
         self.assertTrue(all(timer.cancelled for timer in self.timers))
         self.assertTrue(all(not connection.subscriptions for connection in self.connections))
+
+    def call_coordinator(self):
+        coordinator = monitor_module.MonitorCoordinator(self.client, RUNTIME, "gate_main")
+        coordinator.set_call_audio_release(
+            lambda runtime, station, generation: self.manager.release_call("one", runtime, station, generation))
+        request = self.http.request
+        self.control_requests = []
+
+        def control_request(method, url, **kwargs):
+            if url.endswith(("/api/v1/call", "/api/v1/hangup")):
+                self.control_requests.append((url.rsplit("/", 1)[-1], kwargs["json"]))
+                return Response(payload={"runtime_id": RUNTIME, "station_id": "gate_main",
+                    "operation_id": 3, "generation": 9, "queued": True,
+                    "state": "ending" if url.endswith("hangup") else "preparing"})
+            return request(method, url, **kwargs)
+
+        self.http.request = control_request
+        return coordinator
+
+    async def test_hangup_releases_audio_self_refreshed_before_coordinator_poll(self):
+        self.client.status = {"runtime_id": RUNTIME, "call": {"session": "idle", "generation": 0}}
+        coordinator = self.call_coordinator()
+        await coordinator.async_call()
+        self.http.current_status = outbound_status()
+        connection = self.connections[0]
+        listener_id = await self.listen(connection)
+        await self.manager.start(connection, {"id": 3, "config_entry_id": "one", "listener_id": listener_id})
+        self.assertEqual("active", connection.results[-1]["state"])
+        self.assertEqual(0, coordinator._native_generation)
+        self.assertEqual(7, self.client.status["call"]["generation"])
+        await coordinator.async_hangup()
+        self.assertEqual(("hangup", {"runtime_id": RUNTIME, "station_id": "gate_main",
+            "operation_id": 3, "generation": 9}), self.control_requests[-1])
+        self.assertEqual("ending", coordinator.call_state)
+        self.assert_released()
+        self.assertEqual(["session", "end"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+        self.assertEqual("talking", self.client.status["call"]["session"])
+
+    async def test_hangup_revokes_initial_refresh_and_open_even_if_same_identity_returns(self):
+        for boundary in ("refresh", "open"):
+            for explicit in (False, True):
+                with self.subTest(boundary=boundary, explicit=explicit):
+                    self.http.request = HttpBoundary.request.__get__(self.http)
+                    self.http.producer_requests.clear()
+                    self.client.status = self.http.current_status = outbound_status()
+                    coordinator = self.call_coordinator()
+                    await coordinator.async_apply_call_status(self.client.status)
+                    entered, resume = asyncio.Event(), asyncio.Event()
+                    request = self.http.request
+
+                    class GatedResponse(Response):
+                        async def __aenter__(response):
+                            entered.set()
+                            await resume.wait()
+                            return response
+
+                    def gated_request(method, url, **kwargs):
+                        response = request(method, url, **kwargs)
+                        if url.endswith("/status" if boundary == "refresh" else "/audio/session"):
+                            return GatedResponse(payload=response.payload)
+                        return response
+
+                    self.http.request = gated_request
+                    connection = Connection()
+                    msg = {"id": 1, "config_entry_id": "one"}
+                    if explicit:
+                        msg.update(station_id="gate_main", generation=7)
+                    opening = asyncio.create_task(self.manager.start(connection, msg))
+                    try:
+                        await entered.wait()
+                        pending = next(iter(self.manager._pending_cleanups.values()))
+                        if boundary == "refresh":
+                            self.assertIsNone(pending.producer.call_identity)
+                        await coordinator.async_hangup()
+                        # This remains real cached TALKING. No fake terminal native
+                        # state may be used to prevent this reservation's revival.
+                        self.assertEqual("talking", self.client.status["call"]["session"])
+                        if boundary == "open":
+                            self.assertEqual({}, self.manager._starting)
+                            self.assertEqual({}, self.manager._pending_cleanups)
+                        else:
+                            # Even explicit station/generation has no runtime
+                            # binding. Compare its marker after fresh selection.
+                            self.assertEqual(1, len(self.manager._starting))
+                            self.assertEqual(1, len(self.manager._pending_cleanups))
+                        self.client.status = self.http.current_status = outbound_status()
+                        resume.set()
+                        await opening
+                        self.assertEqual([], connection.results)
+                        self.assertEqual(["not_found"], [error.code for error in connection.errors])
+                        self.assert_released()
+                        self.assertEqual(["session", "end"], [
+                            url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                    finally:
+                        resume.set()
+                        await opening
+                        self.http.request = request
+                        await self.manager.release_entry("one")
+
+    async def test_exact_release_preserves_new_owner_chosen_after_cached_candidate(self):
+        for changed in ("runtime", "station", "control"):
+            with self.subTest(changed=changed):
+                self.client.status = outbound_status()
+                sample = status(REBOOT_RUNTIME if changed == "runtime" else RUNTIME)
+                if changed == "station":
+                    sample["call"]["station_id"] = "gate_side"
+                if changed == "control":
+                    sample["call"]["generation"] = sample["audio_tx"]["generation"] = 8
+                self.http.current_status = sample
+                entered, resume = asyncio.Event(), asyncio.Event()
+                request = self.http.request
+
+                class GatedOpen(Response):
+                    async def __aenter__(response):
+                        entered.set()
+                        await resume.wait()
+                        return response
+
+                def gated_request(method, url, **kwargs):
+                    response = request(method, url, **kwargs)
+                    return GatedOpen(payload=response.payload) if url.endswith("/audio/session") else response
+
+                self.http.request = gated_request
+                connection = Connection()
+                opening = asyncio.create_task(self.manager.start(connection, {"id": 1, "config_entry_id": "one"}))
+                try:
+                    await entered.wait()
+                    pending = next(iter(self.manager._pending_cleanups.values()))
+                    owner = (sample["runtime_id"], sample["call"]["station_id"], sample["call"]["generation"])
+                    self.assertEqual(owner, pending.producer.call_identity)
+                    await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+                    self.assertEqual(1, len(self.manager._starting))
+                    self.assertEqual(1, len(self.manager._pending_cleanups))
+                    resume.set()
+                    await opening
+                    self.assertEqual([], connection.errors)
+                    capture = self.manager._by_entry["one"]
+                    self.assertEqual(owner, capture.producer.call_identity)
+                    self.assertEqual("active", connection.results[-1]["state"])
+                    self.assertEqual(["session"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                finally:
+                    resume.set()
+                    await opening
+                    self.http.request = request
+                    await self.manager.release_entry("one")
+                    self.http.producer_requests.clear()
+
+    async def test_exact_release_preserves_unrelated_request_during_initial_refresh(self):
+        for changed in ("runtime", "station", "control"):
+            with self.subTest(changed=changed):
+                sample = status(REBOOT_RUNTIME if changed == "runtime" else RUNTIME)
+                if changed == "station":
+                    sample["call"]["station_id"] = "gate_side"
+                if changed == "control":
+                    sample["call"]["generation"] = sample["audio_tx"]["generation"] = 8
+                # Explicit request identity takes precedence over cached native
+                # station/generation, even before its first refresh completes.
+                self.client.status = status(sample["runtime_id"])
+                self.http.current_status = sample
+                entered, resume = asyncio.Event(), asyncio.Event()
+                request = self.http.request
+
+                class GatedRefresh(Response):
+                    async def __aenter__(response):
+                        entered.set()
+                        await resume.wait()
+                        return response
+
+                def gated_request(method, url, **kwargs):
+                    response = request(method, url, **kwargs)
+                    return GatedRefresh(payload=response.payload) if url.endswith("/status") else response
+
+                self.http.request = gated_request
+                connection = Connection()
+                opening = asyncio.create_task(self.manager.start(connection, {"id": 1, "config_entry_id": "one",
+                    "station_id": sample["call"]["station_id"], "generation": sample["call"]["generation"]}))
+                try:
+                    await entered.wait()
+                    pending = next(iter(self.manager._pending_cleanups.values()))
+                    self.assertIsNone(pending.producer.call_identity)
+                    await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+                    self.assertEqual(1, len(self.manager._starting))
+                    self.assertEqual(1, len(self.manager._pending_cleanups))
+                    resume.set()
+                    await opening
+                    self.assertEqual([], connection.errors)
+                    self.assertEqual((sample["runtime_id"], sample["call"]["station_id"], sample["call"]["generation"]),
+                        self.manager._by_entry["one"].producer.call_identity)
+                    self.assertEqual(["session"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                finally:
+                    resume.set()
+                    await opening
+                    self.http.request = request
+                    await self.manager.release_entry("one")
+                    self.http.producer_requests.clear()
+
+    async def test_delayed_accepted_hangup_preserves_new_incoming_audio_owner(self):
+        for changed in ("station", "control"):
+            with self.subTest(changed=changed):
+                self.http.request = HttpBoundary.request.__get__(self.http)
+                self.client.status = self.http.current_status = outbound_status()
+                coordinator = self.call_coordinator()
+                await coordinator.async_apply_call_status(self.client.status)
+                entered, resume = asyncio.Event(), asyncio.Event()
+                request = self.http.request
+
+                class GatedHangup(Response):
+                    async def __aenter__(response):
+                        entered.set()
+                        await resume.wait()
+                        return response
+
+                def gated_request(method, url, **kwargs):
+                    response = request(method, url, **kwargs)
+                    return GatedHangup(payload=response.payload) if url.endswith("/hangup") else response
+
+                self.http.request = gated_request
+                hanging = asyncio.create_task(coordinator.async_hangup())
+                try:
+                    await entered.wait()
+                    sample = status()
+                    if changed == "station":
+                        sample["call"]["station_id"] = "gate_side"
+                    else:
+                        sample["call"]["generation"] = sample["audio_tx"]["generation"] = 8
+                    self.client.status = self.http.current_status = sample
+                    connection = Connection()
+                    await self.manager.listen_start(connection, {"id": 1, "config_entry_id": "one",
+                        "station_id": sample["call"]["station_id"], "generation": sample["call"]["generation"]})
+                    listener_id = connection.results[-1]["listener_id"]
+                    await self.manager.start(connection, {"id": 2, "config_entry_id": "one", "listener_id": listener_id})
+                    capture = self.manager._by_entry["one"]
+                    hub = self.manager._hubs["one"]
+                    resume.set()
+                    await hanging
+                    self.assertEqual("ending", coordinator.call_state)
+                    self.assertEqual([], connection.errors)
+                    self.assertIs(hub, self.manager._hubs["one"])
+                    self.assertIn(listener_id, self.manager._listeners)
+                    self.assertIs(capture, self.manager._by_entry["one"])
+                    self.assertEqual("active", capture.producer.state.value)
+                    self.assertEqual(["session"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                finally:
+                    resume.set()
+                    await hanging
+                    self.http.request = request
+                    await self.manager.release_entry("one")
+                    self.http.producer_requests.clear()
+
+    async def test_rejected_http_hangup_preserves_existing_listener_and_microphone(self):
+        self.client.status = self.http.current_status = outbound_status()
+        coordinator = self.call_coordinator()
+        await coordinator.async_apply_call_status(self.client.status)
+        connection = self.connections[0]
+        listener_id = await self.listen(connection)
+        await self.manager.start(connection, {"id": 2, "config_entry_id": "one", "listener_id": listener_id})
+        request = self.http.request
+
+        def rejecting_request(method, url, **kwargs):
+            if url.endswith("/hangup"):
+                return Response(code=409, payload={"error": {"code": "operation_mismatch", "message": "synthetic"}})
+            return request(method, url, **kwargs)
+
+        self.http.request = rejecting_request
+        with self.assertRaises(client_module.DoorfastTransportError):
+            await coordinator.async_hangup()
+        self.assertEqual("talking", coordinator.call_state)
+        self.assertIn(listener_id, self.manager._listeners)
+        self.assertEqual("active", self.manager._by_entry["one"].producer.state.value)
+        self.assertEqual(["session"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+
+    async def test_cached_idle_start_without_generation_cannot_publish_after_exact_hangup(self):
+        self.client.status = {"runtime_id": RUNTIME, "call": {"session": "idle", "generation": 0}}
+        coordinator = self.call_coordinator()
+        await coordinator.async_call()
+        self.http.current_status = outbound_status()
+        entered, resume = asyncio.Event(), asyncio.Event()
+        request = self.http.request
+        gated = False
+
+        class GatedRefresh(Response):
+            async def __aenter__(response):
+                entered.set()
+                await resume.wait()
+                return response
+
+        def gated_request(method, url, **kwargs):
+            nonlocal gated
+            response = request(method, url, **kwargs)
+            if url.endswith("/status") and not gated:
+                gated = True
+                return GatedRefresh(payload=response.payload)
+            return response
+
+        self.http.request = gated_request
+        connection = Connection()
+        opening = asyncio.create_task(self.manager.start(connection, {
+            "id": 1, "config_entry_id": "one", "station_id": "gate_main"}))
+        try:
+            await entered.wait()
+            # An independent real listener learns TALKING before the coordinator.
+            await self.listen(self.connections[0])
+            self.assertEqual(0, coordinator._native_generation)
+            await coordinator.async_hangup()
+            # Repeating this exact release and restoring the same native sample
+            # cannot revive the reservation once its fresh identity arrives.
+            await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+            await self.client.refresh()
+            resume.set()
+            await opening
+            self.assertEqual([], connection.results)
+            self.assertEqual(["not_found"], [error.code for error in connection.errors])
+            self.assert_released()
+            self.assertEqual(["session", "end"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+            self.assertEqual("talking", self.client.status["call"]["session"])
+        finally:
+            resume.set()
+            await opening
+
+    async def test_second_related_release_revokes_only_ambiguous_pending_request(self):
+        self.client.status = {"runtime_id": RUNTIME, "call": {"session": "idle", "generation": 0}}
+        self.http.current_status = outbound_status()
+        entered, resume = asyncio.Event(), asyncio.Event()
+        request = self.http.request
+        gated = False
+
+        class GatedRefresh(Response):
+            async def __aenter__(response):
+                entered.set()
+                await resume.wait()
+                return response
+
+        def gated_request(method, url, **kwargs):
+            nonlocal gated
+            response = request(method, url, **kwargs)
+            if url.endswith("/status") and not gated:
+                gated = True
+                return GatedRefresh(payload=response.payload)
+            return response
+
+        self.http.request = gated_request
+        connection = Connection()
+        opening = asyncio.create_task(self.manager.start(connection, {
+            "id": 1, "config_entry_id": "one", "station_id": "gate_main"}))
+        try:
+            await entered.wait()
+            sample = status()
+            sample["call"].update(station_id="gate_side", generation=8)
+            sample["audio_tx"]["generation"] = 8
+            self.http.current_status = sample
+            listener = self.connections[0]
+            await self.manager.listen_start(listener, {"id": 2, "config_entry_id": "one",
+                "station_id": "gate_side", "generation": 8})
+            listener_id = listener.results[-1]["listener_id"]
+            hub = self.manager._hubs["one"]
+            await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+            await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+            await self.manager.release_call("one", RUNTIME, "gate_other", 8)
+            self.assertEqual(1, len(self.manager._starting))
+            self.assertEqual(1, len(self.manager._pending_cleanups))
+            # This direct request has no expected runtime. B is another
+            # relevant release, not an incompatible cached-runtime identity.
+            await self.manager.release_call("one", REBOOT_RUNTIME, "gate_main", 8)
+            self.assertEqual({}, self.manager._starting)
+            self.assertEqual({}, self.manager._pending_cleanups)
+            self.assertIs(hub, self.manager._hubs["one"])
+            self.assertIn(listener_id, self.manager._listeners)
+            resume.set()
+            await opening
+            self.assertEqual([], connection.results)
+            self.assertEqual(["not_found"], [error.code for error in connection.errors])
+            self.assertIs(hub, self.manager._hubs["one"])
+            self.assertEqual(["session", "end"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+        finally:
+            resume.set()
+            await opening
+
+    async def test_direct_initial_refresh_selects_new_runtime_after_cached_runtime_hangup(self):
+        self.client.status = self.http.current_status = outbound_status()
+        coordinator = self.call_coordinator()
+        await coordinator.async_apply_call_status(self.client.status)
+        entered, resume = asyncio.Event(), asyncio.Event()
+        request = self.http.request
+
+        class GatedRefresh(Response):
+            async def __aenter__(response):
+                entered.set()
+                await resume.wait()
+                return response
+
+        def gated_request(method, url, **kwargs):
+            if url.endswith("/status"):
+                return GatedRefresh(payload=status(REBOOT_RUNTIME))
+            return request(method, url, **kwargs)
+
+        self.http.request = gated_request
+        connection = Connection()
+        opening = asyncio.create_task(self.manager.start(connection, {
+            "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7}))
+        try:
+            await entered.wait()
+            pending = next(iter(self.manager._pending_cleanups.values()))
+            self.assertIsNone(pending.producer.call_identity)
+            await coordinator.async_hangup()
+            self.assertEqual("ending", coordinator.call_state)
+            resume.set()
+            await opening
+            self.assertEqual([], connection.errors)
+            self.assertEqual("active", connection.results[-1]["state"])
+            self.assertIsNone(pending.request_runtime_id)
+            self.assertIsNone(pending.identity)
+            self.assertEqual(ws.AudioIdentity(RUNTIME, "gate_main", 7), pending.revoked_identity)
+            capture = self.manager._by_entry["one"]
+            self.assertEqual((REBOOT_RUNTIME, "gate_main", 7), capture.producer.call_identity)
+            await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+            self.assertIs(capture, self.manager._by_entry["one"])
+            self.assertEqual([("session", {"runtime": REBOOT_RUNTIME, "generation": "7"})],
+                [(url.rsplit("/", 1)[-1], params) for url, params in self.http.producer_requests])
+        finally:
+            resume.set()
+            await opening
+
+    async def test_listener_bound_runtime_ignores_other_runtime_release_during_refresh(self):
+        connection = self.connections[0]
+        listener_id = await self.listen(connection)
+        hub = self.manager._hubs["one"]
+        entered, resume = asyncio.Event(), asyncio.Event()
+        request = self.http.request
+
+        class GatedRefresh(Response):
+            async def __aenter__(response):
+                entered.set()
+                await resume.wait()
+                return response
+
+        def gated_request(method, url, **kwargs):
+            response = request(method, url, **kwargs)
+            return GatedRefresh(payload=response.payload) if url.endswith("/status") else response
+
+        self.http.request = gated_request
+        opening = asyncio.create_task(self.manager.start(connection, {
+            "id": 2, "config_entry_id": "one", "listener_id": listener_id}))
+        try:
+            await entered.wait()
+            pending = next(iter(self.manager._pending_cleanups.values()))
+            self.assertIsNone(pending.producer.call_identity)
+            self.assertEqual(RUNTIME, pending.request_runtime_id)
+            self.assertEqual(RUNTIME, pending.producer._expected_runtime_id)
+            await self.manager.release_call("one", REBOOT_RUNTIME, "gate_main", 7)
+            await self.manager.release_call("one", REBOOT_RUNTIME, "gate_main", 8)
+            self.assertIsNone(pending.revoked_identity)
+            self.assertEqual(1, len(self.manager._starting))
+            self.assertEqual(1, len(self.manager._pending_cleanups))
+            resume.set()
+            await opening
+            self.assertEqual([], connection.errors)
+            self.assertEqual("active", connection.results[-1]["state"])
+            self.assertEqual((RUNTIME, "gate_main", 7), self.manager._by_entry["one"].producer.call_identity)
+            self.assertIs(hub, self.manager._hubs["one"])
+            self.assertIn(listener_id, self.manager._listeners)
+            self.assertEqual(["session"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+        finally:
+            resume.set()
+            await opening
+
+    async def test_listener_bound_exact_runtime_release_immediately_revokes_pending_refresh(self):
+        connection = self.connections[0]
+        listener_id = await self.listen(connection)
+        entered, resume = asyncio.Event(), asyncio.Event()
+        request = self.http.request
+
+        class GatedRefresh(Response):
+            async def __aenter__(response):
+                entered.set()
+                await resume.wait()
+                return response
+
+        def gated_request(method, url, **kwargs):
+            response = request(method, url, **kwargs)
+            return GatedRefresh(payload=response.payload) if url.endswith("/status") else response
+
+        self.http.request = gated_request
+        opening = asyncio.create_task(self.manager.start(connection, {
+            "id": 2, "config_entry_id": "one", "listener_id": listener_id}))
+        try:
+            await entered.wait()
+            pending = next(iter(self.manager._pending_cleanups.values()))
+            self.assertIsNone(pending.producer.call_identity)
+            await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+            self.assertEqual({}, self.manager._starting)
+            self.assertEqual({}, self.manager._pending_cleanups)
+            self.assertEqual({}, self.manager._listeners)
+            resume.set()
+            await opening
+            self.assertEqual(1, len(connection.results))  # Only the original listener result.
+            self.assertEqual(["not_found"], [error.code for error in connection.errors])
+            self.assert_released()
+            self.assertEqual(["session", "end"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+        finally:
+            resume.set()
+            await opening
+
+    async def test_one_exact_pending_marker_preserves_a_different_fresh_owner(self):
+        for changed in ("runtime", "station", "control"):
+            with self.subTest(changed=changed):
+                self.client.status = {"runtime_id": RUNTIME, "call": {"session": "idle", "generation": 0}}
+                sample = status(REBOOT_RUNTIME if changed == "runtime" else RUNTIME)
+                if changed == "station":
+                    sample["call"]["station_id"] = "gate_side"
+                if changed == "control":
+                    sample["call"]["generation"] = sample["audio_tx"]["generation"] = 8
+                self.http.current_status = sample
+                entered, resume = asyncio.Event(), asyncio.Event()
+                request = self.http.request
+
+                class GatedRefresh(Response):
+                    async def __aenter__(response):
+                        entered.set()
+                        await resume.wait()
+                        return response
+
+                def gated_request(method, url, **kwargs):
+                    response = request(method, url, **kwargs)
+                    return GatedRefresh(payload=response.payload) if url.endswith("/status") else response
+
+                self.http.request = gated_request
+                connection = Connection()
+                opening = asyncio.create_task(self.manager.start(connection, {"id": 1, "config_entry_id": "one"}))
+                try:
+                    await entered.wait()
+                    pending = next(iter(self.manager._pending_cleanups.values()))
+                    await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+                    await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+                    self.assertEqual(ws.AudioIdentity(RUNTIME, "gate_main", 7), pending.revoked_identity)
+                    self.assertEqual(1, len(self.manager._starting))
+                    resume.set()
+                    await opening
+                    self.assertEqual([], connection.errors)
+                    capture = self.manager._by_entry["one"]
+                    self.assertEqual((sample["runtime_id"], sample["call"]["station_id"], sample["call"]["generation"]),
+                        capture.producer.call_identity)
+                    await self.manager.release_call("one", RUNTIME, "gate_main", 7)
+                    self.assertIs(capture, self.manager._by_entry["one"])
+                    self.assertEqual("active", capture.producer.state.value)
+                    self.assertEqual({}, self.manager._pending_cleanups)
+                    self.assertEqual(["session"], [url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                finally:
+                    resume.set()
+                    await opening
+                    self.http.request = request
+                    await self.manager.release_entry("one")
+                    self.http.producer_requests.clear()
+
+    async def test_outbound_identity_conflicts_cannot_admit_listener_or_microphone(self):
+        for name, sample in inadmissible_statuses():
+            with self.subTest(case=name):
+                self.http.current_status = sample
+                self.client.status = sample
+                listener, microphone = Connection(), Connection()
+                try:
+                    await self.manager.listen_start(listener, {
+                        "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7})
+                    await self.manager.start(microphone, {
+                        "id": 2, "config_entry_id": "one", "station_id": "gate_main", "generation": 7})
+                    self.assertEqual([], listener.results)
+                    self.assertEqual(["audio_identity_mismatch"], [error.code for error in listener.errors])
+                    self.assertEqual([], microphone.results)
+                    self.assertTrue(microphone.errors)
+                    self.assertEqual([], self.http.producer_requests)
+                    self.assert_released()
+                finally:
+                    await self.manager.release_entry("one")
+                    self.http.producer_requests.clear()
+
+    async def test_matched_outbound_and_new_incoming_ignore_terminal_history(self):
+        samples = [outbound_status(), status()]
+        for stage in ("ended", "failed"):
+            for station in ("gate_main", "gate_side"):
+                sample = outbound_status()
+                sample["station_call"].update(stage=stage, station_id=station,
+                    call_generation=6, media_generation=8, timer="none", remaining_ms=0)
+                sample.pop("media")
+                samples.append(sample)
+        for sample in samples:
+            with self.subTest(operation=sample.get("station_call")):
+                self.http.current_status = sample
+                self.client.status = sample
+                connection = Connection()
+                listener_id = await self.listen(connection)
+                await self.manager.start(connection, {
+                    "id": 3, "config_entry_id": "one", "listener_id": listener_id})
+                self.assertEqual([], connection.errors)
+                self.assertEqual("active", connection.results[-1]["state"])
+                self.assertEqual("7", self.http.producer_requests[-1][1]["generation"])
+                await self.manager.release_entry("one")
+                self.assert_released()
+
+    async def test_real_microphone_rejects_mapping_conflict_before_session_open(self):
+        sample = outbound_status()
+        sample["station_call"]["call_generation"] = 8
+        self.http.current_status = sample
+        self.client.status = sample
+        connection = Connection()
+        await self.manager.start(connection, {
+            "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7})
+        self.assertEqual([], connection.results)
+        self.assertEqual(["status_not_ready"], [error.code for error in connection.errors])
+        self.assertEqual([], self.http.producer_requests)
+        self.assert_released()
+
+    async def test_operation_conflict_during_real_open_cannot_publish_microphone(self):
+        for conflict in ("malformed", "control", "media"):
+            for reconcile in (False, True):
+                with self.subTest(conflict=conflict, reconcile=reconcile):
+                    initial = outbound_status()
+                    self.http.current_status = initial
+                    self.client.status = initial
+                    entered, resume = asyncio.Event(), asyncio.Event()
+                    request = self.http.request
+
+                    class GatedOpen(Response):
+                        async def __aenter__(response):
+                            entered.set()
+                            await resume.wait()
+                            return response
+
+                    def gated_request(method, url, **kwargs):
+                        response = request(method, url, **kwargs)
+                        if url.endswith("/audio/session"):
+                            return GatedOpen(payload=response.payload)
+                        return response
+
+                    self.http.request = gated_request
+                    connection = Connection()
+                    opening = asyncio.create_task(self.manager.start(connection, {
+                        "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7}))
+                    try:
+                        await entered.wait()
+                        sample = outbound_status()
+                        if conflict == "malformed":
+                            sample["station_call"] = {}
+                        else:
+                            sample["station_call"]["call_generation" if conflict == "control" else "media_generation"] += 1
+                        self.http.current_status = sample
+                        self.client.status = sample
+                        if reconcile:
+                            await self.manager.reconcile("one", sample)
+                            self.assertEqual({}, self.manager._starting)
+                            self.assertEqual({}, self.manager._pending_cleanups)
+                            # A revoked start cannot revive if another poll
+                            # restores admission before the old open completes.
+                            self.client.status = initial
+                            self.http.current_status = initial
+                        resume.set()
+                        await opening
+                        self.assertEqual([], connection.results)
+                        self.assertTrue(connection.errors)
+                        self.assert_released()
+                        self.assertEqual(["session", "end"], [
+                            url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                    finally:
+                        resume.set()
+                        await opening
+                        self.http.request = request
+                        await self.manager.release_entry("one")
+                        self.http.producer_requests.clear()
+
+    async def test_direct_microphone_reconcile_revokes_observed_operation_conflict(self):
+        for conflict in ("malformed", "control", "media"):
+            with self.subTest(conflict=conflict):
+                initial = outbound_status()
+                self.http.current_status = initial
+                self.client.status = initial
+                connection = Connection()
+                await self.manager.start(connection, {
+                    "id": 1, "config_entry_id": "one", "station_id": "gate_main", "generation": 7})
+                self.assertEqual("active", connection.results[-1]["state"])
+                capture = self.manager._by_entry["one"]
+                sample = outbound_status()
+                if conflict == "malformed":
+                    sample["station_call"] = {}
+                else:
+                    sample["station_call"]["call_generation" if conflict == "control" else "media_generation"] += 1
+                try:
+                    self.client.status = sample
+                    await self.manager.reconcile("one", sample)
+                    self.assert_released()
+                    self.assertEqual("idle", capture.producer.state.value)
+                    self.assertEqual(["session", "end"], [
+                        url.rsplit("/", 1)[-1] for url, _ in self.http.producer_requests])
+                finally:
+                    await self.manager.release_entry("one")
+                    self.http.producer_requests.clear()
+
+    def test_audio_identity_keeps_control_and_media_namespaces_distinct(self):
+        identity_type = sys.modules[f"{PACKAGE}.client_types"].AudioIdentity
+        self.assertEqual(identity_type(RUNTIME, "gate_main", 7),
+                         identity_type.from_status(outbound_status(), "gate_main", 7))
+        for field, value in (("call_generation", 9), ("media_generation", 7),
+                             ("operation_id", False), ("stage", "queued")):
+            sample = outbound_status()
+            sample["station_call"][field] = value
+            with self.subTest(field=field, value=value):
+                with self.assertRaisesRegex(AudioStreamError, "audio_identity_mismatch"):
+                    identity_type.from_status(sample, "gate_main", 7)
+        incoming = outbound_status()
+        incoming["station_call"].update(stage="ended", call_generation=6,
+            media_generation=8, timer="none", remaining_ms=0)
+        incoming.pop("media")
+        self.assertEqual(identity_type(RUNTIME, "gate_main", 7),
+                         identity_type.from_status(incoming, "gate_main", 7))
 
     async def test_http_stream_resync_and_reused_generation_release_the_whole_chain(self):
         """Ignoring a terminal identity failure would retain old hub/producer ownership."""
