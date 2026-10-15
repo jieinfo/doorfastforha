@@ -84,6 +84,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
     clients = hass.data.setdefault(DOMAIN, {})
     client = DoorfastClient(hass, entry.data[CONF_SERVER_ADDRESS])
+    client.monitor_status_callback = lambda status: async_dispatcher_send(
+        hass, f"{DOMAIN}_{entry.entry_id}_STATUS", status
+    )
     clients[entry.entry_id] = client
 
     station_registries = hass.data.setdefault(STATIONS_KEY, {})
@@ -163,6 +166,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             _LOGGER,
         )
 
+    station_registry.async_poll = poll
+
     async def unlock(call):
         station_id = call.data.get("station_id")
         if not isinstance(station_id, str):
@@ -223,6 +228,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             await registry.monitor(station_id).async_start()
         except KeyError as error:
             raise HomeAssistantError("unknown Doorfast station") from error
+        await registry.async_poll()
 
     async def stop_monitor(call):
         registry = _service_resource(hass, STATIONS_KEY, call)
@@ -233,6 +239,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             await registry.monitor(station_id).async_stop()
         except KeyError as error:
             raise HomeAssistantError("unknown Doorfast station") from error
+        await registry.async_poll()
 
     try:
         await poll()
