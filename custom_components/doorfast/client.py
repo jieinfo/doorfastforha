@@ -1,6 +1,6 @@
 from __future__ import annotations
 import json
-from typing import Any
+from typing import Any, Callable
 import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
@@ -43,6 +43,9 @@ class DoorfastClient:
         self._refresh_sequence = 0
         self._station_control_epochs: dict[str, int] = {}
         self._status_control_epochs: dict[str, int] = {}
+        self._accepted_station_calls: dict[str, tuple[str, int, int]] = {}
+        self._preview_stop_fences: dict[str, tuple[str, int, tuple[str, int, int] | None]] = {}
+        self.monitor_status_callback: Callable[[dict[str, Any]], None] | None = None
     async def _request(self, method: str, path: str, payload: dict | None = None) -> dict[str, Any]:
         async with self.session.request(method, f"{self.base_url}{path}", json=payload, timeout=aiohttp.ClientTimeout(total=10)) as response:
             station_control = (method == "POST" and path in {"/api/v1/call", "/api/v1/hangup"}
@@ -132,6 +135,11 @@ class DoorfastClient:
             and previous_runtime_id
             and status.get("runtime_id") != previous_runtime_id
         )
+        if runtime_changed:
+            self._preview_stop_fences = {}
+        media = status.get("media")
+        if isinstance(media, dict):
+            status = {**status, "media": self._fence_stopped_previews(status, media)}
         self.status = status
         self._status_control_epochs = control_epochs
         self.online = True
@@ -182,7 +190,15 @@ class DoorfastClient:
         response = await self._request("POST", "/api/v1/call", {
             "runtime_id": runtime_id, "station_id": station_id,
         })
-        return validate_reply(response, runtime_id, station_id)
+        response = validate_reply(response, runtime_id, station_id)
+        if (getattr(self, "status", {}).get("runtime_id") == runtime_id
+                and response.get("generation", 0) > 0
+                and response.get("state") in {"preparing", "calling", "talking", "preview", "ringing"}):
+            accepted = getattr(self, "_accepted_station_calls", {})
+            previous = accepted.get(station_id)
+            accepted[station_id] = (runtime_id, response["generation"], previous[2] + 1 if previous else 1)
+            self._accepted_station_calls = accepted
+        return response
 
     async def hangup_station(self, station_id: str, reason="ha", *, generation=None, operation_id=None):
         station_id = require_station_id(station_id)
@@ -248,25 +264,112 @@ class DoorfastClient:
     async def start_monitor(
         self, runtime_id: str, station_id: str
     ) -> dict[str, Any]:
-        return await self._request(
+        response = await self._request(
             "POST",
             "/api/v1/monitor/start",
             {"runtime_id": runtime_id, "station_id": require_station_id(station_id)},
         )
+        # Reads begun before this accepted lifecycle edge cannot replace it.
+        self._refresh_sequence = getattr(self, "_refresh_sequence", 0) + 1
+        return response
 
     async def stop_monitor(
         self, runtime_id: str, station_id: str, generation: int
     ) -> dict[str, Any]:
         generation = self._monitor_generation(generation)
-        return await self._request(
+        station_id = require_station_id(station_id)
+        accepted_call = getattr(self, "_accepted_station_calls", {}).get(station_id)
+        response = await self._request(
             "POST",
             "/api/v1/monitor/stop",
             {
                 "runtime_id": runtime_id,
-                "station_id": require_station_id(station_id),
+                "station_id": station_id,
                 "generation": generation,
             },
         )
+        if (response.get("runtime_id", runtime_id) != runtime_id
+                or response.get("station_id", station_id) != station_id
+                or type(response.get("generation", generation)) is not int
+                or response.get("generation", generation) != generation):
+            raise ValueError("monitor stop reply identity mismatch")
+        self._refresh_sequence = getattr(self, "_refresh_sequence", 0) + 1
+        status = getattr(self, "status", {})
+        if status.get("runtime_id") == runtime_id:
+            fences = getattr(self, "_preview_stop_fences", {})
+            fences[station_id] = (runtime_id, generation, accepted_call)
+            self._preview_stop_fences = fences
+            media = status.get("media")
+            if isinstance(media, dict):
+                sessions = media.get("sessions")
+                if (isinstance(sessions, list) and media.get("available") is not False
+                        and not self._call_owns_station(status, station_id)
+                        and getattr(self, "_accepted_station_calls", {}).get(station_id) == accepted_call
+                        and not any(isinstance(item, dict) and item.get("station_id") == station_id
+                                    for item in sessions)):
+                    # A start can be accepted before the first global sample.
+                    # Expose only the acknowledged pending stop, never fake idle.
+                    media = {**media, "sessions": [*sessions, {"station_id": station_id,
+                        "generation": generation, "purpose": "preview", "state": "stopping",
+                        "ready": False, "source_live": False}]}
+                self.status = {**status, "media": self._fence_stopped_previews(status, media)}
+            callback = getattr(self, "monitor_status_callback", None)
+            if callback is not None:
+                callback(self.status)
+        return response
+
+    @staticmethod
+    def _call_owns_station(status, station_id, media_generation=None):
+        native = status.get("call")
+        operation = station_call_operation(status)
+        if (operation is not None and operation["station_id"] == station_id
+                and operation["stage"] in {"preparing", "calling", "talking", "ending"}):
+            return media_generation is None or operation["media_generation"] == media_generation
+        if not (isinstance(native, dict) and native.get("station_id") == station_id
+                and native.get("session") in {"preview", "ringing", "talking", "ending"}
+                and type(native.get("generation")) is int and 0 < native["generation"] <= _UINT64_MAX):
+            return False
+        if media_generation is None:
+            return True
+        # Native control generations are not public media generations. Incoming
+        # calls borrow only their separately observed, matching media owner.
+        media = status.get("media")
+        sessions = media.get("sessions") if isinstance(media, dict) else None
+        return isinstance(sessions, list) and any(
+            isinstance(item, dict) and item.get("station_id") == station_id
+            and item.get("generation") == media_generation and item.get("purpose") == "call"
+            for item in sessions)
+
+    def _fence_stopped_previews(self, status, media, *, ownership=False):
+        """A stop ACK is pending, not proof of remote completion.
+
+        Keep the exact stopped preview visible as stopping, but never let it
+        reacquire local ownership. New native/control owners remain authoritative.
+        """
+        sessions = media.get("sessions")
+        if not isinstance(sessions, list):
+            return media
+        fences = getattr(self, "_preview_stop_fences", {})
+        rows = []
+        for item in sessions:
+            if not isinstance(item, dict):
+                rows.append(item)
+                continue
+            station_id = item.get("station_id")
+            fence = fences.get(station_id) if isinstance(station_id, str) else None
+            identity = (status.get("runtime_id"), item.get("generation"))
+            accepted = (getattr(self, "_accepted_station_calls", {}).get(station_id)
+                        if fence is not None else None)
+            borrowed = (accepted is not None and accepted != fence[2] and accepted[:2] == identity)
+            if (fence is not None and fence[:2] == identity and not borrowed
+                    and item.get("purpose") == "preview"
+                    and not self._call_owns_station(status, station_id, item.get("generation"))):
+                if ownership:
+                    continue
+                if item.get("state") not in {"idle", "stopped", "failed"}:
+                    item = {**item, "state": "stopping", "ready": False, "source_live": False}
+            rows.append(item)
+        return {**media, "sessions": rows}
 
     async def set_monitor_viewer(
         self, runtime_id: str, station_id: str, generation: int, active: bool
@@ -286,7 +389,16 @@ class DoorfastClient:
         )
 
     async def monitor_status(self) -> dict[str, Any]:
-        return await self._request("GET", "/api/v1/monitor/status")
+        request_runtime = getattr(self, "status", {}).get("runtime_id")
+        response = await self._request("GET", "/api/v1/monitor/status")
+        # Older bridges omit this field. Bind their observation to the runtime
+        # at request submission, never a runtime that appeared while awaiting it.
+        if "runtime_id" not in response and isinstance(request_runtime, str):
+            response = {**response, "runtime_id": request_runtime}
+        status = getattr(self, "status", {})
+        if response.get("runtime_id") == status.get("runtime_id"):
+            return self._fence_stopped_previews(status, response, ownership=True)
+        return response
     def _current_video_generation(self) -> int | None:
         call = self.status.get("call")
         video = self.status.get("video")

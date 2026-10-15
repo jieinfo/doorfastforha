@@ -41,6 +41,7 @@ async def sync_monitor_state(
         if (
             not isinstance(expected_runtime, str)
             or reported_runtime != expected_runtime
+            or client.status.get("runtime_id") != expected_runtime
             or not isinstance(sessions, list)
         ):
             await provider.async_reconcile_monitor()
@@ -89,13 +90,15 @@ async def sync_monitor_state(
                     if hasattr(client, "_status_control_epochs") else None
                 ))
             item = by_station.get(current_station_id)
+            current_marker = (
+                getattr(coordinator, "generation", None),
+                getattr(coordinator, "status_revision", 0),
+            )
+            # Nonempty old replies can resurrect a stopped owner just as an
+            # old empty reply can clear a newly started one.
+            if current_marker != before_poll[current_station_id]:
+                continue
             if item is None:
-                current_marker = (
-                    getattr(coordinator, "generation", None),
-                    getattr(coordinator, "status_revision", 0),
-                )
-                if current_marker != before_poll[current_station_id]:
-                    continue
                 revision = status.get("status_revision", 0)
                 item = {
                     "runtime_id": expected_runtime,
