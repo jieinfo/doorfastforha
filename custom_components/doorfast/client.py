@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+from time import monotonic
 from typing import Any, Callable
 from urllib.parse import urlsplit
 import aiohttp
@@ -19,6 +20,7 @@ from .client_types import (
 from .audio import decode_pcm_wav
 from .station_control import positive_condition, validate_call_parameters, validate_reply, stable_error
 from .session_diagnostics import station_call_operation, _STATION_CALL_STAGE_ORDER
+from .access_status import station_unlock_record, validate_unlock_reply, PENDING_PHASES
 
 _UINT64_MAX = (1 << 64) - 1
 
@@ -42,6 +44,8 @@ class DoorfastClient:
         self._audio_revision: int | None = None
         self._audio_etag: str | None = None
         self._refresh_sequence = 0
+        self._unlock_epochs: dict[str, int] = {}
+        self._unlock_acceptance_epochs: dict[str, int] = {}
         self._station_control_epochs: dict[str, int] = {}
         self._status_control_epochs: dict[str, int] = {}
         self._accepted_station_calls: dict[str, tuple[str, int, int]] = {}
@@ -119,9 +123,20 @@ class DoorfastClient:
         self._refresh_sequence += 1
         refresh_sequence = self._refresh_sequence
         control_epochs = dict(getattr(self, "_station_control_epochs", {}))
+        unlock_epochs = dict(getattr(self, "_unlock_epochs", {}))
+        acceptance_epochs = dict(getattr(self, "_unlock_acceptance_epochs", {}))
         status = await self._request("GET", "/api/v1/status")
+        accepted_during_fetch = {
+            station for station, epoch in getattr(self, "_unlock_acceptance_epochs", {}).items()
+            if epoch != acceptance_epochs.get(station)
+        }
+        # Fence the returned observation too, including the superseded-GET
+        # path below; callers may dispatch that value independently.
+        status = self._fence_unlock_status(status, accepted_during_fetch)
         if refresh_sequence != self._refresh_sequence:
             return status
+        if unlock_epochs != getattr(self, "_unlock_epochs", {}):
+            return self.status
         if (control_epochs != getattr(self, "_station_control_epochs", {})
                 and status.get("runtime_id") == self.status.get("runtime_id")):
             # An observation begun before a newer station request cannot be
@@ -180,9 +195,77 @@ class DoorfastClient:
         return await self.unlock_station(station_id)
 
     async def unlock_station(self, station_id: str):
-        return await self._request("POST", "/api/v1/unlock", {
-            "station_id": require_station_id(station_id),
-        })
+        station_id = require_station_id(station_id)
+        runtime = self._current_runtime_id()
+        epochs = getattr(self, "_unlock_epochs", {})
+        epoch = epochs.get(station_id, 0) + 1
+        epochs[station_id] = epoch
+        self._unlock_epochs = epochs
+        started = monotonic()
+        response = validate_unlock_reply(await self._request("POST", "/api/v1/unlock", {
+            "station_id": station_id,
+        }), runtime, station_id)
+        duration = max(0, int((monotonic() - started) * 1000))
+        if ("request_id" in response and self._unlock_epochs.get(station_id) == epoch
+                and self._current_runtime_id() == runtime and runtime is not None):
+            access = self.status.get("access")
+            access = access if isinstance(access, dict) else {}
+            row = {key: value for key, value in response.items() if key != "submitted"}
+            row.update(physical_result_confirmed=False, request_to_acceptance_ms=duration)
+            old = station_unlock_record(self.status, station_id)
+            same_request = old is not None and old["request_id"] == row["request_id"]
+            if old is None or self._unlock_record_is_newer(row, old) or same_request:
+                if same_request and not self._unlock_record_is_newer(row, old):
+                    row = {**old, "request_to_acceptance_ms": duration}
+                rows = access.get("requests", [])
+                rows = rows if isinstance(rows, list) else []
+                rows = [item for item in rows if isinstance(item, dict) and item.get("station_id") != station_id]
+                self.status = {**self.status, "access": {**access, "version": 1, "requests": [*rows, row]}}
+                acceptances = getattr(self, "_unlock_acceptance_epochs", {})
+                acceptances[station_id] = acceptances.get(station_id, 0) + 1
+                self._unlock_acceptance_epochs = acceptances
+        return response
+
+    @staticmethod
+    def _unlock_record_is_newer(candidate, previous):
+        if candidate["request_id"] != previous["request_id"]:
+            return candidate["request_id"] > previous["request_id"]
+        order = lambda row: PENDING_PHASES.index(row["phase"]) if row["phase"] in PENDING_PHASES else 2
+        return order(candidate) > order(previous)
+
+    def _fence_unlock_status(self, status, accepted_during_fetch=()):
+        """Fence independent unlock identities without relying on media revisions."""
+        access = status.get("access")
+        if (not isinstance(access, dict) or type(access.get("version")) is not int
+                or access["version"] != 1 or status.get("runtime_id") != self.status.get("runtime_id")
+                or not isinstance(access.get("requests"), list)):
+            return status
+        rows = list(access["requests"])
+        if accepted_during_fetch and all(
+                isinstance(row, dict) and isinstance(row.get("station_id"), str)
+                and station_unlock_record(status, row["station_id"]) is not None for row in rows):
+            # A valid observation captured before acceptance may omit that
+            # station entirely. Preserve only acceptances newer than this GET,
+            # never substitute cached success for malformed operation records.
+            for station_id in sorted(accepted_during_fetch):
+                if any(row["station_id"] == station_id for row in rows):
+                    continue
+                previous = station_unlock_record(self.status, station_id)
+                if previous is not None:
+                    rows.append(previous)
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict) or not isinstance(row.get("station_id"), str):
+                continue
+            station_id = row["station_id"]
+            candidate = station_unlock_record(status, station_id)
+            previous = station_unlock_record(self.status, station_id)
+            if candidate is None or previous is None:
+                continue
+            if self._unlock_record_is_newer(previous, candidate):
+                rows[index] = previous
+            elif candidate["request_id"] == previous["request_id"] and "request_to_acceptance_ms" in previous:
+                rows[index] = {**candidate, "request_to_acceptance_ms": previous["request_to_acceptance_ms"]}
+        return {**status, "access": {**access, "requests": rows}}
     async def answer(self, generation=None, primary_media_port=DEFAULT_VIDEO_PORT, secondary_media_port=DEFAULT_AUDIO_PORT, duration_seconds=DEFAULT_CALL_DURATION):
         generation = resolve_generation(self.status, generation)
         return await self._request("POST", "/api/v1/answer", {"runtime_id": self._control_runtime_id(), "generation": generation, "primary_media_port": primary_media_port, "secondary_media_port": secondary_media_port, "duration_seconds": duration_seconds})

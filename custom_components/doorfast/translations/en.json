@@ -156,7 +156,22 @@
       "unlock_status": {"name": "Unlock progress / latest reply", "state": {
         "idle": "Idle", "waiting_media": "Preparing preview for unlock", "waiting_reply": "Waiting for station reply",
         "protocol_completed": "Station acknowledged (door position unverified)", "protocol_rejected": "Station rejected unlock",
-        "expired": "Reply timed out", "cancelled": "Cancelled", "send_failed": "Send failed"
+        "expired": "Reply timed out", "cancelled": "Cancelled", "send_failed": "Send failed",
+        "preparation_timeout": "Preparation timed out", "material_unavailable": "Unlock material unavailable",
+        "disabled": "Unlock disabled", "unknown": "Unknown"
+      }, "state_attributes": {
+        "wait_reason": {"name": "Unlock wait reason", "state": {
+          "none": "None", "busy": "Station busy", "cooldown": "Station cooldown",
+          "waiting_media": "Preparing unlock", "compatibility": "Full media compatibility path",
+          "station_unavailable": "Station unavailable", "unknown": "Unknown"
+        }},
+        "preparation_path": {"name": "Preparation path", "state": {
+          "lightweight": "Lightweight preparation", "full_media": "Full media compatibility path",
+          "reused": "Reused session", "unknown": "Unknown"
+        }},
+        "sent_ms": {"name": "Request to protocol send (ms)"},
+        "reply_ms": {"name": "Request to protocol reply (ms)"},
+        "request_to_acceptance_ms": {"name": "HA request to acceptance (ms)"}
       }}
     },
     "binary_sensor": {"ring_status": {"name": "Incoming call"}, "station_reachable": {"name": "Station online"}},

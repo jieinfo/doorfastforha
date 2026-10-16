@@ -1,0 +1,621 @@
+[
+  {
+    "case": "accepted_preparing",
+    "accepted": {
+      "submitted": true,
+      "station_id": "gate_main",
+      "runtime_id": "0123456789abcdef",
+      "request_id": "0000000000000001",
+      "phase": "waiting_media"
+    },
+    "status": {
+      "runtime_id": "0123456789abcdef",
+      "access": {
+        "version": 1,
+        "stations": [
+          {
+            "station_id": "gate_main",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          },
+          {
+            "station_id": "gate_side",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          }
+        ],
+        "requests": [
+          {
+            "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef",
+            "request_id": "0000000000000001",
+            "phase": "waiting_media",
+            "wait_reason": "waiting_media",
+            "preparation_path": "lightweight",
+            "mode": "inherit",
+            "credential_source": "global",
+            "reused_session": false,
+            "physical_result_confirmed": false,
+            "attempts": 0,
+            "busy_replies": 0,
+            "remaining_ms": 30000,
+            "elapsed_ms": 0,
+            "error": "none",
+            "cleanup_error": "none"
+          }
+        ],
+        "request": {
+          "station_id": "gate_main",
+          "runtime_id": "0123456789abcdef",
+          "request_id": "0000000000000001",
+          "phase": "waiting_media",
+          "wait_reason": "waiting_media",
+          "preparation_path": "lightweight",
+          "mode": "inherit",
+          "credential_source": "global",
+          "reused_session": false,
+          "physical_result_confirmed": false,
+          "attempts": 0,
+          "busy_replies": 0,
+          "remaining_ms": 30000,
+          "elapsed_ms": 0,
+          "error": "none",
+          "cleanup_error": "none"
+        },
+        "configured": true,
+        "state": "idle",
+        "generation": 0,
+        "physical_result_confirmed": false,
+        "manual_state": "waiting_media",
+        "manual_station_id": "gate_main"
+      }
+    }
+  },
+  {
+    "case": "sent_waiting_reply",
+    "accepted": {
+      "submitted": true,
+      "station_id": "gate_main",
+      "runtime_id": "0123456789abcdef",
+      "request_id": "0000000000000001",
+      "phase": "waiting_media"
+    },
+    "status": {
+      "runtime_id": "0123456789abcdef",
+      "access": {
+        "version": 1,
+        "stations": [
+          {
+            "station_id": "gate_main",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          },
+          {
+            "station_id": "gate_side",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          }
+        ],
+        "requests": [
+          {
+            "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef",
+            "request_id": "0000000000000001",
+            "phase": "waiting_reply",
+            "wait_reason": "none",
+            "preparation_path": "lightweight",
+            "mode": "inherit",
+            "credential_source": "global",
+            "reused_session": false,
+            "physical_result_confirmed": false,
+            "attempts": 2,
+            "busy_replies": 1,
+            "remaining_ms": 1000,
+            "elapsed_ms": 20,
+            "first_request_ms": 5,
+            "first_media_ms": 20,
+            "sent_ms": 20,
+            "preparation_ms": 20,
+            "error": "none",
+            "cleanup_error": "none"
+          }
+        ],
+        "request": {
+          "station_id": "gate_main",
+          "runtime_id": "0123456789abcdef",
+          "request_id": "0000000000000001",
+          "phase": "waiting_reply",
+          "wait_reason": "none",
+          "preparation_path": "lightweight",
+          "mode": "inherit",
+          "credential_source": "global",
+          "reused_session": false,
+          "physical_result_confirmed": false,
+          "attempts": 2,
+          "busy_replies": 1,
+          "remaining_ms": 1000,
+          "elapsed_ms": 20,
+          "first_request_ms": 5,
+          "first_media_ms": 20,
+          "sent_ms": 20,
+          "preparation_ms": 20,
+          "error": "none",
+          "cleanup_error": "none"
+        },
+        "configured": true,
+        "state": "waiting",
+        "generation": 1,
+        "station_id": "gate_main",
+        "physical_result_confirmed": false,
+        "manual_state": "waiting_reply",
+        "manual_station_id": "gate_main"
+      }
+    }
+  },
+  {
+    "case": "protocol_completed",
+    "accepted": {
+      "submitted": true,
+      "station_id": "gate_main",
+      "runtime_id": "0123456789abcdef",
+      "request_id": "0000000000000001",
+      "phase": "waiting_media"
+    },
+    "status": {
+      "runtime_id": "0123456789abcdef",
+      "access": {
+        "version": 1,
+        "stations": [
+          {
+            "station_id": "gate_main",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          },
+          {
+            "station_id": "gate_side",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          }
+        ],
+        "requests": [
+          {
+            "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef",
+            "request_id": "0000000000000001",
+            "phase": "protocol_completed",
+            "wait_reason": "none",
+            "preparation_path": "lightweight",
+            "mode": "inherit",
+            "credential_source": "global",
+            "reused_session": false,
+            "physical_result_confirmed": false,
+            "attempts": 2,
+            "busy_replies": 1,
+            "remaining_ms": 0,
+            "elapsed_ms": 50,
+            "first_request_ms": 5,
+            "first_media_ms": 20,
+            "sent_ms": 20,
+            "preparation_ms": 20,
+            "reply_ms": 50,
+            "reply_latency_ms": 30,
+            "raw_status": 1,
+            "error": "none",
+            "cleanup_error": "none"
+          }
+        ],
+        "request": {
+          "station_id": "gate_main",
+          "runtime_id": "0123456789abcdef",
+          "request_id": "0000000000000001",
+          "phase": "protocol_completed",
+          "wait_reason": "none",
+          "preparation_path": "lightweight",
+          "mode": "inherit",
+          "credential_source": "global",
+          "reused_session": false,
+          "physical_result_confirmed": false,
+          "attempts": 2,
+          "busy_replies": 1,
+          "remaining_ms": 0,
+          "elapsed_ms": 50,
+          "first_request_ms": 5,
+          "first_media_ms": 20,
+          "sent_ms": 20,
+          "preparation_ms": 20,
+          "reply_ms": 50,
+          "reply_latency_ms": 30,
+          "raw_status": 1,
+          "error": "none",
+          "cleanup_error": "none"
+        },
+        "configured": true,
+        "state": "protocol_completed",
+        "generation": 1,
+        "station_id": "gate_main",
+        "raw_status": 1,
+        "physical_result_confirmed": false,
+        "manual_state": "idle"
+      }
+    }
+  },
+  {
+    "case": "protocol_rejected",
+    "accepted": {
+      "submitted": true,
+      "station_id": "gate_main",
+      "runtime_id": "0123456789abcdef",
+      "request_id": "0000000000000001",
+      "phase": "waiting_media"
+    },
+    "status": {
+      "runtime_id": "0123456789abcdef",
+      "access": {
+        "version": 1,
+        "stations": [
+          {
+            "station_id": "gate_main",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          },
+          {
+            "station_id": "gate_side",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          }
+        ],
+        "requests": [
+          {
+            "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef",
+            "request_id": "0000000000000001",
+            "phase": "protocol_rejected",
+            "wait_reason": "none",
+            "preparation_path": "lightweight",
+            "mode": "inherit",
+            "credential_source": "global",
+            "reused_session": false,
+            "physical_result_confirmed": false,
+            "attempts": 2,
+            "busy_replies": 1,
+            "remaining_ms": 0,
+            "elapsed_ms": 50,
+            "first_request_ms": 5,
+            "first_media_ms": 20,
+            "sent_ms": 20,
+            "preparation_ms": 20,
+            "reply_ms": 50,
+            "reply_latency_ms": 30,
+            "raw_status": 0,
+            "error": "none",
+            "cleanup_error": "none"
+          }
+        ],
+        "request": {
+          "station_id": "gate_main",
+          "runtime_id": "0123456789abcdef",
+          "request_id": "0000000000000001",
+          "phase": "protocol_rejected",
+          "wait_reason": "none",
+          "preparation_path": "lightweight",
+          "mode": "inherit",
+          "credential_source": "global",
+          "reused_session": false,
+          "physical_result_confirmed": false,
+          "attempts": 2,
+          "busy_replies": 1,
+          "remaining_ms": 0,
+          "elapsed_ms": 50,
+          "first_request_ms": 5,
+          "first_media_ms": 20,
+          "sent_ms": 20,
+          "preparation_ms": 20,
+          "reply_ms": 50,
+          "reply_latency_ms": 30,
+          "raw_status": 0,
+          "error": "none",
+          "cleanup_error": "none"
+        },
+        "configured": true,
+        "state": "protocol_rejected",
+        "generation": 1,
+        "station_id": "gate_main",
+        "raw_status": 0,
+        "physical_result_confirmed": false,
+        "manual_state": "idle"
+      }
+    }
+  },
+  {
+    "case": "preparation_timeout",
+    "accepted": {
+      "submitted": true,
+      "station_id": "gate_main",
+      "runtime_id": "0123456789abcdef",
+      "request_id": "0000000000000001",
+      "phase": "waiting_media"
+    },
+    "status": {
+      "runtime_id": "0123456789abcdef",
+      "access": {
+        "version": 1,
+        "stations": [
+          {
+            "station_id": "gate_main",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          },
+          {
+            "station_id": "gate_side",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          }
+        ],
+        "requests": [
+          {
+            "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef",
+            "request_id": "0000000000000001",
+            "phase": "preparation_timeout",
+            "wait_reason": "none",
+            "preparation_path": "lightweight",
+            "mode": "inherit",
+            "credential_source": "global",
+            "reused_session": false,
+            "physical_result_confirmed": false,
+            "attempts": 0,
+            "busy_replies": 0,
+            "remaining_ms": 0,
+            "elapsed_ms": 30000,
+            "preparation_ms": 30000,
+            "error": "none",
+            "cleanup_error": "none"
+          }
+        ],
+        "request": {
+          "station_id": "gate_main",
+          "runtime_id": "0123456789abcdef",
+          "request_id": "0000000000000001",
+          "phase": "preparation_timeout",
+          "wait_reason": "none",
+          "preparation_path": "lightweight",
+          "mode": "inherit",
+          "credential_source": "global",
+          "reused_session": false,
+          "physical_result_confirmed": false,
+          "attempts": 0,
+          "busy_replies": 0,
+          "remaining_ms": 0,
+          "elapsed_ms": 30000,
+          "preparation_ms": 30000,
+          "error": "none",
+          "cleanup_error": "none"
+        },
+        "configured": true,
+        "state": "idle",
+        "generation": 0,
+        "physical_result_confirmed": false,
+        "manual_state": "idle"
+      }
+    }
+  },
+  {
+    "case": "reply_timeout",
+    "accepted": {
+      "submitted": true,
+      "station_id": "gate_main",
+      "runtime_id": "0123456789abcdef",
+      "request_id": "0000000000000001",
+      "phase": "waiting_media"
+    },
+    "status": {
+      "runtime_id": "0123456789abcdef",
+      "access": {
+        "version": 1,
+        "stations": [
+          {
+            "station_id": "gate_main",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          },
+          {
+            "station_id": "gate_side",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          }
+        ],
+        "requests": [
+          {
+            "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef",
+            "request_id": "0000000000000001",
+            "phase": "expired",
+            "wait_reason": "none",
+            "preparation_path": "lightweight",
+            "mode": "inherit",
+            "credential_source": "global",
+            "reused_session": false,
+            "physical_result_confirmed": false,
+            "attempts": 2,
+            "busy_replies": 1,
+            "remaining_ms": 0,
+            "elapsed_ms": 1020,
+            "first_request_ms": 5,
+            "first_media_ms": 20,
+            "sent_ms": 20,
+            "preparation_ms": 20,
+            "error": "none",
+            "cleanup_error": "none"
+          }
+        ],
+        "request": {
+          "station_id": "gate_main",
+          "runtime_id": "0123456789abcdef",
+          "request_id": "0000000000000001",
+          "phase": "expired",
+          "wait_reason": "none",
+          "preparation_path": "lightweight",
+          "mode": "inherit",
+          "credential_source": "global",
+          "reused_session": false,
+          "physical_result_confirmed": false,
+          "attempts": 2,
+          "busy_replies": 1,
+          "remaining_ms": 0,
+          "elapsed_ms": 1020,
+          "first_request_ms": 5,
+          "first_media_ms": 20,
+          "sent_ms": 20,
+          "preparation_ms": 20,
+          "error": "none",
+          "cleanup_error": "none"
+        },
+        "configured": true,
+        "state": "expired",
+        "generation": 1,
+        "station_id": "gate_main",
+        "physical_result_confirmed": false,
+        "manual_state": "idle"
+      }
+    }
+  },
+  {
+    "case": "cancelled",
+    "accepted": {
+      "submitted": true,
+      "station_id": "gate_main",
+      "runtime_id": "0123456789abcdef",
+      "request_id": "0000000000000001",
+      "phase": "waiting_media"
+    },
+    "status": {
+      "runtime_id": "0123456789abcdef",
+      "access": {
+        "version": 1,
+        "stations": [
+          {
+            "station_id": "gate_main",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          },
+          {
+            "station_id": "gate_side",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          }
+        ],
+        "requests": [
+          {
+            "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef",
+            "request_id": "0000000000000001",
+            "phase": "cancelled",
+            "wait_reason": "none",
+            "preparation_path": "lightweight",
+            "mode": "inherit",
+            "credential_source": "global",
+            "reused_session": false,
+            "physical_result_confirmed": false,
+            "attempts": 0,
+            "busy_replies": 0,
+            "remaining_ms": 0,
+            "elapsed_ms": 10,
+            "preparation_ms": 10,
+            "error": "none",
+            "cleanup_error": "none"
+          }
+        ],
+        "request": {
+          "station_id": "gate_main",
+          "runtime_id": "0123456789abcdef",
+          "request_id": "0000000000000001",
+          "phase": "cancelled",
+          "wait_reason": "none",
+          "preparation_path": "lightweight",
+          "mode": "inherit",
+          "credential_source": "global",
+          "reused_session": false,
+          "physical_result_confirmed": false,
+          "attempts": 0,
+          "busy_replies": 0,
+          "remaining_ms": 0,
+          "elapsed_ms": 10,
+          "preparation_ms": 10,
+          "error": "none",
+          "cleanup_error": "none"
+        },
+        "configured": true,
+        "state": "idle",
+        "generation": 0,
+        "physical_result_confirmed": false,
+        "manual_state": "idle"
+      }
+    }
+  },
+  {
+    "case": "runtime_reset",
+    "accepted": {
+      "submitted": true,
+      "station_id": "gate_main",
+      "runtime_id": "0123456789abcdef",
+      "request_id": "0000000000000001",
+      "phase": "waiting_media"
+    },
+    "status": {
+      "runtime_id": "fedcba9876543210",
+      "access": {
+        "version": 1,
+        "stations": [
+          {
+            "station_id": "gate_main",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          },
+          {
+            "station_id": "gate_side",
+            "mode": "inherit",
+            "configured": true,
+            "credential_source": "global",
+            "reason": "none"
+          }
+        ],
+        "requests": [],
+        "configured": true,
+        "state": "idle",
+        "generation": 0,
+        "physical_result_confirmed": false,
+        "manual_state": "idle"
+      }
+    }
+  }
+]

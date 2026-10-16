@@ -7,7 +7,8 @@ from pathlib import Path
 import sys
 import types
 import unittest
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock, call, patch
+from test_access_status import unlock_status
 
 
 ROOT = Path(__file__).parents[1]
@@ -126,6 +127,208 @@ def audio_client(*responses):
 
 
 class ControlPayloadTest(unittest.IsolatedAsyncioTestCase):
+    async def _status_observation_during_unlock_submission(self, observation, *, supersede=False):
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        client.status = unlock_status()
+        client.status["access"]["requests"] = []
+        post_started, get_started = asyncio.Event(), asyncio.Event()
+        accept_post, finish_get = asyncio.Event(), asyncio.Event()
+        gets = 0
+
+        async def request(method, path, payload=None):
+            nonlocal gets
+            if method == "POST":
+                post_started.set()
+                await accept_post.wait()
+                return {"submitted": True, "station_id": "gate_main", "runtime_id": "0123456789abcdef",
+                        "request_id": "0000000000000002", "phase": "waiting_media"}
+            gets += 1
+            if gets == 1:
+                get_started.set()
+                await finish_get.wait()
+                return observation
+            return unlock_status("waiting_media")
+
+        client._request = request
+        unlock = asyncio.create_task(client.unlock_station("gate_main"))
+        await post_started.wait()
+        refresh = asyncio.create_task(client.refresh())
+        await get_started.wait()
+        accept_post.set()
+        await unlock
+        accepted = dict(client.status["access"]["requests"][0])
+        if supersede:
+            await client.refresh()
+        finish_get.set()
+        result = await refresh
+        return client, result, accepted
+
+    async def test_get_started_during_submission_keeps_later_acceptance_in_cache_and_return(self):
+        for supersede in (False, True):
+            with self.subTest(supersede=supersede):
+                observation = unlock_status()
+                observation["access"]["requests"] = []
+                client, result, accepted = await self._status_observation_during_unlock_submission(
+                    observation, supersede=supersede)
+                self.assertEqual("0000000000000002", accepted["request_id"])
+                self.assertIsInstance(accepted["request_to_acceptance_ms"], int)
+                for status in (client.status, result):
+                    self.assertTrue(status["access"]["requests"], "delayed GET erased later acceptance")
+                    self.assertEqual("0000000000000002", status["access"]["requests"][0]["request_id"])
+                    self.assertEqual(accepted["request_to_acceptance_ms"],
+                                     status["access"]["requests"][0]["request_to_acceptance_ms"])
+
+    async def test_observation_during_acceptance_keeps_invalid_status_unknown_and_new_runtime_authoritative(self):
+        from custom_components.doorfast.access_status import station_unlock_attributes
+        observations = [
+            {"runtime_id": "0123456789abcdef", "access": {"version": "1", "requests": []}},
+            {"runtime_id": "0123456789abcdef", "access": {"version": 2, "requests": []}},
+            {"runtime_id": "0123456789abcdef", "access": {"version": 1, "requests": None}},
+        ]
+        malformed_record = unlock_status()
+        malformed_record["access"]["requests"][0]["request_id"] = "bad"
+        observations.append(malformed_record)
+        new_runtime = unlock_status()
+        new_runtime["runtime_id"] = "fedcba9876543210"
+        new_runtime["access"]["requests"] = []
+        observations.append(new_runtime)
+        for observation in observations:
+            with self.subTest(observation=observation):
+                client, result, _accepted = await self._status_observation_during_unlock_submission(observation)
+                for status in (client.status, result):
+                    attrs = station_unlock_attributes(status, "gate_main")
+                    self.assertNotIn("request_id", attrs)
+                    self.assertNotIn("request_to_acceptance_ms", attrs)
+                    self.assertEqual("idle" if observation is new_runtime else "unknown", attrs["phase"])
+                self.assertEqual(observation["runtime_id"], client.status["runtime_id"])
+
+    async def test_superseded_refresh_returns_current_unlock_progress(self):
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        client.status = unlock_status("waiting_reply")
+        started, finish = asyncio.Event(), asyncio.Event()
+
+        async def request(*args):
+            if not started.is_set():
+                started.set()
+                await finish.wait()
+                return unlock_status("waiting_reply")
+            return unlock_status()
+
+        client._request = request
+        old = asyncio.create_task(client.refresh())
+        await started.wait()
+        await client.refresh()
+        finish.set()
+        result = await old
+        for status in (client.status, result):
+            self.assertEqual("protocol_completed", status["access"]["requests"][0]["phase"])
+
+    async def test_unlock_validates_accepted_reply_and_only_sends_station_id(self):
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        client.status = {"runtime_id": "0123456789abcdef"}
+        reply = {"submitted": True, "station_id": "gate_main", "runtime_id": "0123456789abcdef",
+                 "request_id": "0000000000000002", "phase": "waiting_media", "secret": "private"}
+        client._request = AsyncMock(return_value=reply)
+        with patch.object(client_module, "monotonic", side_effect=[10, 10.125]):
+            accepted = await client.unlock_station("gate_main")
+        self.assertNotIn("secret", accepted)
+        self.assertEqual("0000000000000002", client.status["access"]["requests"][0]["request_id"])
+        self.assertEqual(125, client.status["access"]["requests"][0]["request_to_acceptance_ms"])
+        client._request.assert_awaited_once_with("POST", "/api/v1/unlock", {"station_id": "gate_main"})
+        for field, bad in (("request_id", "0" * 16), ("runtime_id", "fedcba9876543210"),
+                ("station_id", "gate_side"), ("phase", "opened"), ("submitted", 1)):
+            client._request = AsyncMock(return_value={**reply, field: bad})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                await client.unlock_station("gate_main")
+
+    async def test_delayed_unlock_reply_and_status_cannot_replace_newer_unlock(self):
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        client.status = unlock_status("waiting_media")
+        client.online = True
+        entered, resume = asyncio.Event(), asyncio.Event()
+        async def old_request(method, path, payload=None):
+            entered.set()
+            await resume.wait()
+            return {"submitted": True, "station_id": "gate_main", "runtime_id": "0123456789abcdef",
+                    "request_id": "0000000000000002", "phase": "waiting_media"}
+        client._request = old_request
+        pending = asyncio.create_task(client.unlock_station("gate_main"))
+        await entered.wait()
+        client._request = AsyncMock(return_value={"submitted": True, "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef", "request_id": "0000000000000003", "phase": "waiting_reply"})
+        await client.unlock_station("gate_main")
+        resume.set()
+        await pending
+        self.assertEqual("0000000000000003", client.status["access"]["requests"][0]["request_id"])
+        client._request = AsyncMock(return_value=unlock_status())
+        await client.refresh()
+        self.assertEqual("0000000000000003", client.status["access"]["requests"][0]["request_id"])
+        client._request = AsyncMock(return_value={"runtime_id": "0123456789abcdef", "access": {"version": "1"}})
+        await client.refresh()
+        self.assertEqual({"version": "1"}, client.status["access"])
+
+    async def test_unlock_status_preserves_terminal_progress_but_not_malformed_cached_success(self):
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        client.status = unlock_status()
+        previous = client.status["access"]["requests"][0]
+        previous["request_to_acceptance_ms"] = 8
+        client._request = AsyncMock(return_value=unlock_status("waiting_media"))
+        await client.refresh()
+        self.assertEqual("protocol_completed", client.status["access"]["requests"][0]["phase"])
+        client._request = AsyncMock(return_value=unlock_status())
+        await client.refresh()
+        self.assertEqual(8, client.status["access"]["requests"][0]["request_to_acceptance_ms"])
+        malformed = unlock_status()
+        malformed["access"]["requests"][0]["phase"] = "physical_open"
+        client._request = AsyncMock(return_value=malformed)
+        await client.refresh()
+        from custom_components.doorfast.access_status import station_unlock_attributes
+        self.assertEqual("unknown", station_unlock_attributes(client.status, "gate_main")["phase"])
+
+    async def test_delayed_acceptance_keeps_observed_terminal_result_and_local_duration(self):
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        client.status = unlock_status()
+        client._request = AsyncMock(return_value={"submitted": True, "station_id": "gate_main",
+            "runtime_id": "0123456789abcdef", "request_id": "0000000000000002", "phase": "waiting_media"})
+        with patch.object(client_module, "monotonic", side_effect=[10, 10.125]):
+            await client.unlock_station("gate_main")
+        row = client.status["access"]["requests"][0]
+        self.assertEqual("protocol_completed", row["phase"])
+        self.assertEqual(125, row.get("request_to_acceptance_ms"))
+
+    async def test_refresh_started_before_unlock_and_runtime_changed_reply_are_fenced(self):
+        client = DoorfastClient(None, "http://synthetic.invalid")
+        client.status = unlock_status()
+        entered, resume = asyncio.Event(), asyncio.Event()
+        async def request(method, path, payload=None):
+            if method == "GET":
+                entered.set()
+                await resume.wait()
+                return unlock_status()
+            return {"submitted": True, "station_id": "gate_main", "runtime_id": "0123456789abcdef",
+                    "request_id": "0000000000000003", "phase": "waiting_media"}
+        client._request = request
+        pending = asyncio.create_task(client.refresh())
+        await entered.wait()
+        await client.unlock_station("gate_main")
+        resume.set()
+        await pending
+        self.assertEqual("0000000000000003", client.status["access"]["requests"][0]["request_id"])
+        entered.clear()
+        resume.clear()
+        async def delayed(method, path, payload=None):
+            entered.set()
+            await resume.wait()
+            return {"submitted": True, "station_id": "gate_main", "runtime_id": "0123456789abcdef",
+                    "request_id": "0000000000000004", "phase": "waiting_media"}
+        client._request = delayed
+        pending = asyncio.create_task(client.unlock_station("gate_main"))
+        await entered.wait()
+        client.status = {"runtime_id": "fedcba9876543210"}
+        resume.set()
+        await pending
+        self.assertNotIn("access", client.status)
+
     async def test_refresh_started_before_control_change_cannot_replace_authoritative_status(self):
         client = DoorfastClient.__new__(DoorfastClient)
         fresh = {"runtime_id": "0123456789abcdef", "call": {"session": "talking", "generation": 42}}

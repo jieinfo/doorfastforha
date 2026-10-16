@@ -155,7 +155,22 @@
       "unlock_status": {"name": "解锁进度／最近回复", "state": {
         "idle": "空闲", "waiting_media": "正在建立解锁所需预览", "waiting_reply": "等待门口机回复",
         "protocol_completed": "门口机已确认（未验证门状态）", "protocol_rejected": "门口机拒绝解锁",
-        "expired": "回复超时", "cancelled": "已取消", "send_failed": "发送失败"
+        "expired": "回复超时", "cancelled": "已取消", "send_failed": "发送失败",
+        "preparation_timeout": "准备超时", "material_unavailable": "解锁材料不可用",
+        "disabled": "解锁已禁用", "unknown": "未知"
+      }, "state_attributes": {
+        "wait_reason": {"name": "解锁等待原因", "state": {
+          "none": "无", "busy": "门口机忙", "cooldown": "门口机冷却中",
+          "waiting_media": "正在准备解锁", "compatibility": "完整媒体兼容路径",
+          "station_unavailable": "门口机不可用", "unknown": "未知"
+        }},
+        "preparation_path": {"name": "准备路径", "state": {
+          "lightweight": "轻量准备", "full_media": "完整媒体兼容路径",
+          "reused": "复用会话", "unknown": "未知"
+        }},
+        "sent_ms": {"name": "请求到协议发送（毫秒）"},
+        "reply_ms": {"name": "请求到协议回复（毫秒）"},
+        "request_to_acceptance_ms": {"name": "HA 请求到受理（毫秒）"}
       }}
     },
     "binary_sensor": {"ring_status": {"name": "来电"}, "station_reachable": {"name": "门口机在线"}},
