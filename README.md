@@ -202,6 +202,17 @@ Audio is downmixed to mono, filtered and resampled to
 PCM and an opaque capture ID through HA's authenticated WebSocket; Doorfast producer
 credentials stay in the integration backend.
 
+For uhttpd CGI compatibility, the backend sends the private producer token in
+`Authorization: DoorfastAudio <audio_session>` and the legacy
+`X-Doorfast-Audio-Session` header on submit/end requests. Update Doorfast with
+the Authorization-header compatibility fix before updating this integration;
+updating HA alone cannot repair a bridge that only receives the dropped custom
+header. Tokens never belong in URLs or logs. No new user setting is required.
+Bridge URLs containing HTTP Basic credentials retain the legacy audio header
+and leave Authorization to HTTP authentication. This preserves servers that
+already forward that custom header; Basic-protected uhttpd remains unsupported
+for uplink because it cannot carry both credentials in Authorization.
+
 Uplink sends at most five 320-byte frames per request, with one request in
 flight and no replay of uncertain submissions. Downlink PCM is mono 8 kHz
 `s16le`, at most 3200 bytes per chunk (canonical WAV at most 3244 bytes). The

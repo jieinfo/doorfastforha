@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 from typing import Any, Callable
+from urllib.parse import urlsplit
 import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from .const import DEFAULT_AUDIO_PORT, DEFAULT_CALL_DURATION, DEFAULT_VIDEO_PORT
@@ -63,6 +64,9 @@ class DoorfastClient:
             if not isinstance(data, dict): raise ValueError("Doorfast bridge returned a non-object response")
             return data
     async def _pcm_request(self, path: str, params: dict[str, str], headers: dict[str, str], body: bytes) -> PcmHttpReply:
+        # Keep URL Basic authentication available on legacy HTTP bridges.
+        if urlsplit(self.base_url).username is not None:
+            headers = {key: value for key, value in headers.items() if key != "Authorization"}
         async with self.session.request(
             "POST",
             f"{self.base_url}{path}",
@@ -94,6 +98,7 @@ class DoorfastClient:
             },
             {
                 "Content-Type": "application/octet-stream",
+                "Authorization": f"DoorfastAudio {session_token}",
                 "X-Doorfast-Audio-Session": session_token,
             },
             body,
@@ -103,7 +108,10 @@ class DoorfastClient:
         return await self._pcm_request(
             "/api/v1/audio/session/end",
             {"runtime": runtime_id, "generation": str(generation)},
-            {"X-Doorfast-Audio-Session": session_token},
+            {
+                "Authorization": f"DoorfastAudio {session_token}",
+                "X-Doorfast-Audio-Session": session_token,
+            },
             b"",
         )
 

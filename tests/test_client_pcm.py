@@ -94,10 +94,20 @@ class PcmHttpPrimitiveTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, open_request[2]["headers"])
         self.assertEqual("http://doorfast/cgi-bin/doorfast/api/v1/audio/submit.pcm", submit_request[1])
         self.assertEqual({"runtime": "0123456789abcdef", "generation": "7", "sequence": "9"}, submit_request[2]["params"])
-        self.assertEqual({"Content-Type": "application/octet-stream", "X-Doorfast-Audio-Session": token}, submit_request[2]["headers"])
+        with self.subTest(route="submit uses uhttpd-forwarded credentials"):
+            self.assertEqual({
+                "Content-Type": "application/octet-stream",
+                "Authorization": "DoorfastAudio " + token,
+                "X-Doorfast-Audio-Session": token,
+            }, submit_request[2]["headers"])
         self.assertEqual(b"x" * 320, submit_request[2]["data"])
         self.assertEqual("http://doorfast/cgi-bin/doorfast/api/v1/audio/session/end", end_request[1])
-        self.assertEqual({"X-Doorfast-Audio-Session": token}, end_request[2]["headers"])
+        with self.subTest(route="end uses uhttpd-forwarded credentials"):
+            self.assertEqual({
+                "Authorization": "DoorfastAudio " + token,
+                "X-Doorfast-Audio-Session": token,
+            }, end_request[2]["headers"])
+        self.assertEqual({"runtime": "0123456789abcdef", "generation": "7"}, end_request[2]["params"])
         self.assertEqual(b"", end_request[2]["data"])
 
     async def test_parses_conflict_json_before_returning_status(self):
@@ -105,6 +115,29 @@ class PcmHttpPrimitiveTest(unittest.IsolatedAsyncioTestCase):
         reply = await client.pcm_submit("0123456789abcdef", 7, 9, "a" * 32, b"x" * 320)
         self.assertEqual(409, reply.status)
         self.assertEqual(10, reply.payload["next_sequence"])
+
+    async def test_preserves_url_basic_auth_for_submit_and_end(self):
+        for address in (
+            "http://user:pass@doorfast/cgi-bin/doorfast",
+            "http://user@doorfast/cgi-bin/doorfast",
+            "http://:pass@doorfast/cgi-bin/doorfast",
+        ):
+            with self.subTest(address=address):
+                client = self.client(Response(200, {}), Response(200, {}))
+                client.base_url = address
+                token = "a" * 32
+                await client.pcm_submit("0123456789abcdef", 7, 9, token, b"x" * 320)
+                await client.pcm_session_end("0123456789abcdef", 7, token)
+                submitted, ended = client.session.requests
+                with self.subTest(route="submit"):
+                    self.assertEqual({
+                        "Content-Type": "application/octet-stream",
+                        "X-Doorfast-Audio-Session": token,
+                    }, submitted[2]["headers"])
+                with self.subTest(route="end"):
+                    self.assertEqual({"X-Doorfast-Audio-Session": token}, ended[2]["headers"])
+                self.assertEqual(address + "/api/v1/audio/submit.pcm", submitted[1])
+                self.assertEqual(address + "/api/v1/audio/session/end", ended[1])
 
     async def test_rejects_non_object_json_even_on_error_status(self):
         client = self.client(Response(503, []))
