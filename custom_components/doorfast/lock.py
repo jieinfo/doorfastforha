@@ -135,8 +135,10 @@ class DoorfastStationLock(LockEntity, DoorfastStationEntity):
     @property
     def available(self):
         config = station_unlock_configuration(self.client.status, self.station.station_id)
+        access = self.client.status.get("access")
+        versioned = isinstance(access, dict) and "version" in access
         return (self._active and self.station.enabled and self.client.online
-                and config.get("configured") is not False)
+                and ((not versioned) or config.get("configured") is True))
 
     @property
     def extra_state_attributes(self):

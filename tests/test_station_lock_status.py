@@ -44,6 +44,21 @@ class StationLockStatusTest(unittest.IsolatedAsyncioTestCase):
         entity.station = support.station(enabled=False)
         self.assertFalse(entity.available)
 
+    async def test_present_v1_requires_a_valid_usable_matching_station_configuration(self):
+        registry = support.FakeRegistry()
+        hass = support.FakeHass(registry)
+        entity = lock.DoorfastStationLock(hass, support.FakeEntry(), support.station())
+        registry.client.status = {"runtime_id": "0123456789abcdef", "access": {"version": 1}}
+        self.assertFalse(entity.available)
+        registry.client.status = {"runtime_id": "0123456789abcdef", "access": {
+            "version": 1, "stations": [{"station_id": "gate_side", "mode": "direct",
+                "configured": True, "credential_source": "station", "reason": "none"}]}}
+        self.assertFalse(entity.available)
+        registry.client.status["access"]["stations"][0]["station_id"] = "gate_main"
+        self.assertTrue(entity.available)
+        registry.client.status["access"]["stations"][0]["configured"] = "yes"
+        self.assertFalse(entity.available)
+
     async def test_offline_and_recovery_notify_lock_without_unlocking(self):
         registry = support.FakeRegistry()
         hass = support.FakeHass(registry)
