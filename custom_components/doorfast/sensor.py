@@ -2,7 +2,7 @@ from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.core import callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
-from .access_status import UNLOCK_PHASES, station_access_attributes
+from .access_status import UNLOCK_PHASES, station_unlock_attributes
 from .const import CONTROLLER_NAME, DOMAIN, LATEST_EVENT, MANUFACTURER, STATIONS_KEY, SW_VERSION
 from .station_entity import DoorfastStationEntity
 from .station_status import PREVIEW_PHASES, preview_attributes
@@ -135,6 +135,6 @@ class DoorfastUnlockStatus(DoorfastStationStatus):
 
     @property
     def extra_state_attributes(self):
-        return station_access_attributes(
+        return station_unlock_attributes(
             self.client.status if self.available else {}, self.station.station_id,
         )

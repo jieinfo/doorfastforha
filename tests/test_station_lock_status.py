@@ -6,6 +6,7 @@ import types
 import unittest
 
 import test_station_status_entities as support
+from test_access_status import unlock_status
 
 
 class LockEntity(support.SensorEntity):
@@ -22,6 +23,27 @@ lock.async_dispatcher_connect = support.connect
 
 
 class StationLockStatusTest(unittest.IsolatedAsyncioTestCase):
+    async def test_station_configuration_controls_availability_without_changing_identity(self):
+        registry = support.FakeRegistry()
+        hass = support.FakeHass(registry)
+        entity = lock.DoorfastStationLock(hass, support.FakeEntry(), support.station())
+        self.assertEqual("doorfast_entry-1_station_gate_main_unlock", entity.unique_id)
+        self.assertTrue(entity.available)  # Legacy metadata absence remains supported.
+        registry.client.status = unlock_status()
+        self.assertTrue(entity.available)
+        self.assertEqual("0000000000000002", getattr(entity, "extra_state_attributes", {}).get("request_id"))
+        metadata = registry.client.status["access"]["stations"][0]
+        for reason in ("disabled", "material_missing", "material_invalid", "store_unavailable", "station_unavailable"):
+            metadata.update(mode="disabled" if reason == "disabled" else "direct", configured=False,
+                            credential_source="none", reason=reason)
+            self.assertFalse(entity.available, reason)
+        metadata.update(mode="direct", configured=True, credential_source="station", reason="none")
+        registry.client.online = False
+        self.assertFalse(entity.available)
+        registry.client.online = True
+        entity.station = support.station(enabled=False)
+        self.assertFalse(entity.available)
+
     async def test_offline_and_recovery_notify_lock_without_unlocking(self):
         registry = support.FakeRegistry()
         hass = support.FakeHass(registry)

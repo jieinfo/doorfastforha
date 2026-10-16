@@ -3,7 +3,7 @@ from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers import entity_registry as er
 
-from .access_status import access_attributes
+from .access_status import access_attributes, station_unlock_attributes, station_unlock_configuration
 from .const import CONTROLLER_NAME, DOMAIN, MANUFACTURER, SW_VERSION
 from .station_entity import DoorfastStationEntity
 
@@ -134,7 +134,13 @@ class DoorfastStationLock(LockEntity, DoorfastStationEntity):
 
     @property
     def available(self):
-        return self._active and self.station.enabled and self.client.online
+        config = station_unlock_configuration(self.client.status, self.station.station_id)
+        return (self._active and self.station.enabled and self.client.online
+                and config.get("configured") is not False)
+
+    @property
+    def extra_state_attributes(self):
+        return station_unlock_attributes(self.client.status, self.station.station_id)
 
     @property
     def is_locked(self):
