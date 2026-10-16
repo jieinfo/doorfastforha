@@ -45,6 +45,7 @@ class DoorfastClient:
         self._audio_etag: str | None = None
         self._refresh_sequence = 0
         self._unlock_epochs: dict[str, int] = {}
+        self._unlock_acceptance_epochs: dict[str, int] = {}
         self._station_control_epochs: dict[str, int] = {}
         self._status_control_epochs: dict[str, int] = {}
         self._accepted_station_calls: dict[str, tuple[str, int, int]] = {}
@@ -123,7 +124,15 @@ class DoorfastClient:
         refresh_sequence = self._refresh_sequence
         control_epochs = dict(getattr(self, "_station_control_epochs", {}))
         unlock_epochs = dict(getattr(self, "_unlock_epochs", {}))
+        acceptance_epochs = dict(getattr(self, "_unlock_acceptance_epochs", {}))
         status = await self._request("GET", "/api/v1/status")
+        accepted_during_fetch = {
+            station for station, epoch in getattr(self, "_unlock_acceptance_epochs", {}).items()
+            if epoch != acceptance_epochs.get(station)
+        }
+        # Fence the returned observation too, including the superseded-GET
+        # path below; callers may dispatch that value independently.
+        status = self._fence_unlock_status(status, accepted_during_fetch)
         if refresh_sequence != self._refresh_sequence:
             return status
         if unlock_epochs != getattr(self, "_unlock_epochs", {}):
@@ -154,7 +163,6 @@ class DoorfastClient:
         media = status.get("media")
         if isinstance(media, dict):
             status = {**status, "media": self._fence_stopped_previews(status, media)}
-        status = self._fence_unlock_status(status)
         self.status = status
         self._status_control_epochs = control_epochs
         self.online = True
@@ -213,6 +221,9 @@ class DoorfastClient:
                 rows = rows if isinstance(rows, list) else []
                 rows = [item for item in rows if isinstance(item, dict) and item.get("station_id") != station_id]
                 self.status = {**self.status, "access": {**access, "version": 1, "requests": [*rows, row]}}
+                acceptances = getattr(self, "_unlock_acceptance_epochs", {})
+                acceptances[station_id] = acceptances.get(station_id, 0) + 1
+                self._unlock_acceptance_epochs = acceptances
         return response
 
     @staticmethod
@@ -222,7 +233,7 @@ class DoorfastClient:
         order = lambda row: PENDING_PHASES.index(row["phase"]) if row["phase"] in PENDING_PHASES else 2
         return order(candidate) > order(previous)
 
-    def _fence_unlock_status(self, status):
+    def _fence_unlock_status(self, status, accepted_during_fetch=()):
         """Fence independent unlock identities without relying on media revisions."""
         access = status.get("access")
         if (not isinstance(access, dict) or type(access.get("version")) is not int
@@ -230,6 +241,18 @@ class DoorfastClient:
                 or not isinstance(access.get("requests"), list)):
             return status
         rows = list(access["requests"])
+        if accepted_during_fetch and all(
+                isinstance(row, dict) and isinstance(row.get("station_id"), str)
+                and station_unlock_record(status, row["station_id"]) is not None for row in rows):
+            # A valid observation captured before acceptance may omit that
+            # station entirely. Preserve only acceptances newer than this GET,
+            # never substitute cached success for malformed operation records.
+            for station_id in sorted(accepted_during_fetch):
+                if any(row["station_id"] == station_id for row in rows):
+                    continue
+                previous = station_unlock_record(self.status, station_id)
+                if previous is not None:
+                    rows.append(previous)
         for index, row in enumerate(rows):
             if not isinstance(row, dict) or not isinstance(row.get("station_id"), str):
                 continue
